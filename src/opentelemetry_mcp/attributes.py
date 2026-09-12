@@ -1,8 +1,9 @@
 """Strongly-typed span attribute models following OpenTelemetry semantic conventions."""
 
-from typing import Literal
+import json
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Note: We import constants for documentation but must use string literals for Pydantic aliases
 # due to mypy strict mode requirements
@@ -60,6 +61,33 @@ class SpanAttributes(BaseModel):
     service_name: str | None = Field(None, alias="service.name")
     otel_status_code: str | None = Field(None, alias="otel.status_code")
     error: bool | None = None
+
+    @field_validator("gen_ai_response_finish_reasons", "llm_response_finish_reasons", mode="before")
+    @classmethod
+    def _coerce_finish_reasons(cls, value: Any) -> Any:
+        """Coerce finish_reasons into a real list before type validation.
+
+        Backends that store OTel attributes as flat tags (Jaeger) or that
+        serialize OTLP arrayValue by hand (Tempo) hand this field a string
+        instead of a list - a JSON-encoded array ('["stop"]') or, in
+        Tempo's case, a Python repr of the raw arrayValue structure. Without
+        this, list[str] validation raises, SpanAttributes(**attrs)
+        construction fails, and the calling backend's per-span parser
+        silently drops the whole span rather than losing just this field.
+        """
+        if value is None or isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(item) for item in parsed]
+            return [part.strip() for part in stripped.split(",") if part.strip()]
+        return value
 
     def to_dict(self) -> dict[str, str | int | float | bool]:
         """

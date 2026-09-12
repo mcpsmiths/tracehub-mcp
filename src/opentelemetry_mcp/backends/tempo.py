@@ -637,7 +637,12 @@ class TempoBackend(BaseBackend):
             # Parse events with strong typing
             events: list[SpanEvent] = []
             for event_data in span_data.get("events", []):
-                event_attrs = self._parse_otlp_attributes(event_data.get("attributes", []))
+                event_attrs: dict[str, str | int | float | bool] = {
+                    k: (", ".join(v) if isinstance(v, list) else v)
+                    for k, v in self._parse_otlp_attributes(
+                        event_data.get("attributes", [])
+                    ).items()
+                }
                 events.append(
                     SpanEvent(
                         name=event_data.get("name", "event"),
@@ -665,7 +670,7 @@ class TempoBackend(BaseBackend):
 
     def _parse_otlp_attributes(
         self, attributes: list[dict[str, Any]]
-    ) -> dict[str, str | int | float | bool]:
+    ) -> dict[str, str | int | float | bool | list[str]]:
         """Parse OTLP attribute format.
 
         OTLP attributes have structure: {"key": "name", "value": {"stringValue": "..."}}
@@ -676,7 +681,7 @@ class TempoBackend(BaseBackend):
         Returns:
             Dictionary of parsed attributes with typed values
         """
-        result: dict[str, str | int | float | bool] = {}
+        result: dict[str, str | int | float | bool | list[str]] = {}
         for attr in attributes:
             key = attr.get("key")
             if not key:
@@ -694,7 +699,29 @@ class TempoBackend(BaseBackend):
             elif "boolValue" in value_obj:
                 result[key] = value_obj["boolValue"]
             elif "arrayValue" in value_obj:
-                # Simplified array handling - convert to string
-                result[key] = str(value_obj["arrayValue"])
+                # Extract each element's own scalar value rather than
+                # stringifying the raw OTLP structure, which produced an
+                # unparseable Python-repr string and silently dropped the
+                # whole span on any field typed as list[str] (e.g.
+                # gen_ai.response.finish_reasons).
+                result[key] = [
+                    self._otlp_array_item_to_str(item)
+                    for item in value_obj["arrayValue"].get("values", [])
+                ]
 
         return result
+
+    @staticmethod
+    def _otlp_array_item_to_str(item: dict[str, Any]) -> str:
+        """Stringify one OTLP AnyValue array element, checking key presence
+        rather than truthiness so a real 0/False value is not mistaken for
+        an absent field."""
+        if "stringValue" in item:
+            return str(item["stringValue"])
+        if "intValue" in item:
+            return str(item["intValue"])
+        if "doubleValue" in item:
+            return str(item["doubleValue"])
+        if "boolValue" in item:
+            return str(item["boolValue"])
+        return ""
