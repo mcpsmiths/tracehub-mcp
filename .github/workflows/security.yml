@@ -26,7 +26,7 @@ jobs:
             docker-platform: linux/arm64
     runs-on: ${{ matrix.runs-on }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Cache Trivy
         uses: actions/cache@v4
