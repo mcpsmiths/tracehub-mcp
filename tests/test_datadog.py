@@ -533,6 +533,33 @@ class TestParseDatadogSpanRejectsBadTimestamps:
         }
         assert backend._parse_dd_span(span_obj) is None
 
+    def test_missing_service_returns_none(self) -> None:
+        backend = _backend()
+        span_obj = {
+            "attributes": {
+                "trace_id": "t1",
+                "span_id": "s1",
+                "resource_name": "op",
+                # service missing
+                "start_timestamp": "2023-01-02T09:42:36.320Z",
+                "end_timestamp": "2023-01-02T09:42:36.420Z",
+            },
+        }
+        assert backend._parse_dd_span(span_obj) is None
+
+    def test_missing_resource_name_and_service_returns_none(self) -> None:
+        backend = _backend()
+        span_obj = {
+            "attributes": {
+                "trace_id": "t1",
+                "span_id": "s1",
+                # resource_name and service both missing
+                "start_timestamp": "2023-01-02T09:42:36.320Z",
+                "end_timestamp": "2023-01-02T09:42:36.420Z",
+            },
+        }
+        assert backend._parse_dd_span(span_obj) is None
+
 
 class TestGetTraceExactMatch:
     """Test get_trace only keeps spans exactly matching the requested trace_id."""

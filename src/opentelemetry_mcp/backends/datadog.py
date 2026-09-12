@@ -689,6 +689,20 @@ class DatadogBackend(BaseBackend):
                 return None
             duration_ms = (end_time - start_time).total_seconds() * 1000
 
+            operation_name = attrs.get("resource_name") or attrs.get("service")
+            service_name = attrs.get("service")
+            if not operation_name or not service_name:
+                # Don't fabricate identity: a substituted "unknown" would
+                # silently merge unrelated spans into one fake bucket for
+                # any tool that groups/filters by service_name or
+                # operation_name, and would corrupt trace-level rollups
+                # for whichever span happens to become the chosen root.
+                logger.warning(
+                    f"Rejecting span {span_id} (trace {trace_id}): missing "
+                    "resource_name/service identity fields"
+                )
+                return None
+
             custom_attrs = attrs.get("attributes", {}) or {}
             tags = attrs.get("tags", []) or []
 
@@ -701,8 +715,8 @@ class DatadogBackend(BaseBackend):
                 trace_id=str(trace_id),
                 span_id=str(span_id),
                 parent_span_id=str(parent_span_id) if parent_span_id else None,
-                operation_name=attrs.get("resource_name") or attrs.get("service", "unknown"),
-                service_name=attrs.get("service", "unknown"),
+                operation_name=operation_name,
+                service_name=service_name,
                 start_time=start_time,
                 duration_ms=duration_ms,
                 status=status,
