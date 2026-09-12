@@ -1,4 +1,4 @@
-This project (obs-mcp) is a fork of opentelemetry-mcp-server
+This project (tracehub-mcp) is a fork of opentelemetry-mcp-server
 (https://github.com/traceloop/opentelemetry-mcp-server), licensed under the
 Apache License, Version 2.0. See LICENSE for the full license text.
 
