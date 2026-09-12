@@ -9,18 +9,25 @@ handed it a string instead of a real list, which raised a pydantic
 ValidationError inside SpanAttributes(**attrs) construction - and both
 backends' per-span parsers caught that broadly and silently returned None,
 indistinguishable from "no span".
+
+Uses model_validate(dict) rather than SpanAttributes(**dict) - the
+dict-splat form defeats mypy's keyword-argument analysis for a model with
+this many optional aliased fields (every existing SpanAttributes(**...)
+call site in src/ works around the same issue with a pre-typed
+intermediate variable or a `# type: ignore[arg-type]`); model_validate is
+the pattern the rest of this test suite already uses for the same reason.
 """
 
 from opentelemetry_mcp.attributes import SpanAttributes
 
 
 def test_finish_reasons_accepts_a_real_list_unchanged() -> None:
-    attrs = SpanAttributes(**{"gen_ai.response.finish_reasons": ["stop", "length"]})
+    attrs = SpanAttributes.model_validate({"gen_ai.response.finish_reasons": ["stop", "length"]})
     assert attrs.gen_ai_response_finish_reasons == ["stop", "length"]
 
 
 def test_finish_reasons_accepts_none() -> None:
-    attrs = SpanAttributes()
+    attrs = SpanAttributes.model_validate({})
     assert attrs.gen_ai_response_finish_reasons is None
 
 
@@ -28,27 +35,27 @@ def test_finish_reasons_parses_jaeger_style_json_encoded_string() -> None:
     """Jaeger's tag model has no array type - the OTLP collector encodes a
     list attribute as a JSON string when writing it as a tag. Construction
     must not raise, and the value must come out as a real list."""
-    attrs = SpanAttributes(**{"gen_ai.response.finish_reasons": '["stop"]'})
+    attrs = SpanAttributes.model_validate({"gen_ai.response.finish_reasons": '["stop"]'})
     assert attrs.gen_ai_response_finish_reasons == ["stop"]
 
 
 def test_finish_reasons_parses_multi_value_json_encoded_string() -> None:
-    attrs = SpanAttributes(**{"gen_ai.response.finish_reasons": '["stop", "length"]'})
+    attrs = SpanAttributes.model_validate({"gen_ai.response.finish_reasons": '["stop", "length"]'})
     assert attrs.gen_ai_response_finish_reasons == ["stop", "length"]
 
 
 def test_finish_reasons_falls_back_to_comma_split_for_a_plain_string() -> None:
-    attrs = SpanAttributes(**{"gen_ai.response.finish_reasons": "stop,length"})
+    attrs = SpanAttributes.model_validate({"gen_ai.response.finish_reasons": "stop,length"})
     assert attrs.gen_ai_response_finish_reasons == ["stop", "length"]
 
 
 def test_finish_reasons_does_not_raise_on_unparseable_garbage() -> None:
     """Must never raise regardless of input shape - a raised exception here
     is exactly what caused the whole span to be silently dropped upstream."""
-    attrs = SpanAttributes(**{"gen_ai.response.finish_reasons": "not json but fine"})
+    attrs = SpanAttributes.model_validate({"gen_ai.response.finish_reasons": "not json but fine"})
     assert attrs.gen_ai_response_finish_reasons == ["not json but fine"]
 
 
 def test_legacy_llm_response_finish_reasons_gets_the_same_coercion() -> None:
-    attrs = SpanAttributes(**{"llm.response.finish_reasons": '["stop"]'})
+    attrs = SpanAttributes.model_validate({"llm.response.finish_reasons": '["stop"]'})
     assert attrs.llm_response_finish_reasons == ["stop"]
