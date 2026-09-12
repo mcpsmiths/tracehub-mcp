@@ -3,6 +3,8 @@
 import json
 from typing import Any
 
+from pydantic import ValidationError
+
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import LLMSpanAttributes, TraceQuery, UsageMetrics
 from opentelemetry_mcp.utils import parse_iso_timestamp
@@ -43,15 +45,18 @@ async def get_llm_usage(
         return json.dumps({"error": error})
 
     # Build query to find LLM traces
-    query = TraceQuery(
-        service_name=service_name,
-        start_time=start_dt,
-        end_time=end_dt,
-        gen_ai_system=gen_ai_system,
-        gen_ai_request_model=gen_ai_request_model,
-        gen_ai_response_model=gen_ai_response_model,
-        limit=limit,
-    )
+    try:
+        query = TraceQuery(
+            service_name=service_name,
+            start_time=start_dt,
+            end_time=end_dt,
+            gen_ai_system=gen_ai_system,
+            gen_ai_request_model=gen_ai_request_model,
+            gen_ai_response_model=gen_ai_response_model,
+            limit=limit,
+        )
+    except ValidationError as e:
+        return json.dumps({"error": f"Invalid query parameters: {e}"})
 
     try:
         # Search for traces

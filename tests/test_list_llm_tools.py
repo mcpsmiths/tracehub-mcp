@@ -12,9 +12,7 @@ import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
-import pytest
 from opentelemetry.semconv_ai import TraceloopSpanKindValues
-from pydantic import ValidationError
 
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
@@ -280,19 +278,19 @@ class TestListLlmToolsEdgeCases:
         assert result["tools"][0]["services"] == ["test-service"]
 
 
-class TestListLlmToolsLimitValidationBug:
-    """SpanQuery(limit=...) is built OUTSIDE this module's try/except block
-    (unlike list_models.py and search_spans.py, which build their query
-    objects inside the try). An out-of-range limit therefore raises a raw
-    pydantic ValidationError instead of the documented {"error": ...} JSON
-    shape - this locks in that (buggy) current behavior so a fix is visible
-    as a test change, not a silent regression.
+class TestListLlmToolsLimitValidation:
+    """SpanQuery(limit=...) construction is wrapped in its own try/except
+    (matching the convention in tools/errors.py), so an out-of-range limit
+    must surface as the documented {"error": "Invalid query parameters: ..."}
+    JSON shape rather than raising a raw pydantic ValidationError.
     """
 
-    async def test_limit_out_of_bounds_raises_instead_of_returning_error_json(self) -> None:
+    async def test_limit_out_of_bounds_returns_error_json(self) -> None:
         backend = _fake_backend()
 
-        with pytest.raises(ValidationError):
-            await list_llm_tools(backend, limit=0)
+        raw = await list_llm_tools(backend, limit=0)
+        result = json.loads(raw)
 
+        assert "error" in result
+        assert result["error"].startswith("Invalid query parameters:")
         backend.search_spans.assert_not_awaited()

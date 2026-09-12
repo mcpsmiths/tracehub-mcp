@@ -328,16 +328,18 @@ class TestInputValidation:
 
     async def test_limit_that_produces_an_invalid_query_is_caught_not_raised(self) -> None:
         """limit=0 makes the internal TraceQuery(limit=min(0*10, 1000)=0),
-        which fails TraceQuery's `ge=1` constraint. Unlike get_llm_usage,
-        this module builds the query *inside* its try/except, so the
-        resulting pydantic ValidationError is caught and formatted rather
-        than propagating - confirmed here rather than assumed."""
+        which fails TraceQuery's `ge=1` constraint. The TraceQuery
+        construction is wrapped in its own try/except ValidationError, so
+        the resulting pydantic ValidationError is caught and formatted as
+        the dedicated "Invalid query parameters" message rather than the
+        generic backend-failure message - confirmed here rather than
+        assumed."""
         backend = _mock_backend()
 
         result = json.loads(await get_expensive_traces(backend, limit=0))
 
         assert "error" in result
-        assert result["error"].startswith("Failed to get expensive traces:")
+        assert result["error"].startswith("Invalid query parameters:")
         backend.search_traces.assert_not_called()
 
 

@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from opentelemetry.semconv_ai import TraceloopSpanKindValues
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.constants import Traceloop
@@ -67,14 +67,17 @@ async def list_llm_tools(
     ]
 
     # Build query
-    query = SpanQuery(
-        service_name=service_name,
-        start_time=start_dt,
-        end_time=end_dt,
-        gen_ai_system=gen_ai_system,
-        filters=filters,
-        limit=limit,
-    )
+    try:
+        query = SpanQuery(
+            service_name=service_name,
+            start_time=start_dt,
+            end_time=end_dt,
+            gen_ai_system=gen_ai_system,
+            filters=filters,
+            limit=limit,
+        )
+    except ValidationError as e:
+        return json.dumps({"error": f"Invalid query parameters: {e}"})
 
     try:
         # Execute search

@@ -146,7 +146,7 @@ def _convert_params_to_filters(
             )
         )
 
-    if max_duration_ms:
+    if max_duration_ms is not None:
         all_filters.append(
             Filter(
                 field=Fields.DURATION,
@@ -242,7 +242,7 @@ class SpanData(BaseModel):
     @property
     def is_llm_span(self) -> bool:
         """Check if this span represents an LLM operation."""
-        return self.attributes.gen_ai_system is not None
+        return bool(self.attributes.gen_ai_system)
 
     @property
     def gen_ai_system(self) -> str | None:
@@ -533,10 +533,10 @@ class TraceQuery(BaseModel):
         if self.end_time:
             params["end"] = int(self.end_time.timestamp() * 1_000_000)
 
-        if self.min_duration_ms:
+        if self.min_duration_ms is not None:
             params["minDuration"] = f"{self.min_duration_ms}ms"
 
-        if self.max_duration_ms:
+        if self.max_duration_ms is not None:
             params["maxDuration"] = f"{self.max_duration_ms}ms"
 
         params["limit"] = self.limit

@@ -196,6 +196,23 @@ class TestHappyPath:
         assert "llm_provider" not in err
         assert "llm_model" not in err
 
+    async def test_empty_gen_ai_system_span_has_no_llm_fields(self) -> None:
+        """gen_ai.system="" is treated as absent (matching SpanData.is_llm_span
+        and LLMSpanAttributes.from_span), so a request model set alongside an
+        empty system must not surface as an LLM error - this locks in that
+        consistency rather than reporting a half-populated LLM error."""
+        backend = _backend()
+        span = _span(attributes={"gen_ai.system": "", "gen_ai.request.model": "gpt-4"})
+        trace = _trace([span])
+        backend.search_traces.return_value = [trace]
+
+        result = json.loads(await find_errors(backend))
+
+        err = result["error_traces"][0]["error_spans"][0]
+        assert "is_llm_error" not in err
+        assert "llm_provider" not in err
+        assert "llm_model" not in err
+
     async def test_multiple_error_spans_in_one_trace_are_all_reported(self) -> None:
         backend = _backend()
         span1 = _span(span_id="s1", attributes={"error.message": "first"})

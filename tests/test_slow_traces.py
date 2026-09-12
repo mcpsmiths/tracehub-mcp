@@ -249,19 +249,17 @@ class TestInputValidation:
 
     async def test_zero_limit_is_caught_as_error_json_not_raised(self) -> None:
         """limit=0 makes the fetch limit `min(0 * 10, 1000) == 0`, which fails
-        TraceQuery's `ge=1` constraint. Unlike usage.py's get_llm_usage (which
-        builds its TraceQuery before the try/except and lets the
-        ValidationError propagate), this tool constructs the query *inside*
-        the try/except, so the failure is still caught and turned into the
-        documented error-JSON shape - just with the generic
-        "Failed to get slow traces: ..." wrapper rather than a purpose-built
-        validation message."""
+        TraceQuery's `ge=1` constraint. The TraceQuery construction is
+        wrapped in its own try/except ValidationError, so the failure is
+        caught and turned into the dedicated "Invalid query parameters"
+        error-JSON shape rather than the generic
+        "Failed to get slow traces: ..." wrapper."""
         backend = _mock_backend()
 
         result = json.loads(await get_slow_traces(backend, limit=0))
 
         assert "error" in result
-        assert result["error"].startswith("Failed to get slow traces:")
+        assert result["error"].startswith("Invalid query parameters:")
         backend.search_traces.assert_not_called()
 
 

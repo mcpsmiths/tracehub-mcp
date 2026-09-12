@@ -2,6 +2,8 @@
 
 import json
 
+from pydantic import ValidationError
+
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import LLMSpanAttributes, TraceQuery
 from opentelemetry_mcp.utils import parse_iso_timestamp
@@ -51,7 +53,10 @@ async def get_expensive_traces(
             gen_ai_response_model=gen_ai_response_model,
             limit=min(limit * 10, 1000),  # Fetch more to ensure we get enough expensive ones
         )
+    except ValidationError as e:
+        return json.dumps({"error": f"Invalid query parameters: {e}"})
 
+    try:
         # Search traces
         trace_summaries = await backend.search_traces(query)
 

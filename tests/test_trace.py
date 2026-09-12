@@ -203,14 +203,12 @@ async def test_get_trace_sums_tokens_across_multiple_llm_spans() -> None:
     assert result["llm_summary"]["llm_span_count"] == 2
 
 
-async def test_get_trace_empty_gen_ai_system_is_counted_but_has_no_llm_attributes() -> None:
-    """SpanData.is_llm_span only checks `gen_ai_system is not None`, so an
-    empty string still counts as an LLM span for is_llm_span and therefore
-    for trace.llm_spans / llm_span_count. But LLMSpanAttributes.from_span
-    treats an empty string as falsy and returns None. The result is a span
-    that inflates llm_span_count without ever getting an llm_attributes
-    entry, and without contributing to total_tokens. This looks like a real
-    inconsistency in the module's counting logic (flagged, not fixed here).
+async def test_get_trace_empty_gen_ai_system_is_not_counted_as_llm_span() -> None:
+    """SpanData.is_llm_span now checks `bool(gen_ai_system)`, matching
+    LLMSpanAttributes.from_span's treatment of an empty string as absent.
+    A span with an empty gen_ai.system is therefore not counted as an LLM
+    span: it gets no llm_attributes entry, doesn't appear in
+    trace.llm_spans, and produces no llm_summary block at all.
     """
     backend = _fake_backend()
     span = _make_span(
@@ -222,5 +220,4 @@ async def test_get_trace_empty_gen_ai_system_is_counted_but_has_no_llm_attribute
     result = json.loads(await get_trace(backend, "t1"))
 
     assert "llm_attributes" not in result["spans"][0]
-    assert result["llm_summary"]["llm_span_count"] == 1
-    assert result["llm_summary"]["total_tokens"] == 0
+    assert "llm_summary" not in result

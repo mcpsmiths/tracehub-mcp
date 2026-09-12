@@ -6,7 +6,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from opentelemetry_mcp.backends.base import BaseBackend
-from opentelemetry_mcp.models import TraceQuery, TraceSummary
+from opentelemetry_mcp.models import LLMSpanAttributes, TraceQuery, TraceSummary
 from opentelemetry_mcp.utils import parse_iso_timestamp
 
 
@@ -100,16 +100,11 @@ async def find_errors(
                         error_info["stack_trace"] = stack_trace_str
 
                 # Check if it's an LLM-related error
-                if span.is_llm_span:
+                llm_attrs = LLMSpanAttributes.from_span(span)
+                if llm_attrs:
                     error_info["is_llm_error"] = True
-                    llm_provider = span.gen_ai_system
-                    # Get model from request or response model
-                    llm_model = (
-                        span.attributes.gen_ai_request_model
-                        or span.attributes.gen_ai_response_model
-                    )
-                    error_info["llm_provider"] = str(llm_provider) if llm_provider else None
-                    error_info["llm_model"] = str(llm_model) if llm_model else None
+                    error_info["llm_provider"] = llm_attrs.system
+                    error_info["llm_model"] = llm_attrs.response_model or llm_attrs.request_model
 
                 error_spans_list.append(error_info)
 

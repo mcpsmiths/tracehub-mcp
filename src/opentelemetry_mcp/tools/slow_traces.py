@@ -2,6 +2,8 @@
 
 import json
 
+from pydantic import ValidationError
+
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import LLMSpanAttributes, TraceQuery
 from opentelemetry_mcp.utils import parse_iso_timestamp
@@ -52,7 +54,10 @@ async def get_slow_traces(
             min_duration_ms=min_duration_ms,
             limit=min(limit * 10, 1000),  # Fetch more to ensure we get enough slow ones
         )
+    except ValidationError as e:
+        return json.dumps({"error": f"Invalid query parameters: {e}"})
 
+    try:
         # Search traces
         trace_summaries = await backend.search_traces(query)
 

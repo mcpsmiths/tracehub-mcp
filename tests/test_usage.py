@@ -5,9 +5,6 @@ from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
-import pytest
-from pydantic import ValidationError
-
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery
@@ -354,23 +351,22 @@ class TestGetLlmUsageEdgeCases:
 
 
 class TestGetLlmUsageLimitBoundary:
-    """TraceQuery constrains 'limit' to [1, 1000], but that construction
-    happens outside the try/except in get_llm_usage - see BUG note below."""
+    """TraceQuery constrains 'limit' to [1, 1000]; construction happens
+    inside its own try/except in get_llm_usage so an out-of-range value
+    is converted to the documented error-JSON contract."""
 
-    async def test_limit_below_minimum_raises_instead_of_returning_error_json(self) -> None:
-        """BUG: get_llm_usage builds the TraceQuery(limit=...) *before* the
-        try/except block that is supposed to convert failures into
-        `{"error": ...}` JSON. An out-of-range 'limit' (a normal, externally
-        controlled MCP tool argument) therefore raises a raw
-        pydantic.ValidationError instead of the documented error-JSON
-        contract that every other invalid-input path in this tool honors.
-        This test pins the *current* (buggy) behavior; it is not asserting
-        this is desired."""
+    async def test_limit_below_minimum_returns_error_json(self) -> None:
+        """An out-of-range 'limit' (a normal, externally controlled MCP
+        tool argument) must be converted to `{"error": ...}` JSON, not
+        raise a raw pydantic.ValidationError, matching the error-JSON
+        contract every other invalid-input path in this tool honors."""
         backend = _mock_backend()
 
-        with pytest.raises(ValidationError):
-            await get_llm_usage(backend, limit=0)
+        result = await get_llm_usage(backend, limit=0)
+        parsed = json.loads(result)
 
+        assert "error" in parsed
+        assert parsed["error"].startswith("Invalid query parameters:")
         backend.search_traces.assert_not_called()
 
     async def test_limit_at_maximum_boundary_is_accepted(self) -> None:
