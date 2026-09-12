@@ -1,3 +1,10 @@
+## v0.2.2 (2026-09-12)
+
+### Fix
+
+- use model_validate instead of dict-splat in the new attribute tests
+- stop silently dropping spans with array-valued attributes
+
 ## v0.2.1 (2026-09-12)
 
 ### Fix
