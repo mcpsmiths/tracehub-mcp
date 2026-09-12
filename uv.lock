@@ -1655,9 +1655,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "click", specifier = ">=8.3,<8.6" },
-    { name = "fastmcp", specifier = "~=3.2.0" },
+    { name = "fastmcp", specifier = ">=3.2,<4" },
     { name = "httpx", specifier = "~=0.28.0" },
-    { name = "mcp", specifier = "~=1.26.0" },
+    { name = "mcp", specifier = ">=1.26,<2" },
     { name = "opentelemetry-semantic-conventions", specifier = ">=0.60b0" },
     { name = "opentelemetry-semantic-conventions-ai", specifier = ">=0.4.13" },
     { name = "pydantic", specifier = ">=2.12,<2.14" },
