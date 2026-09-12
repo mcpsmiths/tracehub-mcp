@@ -29,6 +29,7 @@ payloads before merge.
 """
 
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -57,6 +58,16 @@ _FACET_FIELDS = {
     Fields.SERVICE_NAME: "service",
     Fields.OPERATION_NAME: "resource_name",
 }
+
+# A mapped Datadog search field name must look like a plain (optionally
+# `@`-prefixed) dotted identifier. Filter.field (models.py) is an
+# unvalidated `str` reachable from any MCP tool call, and unlike the filter
+# *value* (escaped via `_escape_dd_query_value`), the field name is spliced
+# directly into the query string in every operator branch of
+# `_filter_to_dd_query` - so a field like `x) OR (a:b` would inject
+# arbitrary structure into the query. Reject anything that doesn't match
+# this allowlist pattern instead.
+_VALID_DD_FIELD_RE = re.compile(r"^@?[A-Za-z0-9_.]+$")
 
 # Default lookback window used when a query has no time range and there is no
 # narrower signal (e.g. get_trace, list_services). Datadog's span search
@@ -577,6 +588,10 @@ class DatadogBackend(BaseBackend):
             Datadog search condition string, or None if unsupported
         """
         field = self._dd_field(filter_obj.field)
+        if not _VALID_DD_FIELD_RE.match(field):
+            logger.warning(f"Rejecting filter with unsafe/invalid Datadog field name: {field!r}")
+            return None
+
         operator = filter_obj.operator
         value = filter_obj.value
         values = filter_obj.values

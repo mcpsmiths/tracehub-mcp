@@ -225,6 +225,77 @@ class TestBuildDatadogQuery:
         assert backend._build_dd_query(filters) == ('service:"svc" AND @gen_ai.system:"openai"')
 
 
+class TestFieldNameInjection:
+    """Filter.field is an unvalidated str reachable from any MCP tool call.
+
+    Unlike the filter *value*, which is always escaped/quoted via
+    _escape_dd_query_value, the field name (via _dd_field's `@`-prefixed
+    fallback for non-facet fields) used to be spliced directly into the
+    query string - so a malicious field name could inject arbitrary
+    structure (e.g. breaking out of an AND with an OR/paren group) into the
+    Datadog search syntax. Every operator branch must reject an unsafe
+    field name instead.
+    """
+
+    def test_equals_rejects_injection_field(self) -> None:
+        backend = _backend()
+        f = Filter(
+            field="x) OR (a:b",
+            operator=FilterOperator.EQUALS,
+            value="v",
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) is None
+
+    def test_exists_rejects_injection_field(self) -> None:
+        backend = _backend()
+        f = Filter(
+            field="x) OR (@span.op:*",
+            operator=FilterOperator.EXISTS,
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) is None
+
+    def test_in_rejects_injection_field(self) -> None:
+        backend = _backend()
+        f = Filter(
+            field="x) OR (a:b",
+            operator=FilterOperator.IN,
+            values=["v1", "v2"],
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) is None
+
+    def test_build_dd_query_drops_injection_filter_from_and_join(self) -> None:
+        """A rejected field must not leak its raw text into the joined
+        query at all - not even as a dropped-but-still-malicious fragment."""
+        backend = _backend()
+        filters = [
+            Filter(
+                field="gen_ai.system",
+                operator=FilterOperator.EQUALS,
+                value="openai",
+                value_type=FilterType.STRING,
+            ),
+            Filter(
+                field="x) OR (a:b",
+                operator=FilterOperator.EXISTS,
+                value_type=FilterType.STRING,
+            ),
+        ]
+        assert backend._build_dd_query(filters) == '@gen_ai.system:"openai"'
+
+    def test_valid_dotted_field_is_still_accepted(self) -> None:
+        backend = _backend()
+        f = Filter(
+            field="gen_ai.usage.total_tokens",
+            operator=FilterOperator.EQUALS,
+            value=100,
+            value_type=FilterType.NUMBER,
+        )
+        assert backend._filter_to_dd_query(f) == '@gen_ai.usage.total_tokens:"100"'
+
+
 class TestParseDatadogSpan:
     """Test parsing raw Datadog Span resources into SpanData."""
 
