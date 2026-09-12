@@ -1,3 +1,14 @@
+## v0.2.1 (2026-09-12)
+
+### Fix
+
+- correct 6 bugs found during the test-coverage pass
+- attach GitHub Release to the actual tag_format-produced tag
+
+### Perf
+
+- fetch traces concurrently instead of one at a time
+
 ## v0.2.0 (2026-09-12)
 
 ### Feat
