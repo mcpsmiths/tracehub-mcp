@@ -1,5 +1,6 @@
 """Model statistics tool implementation."""
 
+import asyncio
 import json
 from collections.abc import Sequence
 
@@ -90,6 +91,11 @@ async def get_model_stats(
         # Search traces
         trace_summaries = await backend.search_traces(query)
 
+        # Fetch full traces concurrently (was: sequential N+1) to access LLM spans
+        traces = await asyncio.gather(
+            *(backend.get_trace(summary.trace_id) for summary in trace_summaries)
+        )
+
         # Collect metrics for analysis
         durations: list[float] = []
         prompt_tokens_list: list[int] = []
@@ -100,10 +106,7 @@ async def get_model_stats(
         success_count = 0
         request_count = 0
 
-        for summary in trace_summaries:
-            # Get full trace to access LLM spans
-            trace = await backend.get_trace(summary.trace_id)
-
+        for trace in traces:
             for span in trace.llm_spans:
                 llm_attrs = LLMSpanAttributes.from_span(span)
                 if not llm_attrs:
@@ -149,10 +152,8 @@ async def get_model_stats(
             "request_count": request_count,
             "success_count": success_count,
             "error_count": error_count,
-            "success_rate": round(success_count / request_count * 100, 2)
-            if request_count > 0
-            else 0,
-            "error_rate": round(error_count / request_count * 100, 2) if request_count > 0 else 0,
+            "success_rate": round(success_count / request_count * 100, 2),
+            "error_rate": round(error_count / request_count * 100, 2),
             "duration_ms": calculate_percentiles(durations),
             "tokens": {
                 "prompt": calculate_percentiles(prompt_tokens_list),

@@ -1,5 +1,6 @@
 """Slow traces tool implementation."""
 
+import asyncio
 import json
 
 from pydantic import ValidationError
@@ -61,13 +62,15 @@ async def get_slow_traces(
         # Search traces
         trace_summaries = await backend.search_traces(query)
 
+        # Fetch full traces concurrently (was: sequential N+1) to access LLM spans
+        traces = await asyncio.gather(
+            *(backend.get_trace(summary.trace_id) for summary in trace_summaries)
+        )
+
         # Collect trace data with durations
         slow_traces = []
 
-        for summary in trace_summaries:
-            # Get full trace to access LLM spans
-            trace = await backend.get_trace(summary.trace_id)
-
+        for trace in traces:
             # Only include traces that have LLM spans
             if not trace.llm_spans:
                 continue

@@ -7,6 +7,7 @@ HTTP) since this module only ever talks to `backend.search_traces` and
 `backend.get_trace`.
 """
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -203,6 +204,45 @@ class TestListModelsHappyPath:
         assert model["request_count"] == 3
         assert model["first_seen"] == earliest.isoformat()
         assert model["last_seen"] == latest.isoformat()
+
+
+class TestListModelsConcurrency:
+    """Regression test for the N+1 sequential-fetch bug: `get_trace` calls
+    must be issued concurrently (via asyncio.gather), not awaited one trace
+    at a time. Under the old sequential-loop implementation this test's
+    max_in_flight would be 1; the fixed implementation fetches all traces
+    concurrently, so it must be equal to the number of traces."""
+
+    async def test_get_trace_calls_are_concurrent_not_sequential(
+        self, mock_backend: AsyncMock
+    ) -> None:
+        t0 = datetime(2024, 1, 1, tzinfo=UTC)
+        traces = [
+            _make_trace(
+                f"t{i}",
+                [_make_span(trace_id=f"t{i}", start_time=t0, request_model="gpt-4")],
+            )
+            for i in range(3)
+        ]
+        mock_backend.search_traces.return_value = [TraceSummary.from_trace(t) for t in traces]
+        traces_by_id = {t.trace_id: t for t in traces}
+
+        in_flight = 0
+        max_in_flight = 0
+
+        async def _get_trace(trace_id: str) -> TraceData:
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.01)
+            in_flight -= 1
+            return traces_by_id[trace_id]
+
+        mock_backend.get_trace.side_effect = _get_trace
+
+        await list_models(mock_backend)
+
+        assert max_in_flight == len(traces)
 
 
 class TestListModelsQueryConstruction:
