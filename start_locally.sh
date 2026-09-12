@@ -54,4 +54,4 @@ echo "URL: $BACKEND_URL" >&2
 echo "" >&2
 
 # Start the MCP server in stdio mode (for Claude Desktop/MCP clients)
-uv run opentelemetry-mcp --transport stdio --backend "$BACKEND_TYPE" --url "$BACKEND_URL"
+uv run tracehub-mcp --transport stdio --backend "$BACKEND_TYPE" --url "$BACKEND_URL"

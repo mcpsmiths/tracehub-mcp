@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Opentelemetry MCP Server (`opentelemetry-mcp`) is an MCP (Model Context Protocol) server that enables AI agents to query and analyze OpenTelemetry traces from LLM applications. It parses Opentelemetry semantic conventions (the `gen_ai.*` attributes) to enable automated debugging and observability.
+tracehub-mcp is an MCP (Model Context Protocol) server that enables AI agents to query and analyze OpenTelemetry traces from LLM applications. It parses Opentelemetry semantic conventions (the `gen_ai.*` attributes) to enable automated debugging and observability.
 
 **Key Features:**
 
@@ -24,13 +24,13 @@ Opentelemetry MCP Server (`opentelemetry-mcp`) is an MCP (Model Context Protocol
 uv sync
 
 # Run the server (stdio transport for Claude Desktop)
-uv run opentelemetry-mcp
+uv run tracehub-mcp
 
 # Run with HTTP transport
-uv run opentelemetry-mcp --transport http --port 8000
+uv run tracehub-mcp --transport http --port 8000
 
 # Override backend configuration
-uv run opentelemetry-mcp --backend jaeger --url http://localhost:16686
+uv run tracehub-mcp --backend jaeger --url http://localhost:16686
 
 # Run all tests
 uv run pytest

@@ -1,7 +1,7 @@
-# OpenTelemetry MCP Server
+# tracehub-mcp
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![PyPI](https://img.shields.io/pypi/v/opentelemetry-mcp)](https://pypi.org/project/opentelemetry-mcp/)
+[![PyPI](https://img.shields.io/pypi/v/tracehub-mcp)](https://pypi.org/project/tracehub-mcp/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
 **Query and analyze LLM traces with AI assistance.** Ask Claude to find expensive API calls, debug errors, compare model performance, or track token usage—all from your IDE.
@@ -37,9 +37,9 @@ https://github.com/user-attachments/assets/e2106ef9-0a58-4ba0-8b2b-e114c0b8b4b9
 // Add to claude_desktop_config.json:
 {
   "mcpServers": {
-    "opentelemetry-mcp": {
+    "tracehub-mcp": {
       "command": "pipx",
-      "args": ["run", "opentelemetry-mcp"],
+      "args": ["run", "tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "jaeger",
         "BACKEND_URL": "http://localhost:16686"
@@ -54,9 +54,9 @@ Or use `uvx` (alternative):
 ```json
 {
   "mcpServers": {
-    "opentelemetry-mcp": {
+    "tracehub-mcp": {
       "command": "uvx",
-      "args": ["opentelemetry-mcp"],
+      "args": ["tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "jaeger",
         "BACKEND_URL": "http://localhost:16686"
@@ -76,10 +76,10 @@ Or use `uvx` (alternative):
 
 ```bash
 # Run without installing (recommended)
-pipx run opentelemetry-mcp --backend jaeger --url http://localhost:16686
+pipx run tracehub-mcp --backend jaeger --url http://localhost:16686
 
 # Or with uvx
-uvx opentelemetry-mcp --backend jaeger --url http://localhost:16686
+uvx tracehub-mcp --backend jaeger --url http://localhost:16686
 ```
 
 This approach:
@@ -104,9 +104,9 @@ Configure the MCP server in your Claude Desktop config file:
 ```json
 {
   "mcpServers": {
-    "opentelemetry-mcp": {
+    "tracehub-mcp": {
       "command": "pipx",
-      "args": ["run", "opentelemetry-mcp"],
+      "args": ["run", "tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "jaeger",
         "BACKEND_URL": "http://localhost:16686"
@@ -121,9 +121,9 @@ Configure the MCP server in your Claude Desktop config file:
 ```json
 {
   "mcpServers": {
-    "opentelemetry-mcp": {
+    "tracehub-mcp": {
       "command": "uvx",
-      "args": ["opentelemetry-mcp"],
+      "args": ["tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "jaeger",
         "BACKEND_URL": "http://localhost:16686"
@@ -138,9 +138,9 @@ Configure the MCP server in your Claude Desktop config file:
 ```json
 {
   "mcpServers": {
-    "opentelemetry-mcp": {
+    "tracehub-mcp": {
       "command": "pipx",
-      "args": ["run", "opentelemetry-mcp"],
+      "args": ["run", "tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "traceloop",
         "BACKEND_URL": "https://api.traceloop.com",
@@ -161,8 +161,8 @@ If you're developing locally with the cloned repository, use one of these config
 ```json
 {
   "mcpServers": {
-    "opentelemetry-mcp": {
-      "command": "/absolute/path/to/opentelemetry-mcp-server/start_locally.sh"
+    "tracehub-mcp": {
+      "command": "/absolute/path/to/tracehub-mcp/start_locally.sh"
     }
   }
 }
@@ -173,13 +173,13 @@ If you're developing locally with the cloned repository, use one of these config
 ```json
 {
   "mcpServers": {
-    "opentelemetry-mcp-jaeger": {
+    "tracehub-mcp-jaeger": {
       "command": "uv",
       "args": [
         "--directory",
-        "/absolute/path/to/opentelemetry-mcp-server",
+        "/absolute/path/to/tracehub-mcp",
         "run",
-        "opentelemetry-mcp"
+        "tracehub-mcp"
       ],
       "env": {
         "BACKEND_TYPE": "jaeger",
@@ -221,9 +221,9 @@ claude-code "Show me traces with errors from the last hour"
 
 ```json
 {
-  "opentelemetry-mcp": {
+  "tracehub-mcp": {
     "command": "pipx",
-    "args": ["run", "opentelemetry-mcp"],
+    "args": ["run", "tracehub-mcp"],
     "env": {
       "BACKEND_TYPE": "jaeger",
       "BACKEND_URL": "http://localhost:16686"
@@ -236,9 +236,9 @@ claude-code "Show me traces with errors from the last hour"
 
 ```json
 {
-  "opentelemetry-mcp": {
+  "tracehub-mcp": {
     "command": "uvx",
-    "args": ["opentelemetry-mcp"],
+    "args": ["tracehub-mcp"],
     "env": {
       "BACKEND_TYPE": "jaeger",
       "BACKEND_URL": "http://localhost:16686"
@@ -252,13 +252,13 @@ claude-code "Show me traces with errors from the last hour"
 
 ```json
 {
-  "opentelemetry-mcp": {
+  "tracehub-mcp": {
     "command": "uv",
     "args": [
       "--directory",
-      "/absolute/path/to/opentelemetry-mcp-server",
+      "/absolute/path/to/tracehub-mcp",
       "run",
-      "opentelemetry-mcp"
+      "tracehub-mcp"
     ],
     "env": {
       "BACKEND_TYPE": "jaeger",
@@ -284,9 +284,9 @@ claude-code "Show me traces with errors from the last hour"
 
 ```json
 {
-  "opentelemetry-mcp": {
+  "tracehub-mcp": {
     "command": "pipx",
-    "args": ["run", "opentelemetry-mcp"],
+    "args": ["run", "tracehub-mcp"],
     "env": {
       "BACKEND_TYPE": "jaeger",
       "BACKEND_URL": "http://localhost:16686"
@@ -299,9 +299,9 @@ claude-code "Show me traces with errors from the last hour"
 
 ```json
 {
-  "opentelemetry-mcp": {
+  "tracehub-mcp": {
     "command": "uvx",
-    "args": ["opentelemetry-mcp"],
+    "args": ["tracehub-mcp"],
     "env": {
       "BACKEND_TYPE": "jaeger",
       "BACKEND_URL": "http://localhost:16686"
@@ -315,13 +315,13 @@ claude-code "Show me traces with errors from the last hour"
 
 ```json
 {
-  "opentelemetry-mcp": {
+  "tracehub-mcp": {
     "command": "uv",
     "args": [
       "--directory",
-      "/absolute/path/to/opentelemetry-mcp-server",
+      "/absolute/path/to/tracehub-mcp",
       "run",
-      "opentelemetry-mcp"
+      "tracehub-mcp"
     ],
     "env": {
       "BACKEND_TYPE": "jaeger",
@@ -345,9 +345,9 @@ Configure the MCP server in your Gemini CLI config file (`~/.gemini/config.json`
 ```json
 {
   "mcpServers": {
-    "opentelemetry-mcp": {
+    "tracehub-mcp": {
       "command": "pipx",
-      "args": ["run", "opentelemetry-mcp"],
+      "args": ["run", "tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "jaeger",
         "BACKEND_URL": "http://localhost:16686"
@@ -362,9 +362,9 @@ Configure the MCP server in your Gemini CLI config file (`~/.gemini/config.json`
 ```json
 {
   "mcpServers": {
-    "opentelemetry-mcp": {
+    "tracehub-mcp": {
       "command": "uvx",
-      "args": ["opentelemetry-mcp"],
+      "args": ["tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "jaeger",
         "BACKEND_URL": "http://localhost:16686"
@@ -386,13 +386,13 @@ gemini "Analyze token usage for gpt-4 requests today"
 ```json
 {
   "mcpServers": {
-    "opentelemetry-mcp": {
+    "tracehub-mcp": {
       "command": "uv",
       "args": [
         "--directory",
-        "/absolute/path/to/opentelemetry-mcp-server",
+        "/absolute/path/to/tracehub-mcp",
         "run",
-        "opentelemetry-mcp"
+        "tracehub-mcp"
       ],
       "env": {
         "BACKEND_TYPE": "jaeger",
@@ -419,19 +419,19 @@ If you prefer to install the command globally:
 
 ```bash
 # Install with pipx
-pipx install opentelemetry-mcp
+pipx install tracehub-mcp
 
 # Verify
-opentelemetry-mcp --help
+tracehub-mcp --help
 
 # Upgrade
-pipx upgrade opentelemetry-mcp
+pipx upgrade tracehub-mcp
 ```
 
 Or with pip:
 
 ```bash
-pip install opentelemetry-mcp
+pip install tracehub-mcp
 ```
 
 </details>
@@ -482,8 +482,8 @@ If you're contributing to the project or want to make local modifications:
 
 ```bash
 # Clone the repository
-git clone https://github.com/traceloop/opentelemetry-mcp-server.git
-cd opentelemetry-mcp-server
+git clone https://github.com/mcpsmiths/tracehub-mcp.git
+cd tracehub-mcp
 
 # Install dependencies with UV
 uv sync
@@ -517,8 +517,8 @@ BACKEND_URL=http://localhost:16686
 **Option 2: CLI Arguments** (Override environment)
 
 ```bash
-opentelemetry-mcp --backend jaeger --url http://localhost:16686
-opentelemetry-mcp --backend traceloop --url https://api.traceloop.com --api-key YOUR_KEY
+tracehub-mcp --backend jaeger --url http://localhost:16686
+tracehub-mcp --backend traceloop --url https://api.traceloop.com --api-key YOUR_KEY
 ```
 
 > **Configuration Precedence:** CLI arguments > Environment variables > Defaults
@@ -602,7 +602,7 @@ Claude Desktop integration example:
 {
   "mcpServers": {
     "opentelemetry": {
-      "command": "opentelemetry-mcp",
+      "command": "tracehub-mcp",
       "env": {
         "BACKEND_TYPE": "datadog",
         "BACKEND_URL": "https://api.datadoghq.com",
@@ -652,16 +652,16 @@ Start the MCP server with stdio transport for local/Claude Desktop integration:
 
 ```bash
 # If installed with pipx/pip
-opentelemetry-mcp
+tracehub-mcp
 
 # If running from cloned repository with UV
-uv run opentelemetry-mcp
+uv run tracehub-mcp
 
 # With backend override (pipx/pip)
-opentelemetry-mcp --backend jaeger --url http://localhost:16686
+tracehub-mcp --backend jaeger --url http://localhost:16686
 
 # With backend override (UV)
-uv run opentelemetry-mcp --backend jaeger --url http://localhost:16686
+uv run tracehub-mcp --backend jaeger --url http://localhost:16686
 ```
 
 #### HTTP Transport (for Network Access)
@@ -670,16 +670,16 @@ Start the MCP server with HTTP/SSE transport for remote access:
 
 ```bash
 # If installed with pipx/pip
-opentelemetry-mcp --transport http
+tracehub-mcp --transport http
 
 # If running from cloned repository with UV
-uv run opentelemetry-mcp --transport http
+uv run tracehub-mcp --transport http
 
 # Specify custom host and port (pipx/pip)
-opentelemetry-mcp --transport http --host 127.0.0.1 --port 9000
+tracehub-mcp --transport http --host 127.0.0.1 --port 9000
 
 # With UV
-uv run opentelemetry-mcp --transport http --host 127.0.0.1 --port 9000
+uv run tracehub-mcp --transport http --host 127.0.0.1 --port 9000
 ```
 
 The HTTP server will be accessible at `http://localhost:8000/sse` by default.
@@ -1045,7 +1045,7 @@ Make sure your API key is set correctly:
 ```bash
 export BACKEND_API_KEY=your_key_here
 # Or use --api-key CLI flag
-opentelemetry-mcp --api-key your_key_here
+tracehub-mcp --api-key your_key_here
 ```
 
 ### No Traces Found
@@ -1093,6 +1093,6 @@ Apache 2.0 License - see LICENSE file for details
 
 For issues and questions:
 
-- GitHub Issues: https://github.com/traceloop/opentelemetry-mcp-server/issues
-- PyPI Package: https://pypi.org/project/opentelemetry-mcp/
+- GitHub Issues: https://github.com/mcpsmiths/tracehub-mcp/issues
+- PyPI Package: https://pypi.org/project/tracehub-mcp/
 - Traceloop Community: https://traceloop.com/slack

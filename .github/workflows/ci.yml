@@ -64,7 +64,7 @@ jobs:
                       runs-on: ubuntu-latest
                       docker-platform: linux/amd64
                     - platform: arm64
-                      runs-on: Linux-ARM64
+                      runs-on: ubuntu-24.04-arm
                       docker-platform: linux/arm64
         steps:
             - uses: actions/checkout@v6
@@ -79,11 +79,76 @@ jobs:
                   context: .
                   load: true
                   push: false
-                  tags: opentelemetry-mcp-server:${{ github.sha }}-${{ matrix.platform }}
-            - name: Trivy Scan
-              uses: traceloop/.github/actions/ci-action-trivy@main
+                  tags: tracehub-mcp-server:${{ github.sha }}-${{ matrix.platform }}
+            - name: Cache Trivy
+              uses: actions/cache@v4
               with:
-                image_ref: opentelemetry-mcp-server:${{ github.sha }}-${{ matrix.platform }}
-                image_name: opentelemetry-mcp-server-${{ matrix.platform }}
-                scanners: secret,vuln
-                severity: CRITICAL,HIGH
+                  path: ~/.cache/trivy
+                  key: trivy-${{ runner.os }}-${{ matrix.platform }}
+                  restore-keys: |
+                      trivy-${{ runner.os }}-
+            - name: Trivy scan (JSON)
+              uses: aquasecurity/trivy-action@v0.35.0
+              with:
+                  image-ref: tracehub-mcp-server:${{ github.sha }}-${{ matrix.platform }}
+                  scanners: secret,vuln
+                  exit-code: "0"
+                  severity: CRITICAL,HIGH
+                  format: json
+                  output: trivy-results-${{ matrix.platform }}.json
+            - name: Convert to table
+              run: trivy convert --format table --output trivy-results-${{ matrix.platform }}.txt trivy-results-${{ matrix.platform }}.json
+            - name: Convert to SARIF
+              if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+              run: trivy convert --format sarif --output trivy-results-${{ matrix.platform }}.sarif trivy-results-${{ matrix.platform }}.json
+            - name: Upload SARIF to GitHub Security
+              if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+              uses: github/codeql-action/upload-sarif@v4
+              with:
+                  sarif_file: trivy-results-${{ matrix.platform }}.sarif
+                  category: container-security-tracehub-mcp-server-${{ matrix.platform }}
+            - name: Log Trivy results
+              run: |
+                  echo "::group::Trivy Scan Results (tracehub-mcp-server-${{ matrix.platform }})"
+                  if [ -s "trivy-results-${{ matrix.platform }}.txt" ]; then
+                    cat "trivy-results-${{ matrix.platform }}.txt"
+                  else
+                    echo "No issues found!"
+                  fi
+                  echo "::endgroup::"
+            - name: Prepare PR comment
+              if: github.event_name == 'pull_request'
+              run: |
+                  MAX_CHARS=60000
+                  RESULTS_FILE="trivy-results-${{ matrix.platform }}.txt"
+                  COMMENT_FILE="trivy-comment-${{ matrix.platform }}.md"
+                  FILE_SIZE=$(wc -c < "$RESULTS_FILE" || echo "0")
+                  {
+                    echo "## Container Security Scan (tracehub-mcp-server-${{ matrix.platform }})"
+                    echo ""
+                    if [ ! -s "$RESULTS_FILE" ]; then
+                      echo "**No vulnerabilities found!**"
+                    else
+                      echo "<details>"
+                      echo "<summary>Click to expand results</summary>"
+                      echo ""
+                      echo '```'
+                      if [ "$FILE_SIZE" -gt "$MAX_CHARS" ]; then
+                        head -c "$MAX_CHARS" "$RESULTS_FILE"
+                        echo ""
+                        echo "... (output truncated - exceeded ${MAX_CHARS} characters)"
+                        echo "See full results in workflow logs"
+                      else
+                        cat "$RESULTS_FILE"
+                      fi
+                      echo '```'
+                      echo ""
+                      echo "</details>"
+                    fi
+                  } > "$COMMENT_FILE"
+            - name: Post PR comment
+              if: github.event_name == 'pull_request'
+              uses: marocchino/sticky-pull-request-comment@v2
+              with:
+                  header: trivy-scan-tracehub-mcp-server-${{ matrix.platform }}
+                  path: trivy-comment-${{ matrix.platform }}.md

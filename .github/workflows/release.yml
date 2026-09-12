@@ -14,19 +14,16 @@ jobs:
     outputs:
       new_version: ${{ steps.cz.outputs.version }}
     steps:
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.OSS_CI_BOT_APP_ID }}
-          private-key: ${{ secrets.OSS_CI_BOT_PRIVATE_KEY }}
-          repositories: ${{ github.event.repository.name }}
-
       - name: Checkout code
         uses: actions/checkout@v6
         with:
           fetch-depth: 0  # Full history required for Commitizen
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config --global user.name "sairam0424"
+          git config --global user.email "uggesairam0000@gmail.com"
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -40,7 +37,7 @@ jobs:
         id: cz
         uses: commitizen-tools/commitizen-action@master
         with:
-          github_token: ${{ steps.app-token.outputs.token }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           changelog_increment_filename: body.md
 
       - name: Print version info
@@ -103,9 +100,9 @@ jobs:
 
       - name: Test installation from PyPI
         run: |
-          pip install opentelemetry-mcp==${{ needs.bump-version.outputs.new_version }}
+          pip install tracehub-mcp==${{ needs.bump-version.outputs.new_version }}
           python -c "import opentelemetry_mcp; print(f'Installed version: {opentelemetry_mcp.__version__}')"
-          opentelemetry-mcp --help
+          tracehub-mcp --help
 
       - name: Installation successful
         run: echo "✅ Package successfully published and verified on PyPI!"

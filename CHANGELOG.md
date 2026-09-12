@@ -1,3 +1,10 @@
+## [Unreleased]
+
+### Changed
+
+- Forked from traceloop/opentelemetry-mcp-server (Apache 2.0) and renamed to tracehub-mcp, now maintained under github.com/mcpsmiths/tracehub-mcp. See NOTICE for full attribution.
+- Added a Datadog backend (search, get_trace, list_services, health_check), fully hardened per CodeRabbit review.
+
 ## v0.2.2 (2026-02-08)
 
 ### Fix

@@ -56,7 +56,7 @@ _backend: BaseBackend | None = None
 _config: ServerConfig | None = None
 
 # Initialize FastMCP server
-mcp = FastMCP("opentelemetry-mcp")
+mcp = FastMCP("tracehub-mcp")
 
 
 def _create_backend(config: ServerConfig) -> BaseBackend:
@@ -667,13 +667,13 @@ def main(
 
     Examples:
       # Run with stdio transport (default, for Claude Desktop)
-      opentelemetry-mcp --backend traceloop
+      tracehub-mcp --backend traceloop
 
       # Run with HTTP transport for network access
-      opentelemetry-mcp --transport http --port 8000
+      tracehub-mcp --transport http --port 8000
 
       # Run with HTTP on specific host/port
-      opentelemetry-mcp --transport http --host 127.0.0.1 --port 9000
+      tracehub-mcp --transport http --host 127.0.0.1 --port 9000
     """
     global _config
 
