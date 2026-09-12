@@ -1,9 +1,26 @@
-## [Unreleased]
+## v0.2.0 (2026-09-12)
 
-### Changed
+### Feat
 
-- Forked from traceloop/opentelemetry-mcp-server (Apache 2.0) and renamed to tracehub-mcp, now maintained under github.com/mcpsmiths/tracehub-mcp. See NOTICE for full attribution.
-- Added a Datadog backend (search, get_trace, list_services, health_check), fully hardened per CodeRabbit review.
+- add Sentry backend (search, get_trace, list_services, health_check)
+- add Datadog backend (search/get_trace/list_services/health_check)
+
+### Fix
+
+- correct Commitizen version drift and release.yml git identity
+- reject spans missing service/operation identity in Datadog backend
+- reject unescaped filter field names in Datadog query builder
+- remove hardcoded Traceloop API key from start_locally.sh
+- complete the tracehub-mcp rename, remove old-org CI dependencies
+- declare explicit hatch wheel package path
+- reject entries with non-dict attributes; dedupe test fake-client stubs
+- harden _search_spans_raw against a fully malformed response envelope
+- address round-2 CodeRabbit findings (query escaping, response validation, get_trace limit)
+- address CodeRabbit review findings on the Datadog backend
+- **deps**: resolve 2 Dependabot CVEs (pydantic-settings, vcrpy) (#48)
+- **deps**: resolve 26 Dependabot CVEs via dependency upgrades (#47)
+- **deps**: resolve 12 Dependabot CVEs via dependency upgrades (#34)
+- **deps**: upgrade cryptography and fastmcp for security alerts + bumps (#26)
 
 ## v0.2.2 (2026-02-08)
 
