@@ -16,11 +16,19 @@ load_dotenv()
 class BackendConfig(BaseModel):
     """Configuration for OpenTelemetry trace backend."""
 
-    type: Literal["jaeger", "tempo", "traceloop", "datadog"]
+    type: Literal["jaeger", "tempo", "traceloop", "datadog", "sentry"]
     url: HttpUrl
     api_key: str | None = Field(default=None, exclude=True)
     app_key: str | None = Field(
         default=None, exclude=True, description="Datadog Application key (Datadog backend only)"
+    )
+    sentry_org: str | None = Field(
+        default=None, exclude=True, description="Sentry organization slug (Sentry backend only)"
+    )
+    sentry_project: str | None = Field(
+        default=None,
+        exclude=True,
+        description="Sentry project slug, optional (Sentry backend only)",
     )
     timeout: float = Field(default=30.0, gt=0, le=300)
     environments: list[str] = Field(default_factory=lambda: ["prd"])
@@ -38,10 +46,10 @@ class BackendConfig(BaseModel):
         """Load configuration from environment variables."""
         backend_type = os.getenv("BACKEND_TYPE", "jaeger")
         backend_url = os.getenv("BACKEND_URL", "http://localhost:16686")
-        if backend_type not in ["jaeger", "tempo", "traceloop", "datadog"]:
+        if backend_type not in ["jaeger", "tempo", "traceloop", "datadog", "sentry"]:
             raise ValueError(
                 f"Invalid BACKEND_TYPE: {backend_type}. "
-                "Must be one of: jaeger, tempo, traceloop, datadog"
+                "Must be one of: jaeger, tempo, traceloop, datadog, sentry"
             )
 
         # Parse environments from comma-separated string
@@ -61,6 +69,8 @@ class BackendConfig(BaseModel):
             url=backend_url,  # type: ignore
             api_key=os.getenv("BACKEND_API_KEY"),
             app_key=os.getenv("BACKEND_APP_KEY"),
+            sentry_org=os.getenv("BACKEND_SENTRY_ORG"),
+            sentry_project=os.getenv("BACKEND_SENTRY_PROJECT"),
             timeout=timeout,
             environments=environments,
         )
@@ -104,14 +114,16 @@ class ServerConfig(BaseModel):
         backend_url: str | None = None,
         api_key: str | None = None,
         app_key: str | None = None,
+        sentry_org: str | None = None,
+        sentry_project: str | None = None,
         environments: str | None = None,
     ) -> None:
         """Apply CLI argument overrides to configuration."""
         if backend_type:
-            if backend_type not in ["jaeger", "tempo", "traceloop", "datadog"]:
+            if backend_type not in ["jaeger", "tempo", "traceloop", "datadog", "sentry"]:
                 raise ValueError(
                     f"Invalid backend type: {backend_type}. "
-                    "Must be one of: jaeger, tempo, traceloop, datadog"
+                    "Must be one of: jaeger, tempo, traceloop, datadog, sentry"
                 )
             self.backend.type = backend_type  # type: ignore
 
@@ -123,6 +135,12 @@ class ServerConfig(BaseModel):
 
         if app_key:
             self.backend.app_key = app_key
+
+        if sentry_org:
+            self.backend.sentry_org = sentry_org
+
+        if sentry_project:
+            self.backend.sentry_project = sentry_project
 
         if environments:
             self.backend.environments = [

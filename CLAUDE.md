@@ -8,7 +8,7 @@ tracehub-mcp is an MCP (Model Context Protocol) server that enables AI agents to
 
 **Key Features:**
 
-- Multi-backend support: Jaeger, Grafana Tempo, and Traceloop
+- Multi-backend support: Jaeger, Grafana Tempo, Traceloop, Datadog, and Sentry
 - 9 MCP tools: Core tools + LLM-oriented discovery and analysis tools
 - Token usage tracking and aggregation across models/services
 - Finish reasons tracking for debugging truncated/filtered responses
@@ -78,6 +78,8 @@ Concrete implementations:
 - [backends/jaeger.py](opentelemetry_mcp/backends/jaeger.py) - Jaeger backend
 - [backends/tempo.py](opentelemetry_mcp/backends/tempo.py) - Grafana Tempo backend
 - [backends/traceloop.py](opentelemetry_mcp/backends/traceloop.py) - Traceloop backend
+- [backends/datadog.py](opentelemetry_mcp/backends/datadog.py) - Datadog backend
+- [backends/sentry.py](opentelemetry_mcp/backends/sentry.py) - Sentry backend
 
 ### Tool-Based Architecture
 
@@ -121,9 +123,12 @@ return {"result": data}
 
 **Environment Variables** (see [.env.example](.env.example)):
 
-- `BACKEND_TYPE` - Required: `jaeger`, `tempo`, or `traceloop`
+- `BACKEND_TYPE` - Required: `jaeger`, `tempo`, `traceloop`, `datadog`, or `sentry`
 - `BACKEND_URL` - Required: Backend API endpoint
 - `BACKEND_API_KEY` - Optional: Authentication key
+- `BACKEND_APP_KEY` - Required for Datadog backend only: Application key, in addition to `BACKEND_API_KEY`
+- `BACKEND_SENTRY_ORG` - Required for Sentry backend only: Organization slug
+- `BACKEND_SENTRY_PROJECT` - Optional for Sentry backend: Project slug to narrow queries
 - `BACKEND_TIMEOUT` - Optional: Request timeout (default: 30s)
 - `LOG_LEVEL` - Optional: Logging level (default: INFO)
 - `MAX_TRACES_PER_QUERY` - Optional: Result limit (default: 100)

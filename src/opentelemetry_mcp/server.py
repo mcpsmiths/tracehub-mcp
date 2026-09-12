@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.datadog import DatadogBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
+from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.config import ServerConfig
@@ -101,6 +102,15 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             app_key=backend_config.app_key,
+            timeout=backend_config.timeout,
+        )
+    elif backend_config.type == "sentry":
+        logger.info(f"Initializing Sentry backend: {backend_config.url}")
+        return SentryBackend(
+            url=str(backend_config.url),
+            api_key=backend_config.api_key,
+            org_slug=backend_config.sentry_org,
+            project_slug=backend_config.sentry_project,
             timeout=backend_config.timeout,
         )
     else:
@@ -604,7 +614,7 @@ async def list_llm_tools_tool(
 @click.command()
 @click.option(
     "--backend",
-    type=click.Choice(["jaeger", "tempo", "traceloop", "datadog"]),
+    type=click.Choice(["jaeger", "tempo", "traceloop", "datadog", "sentry"]),
     help="Backend type (overrides BACKEND_TYPE env var)",
 )
 @click.option(
@@ -622,6 +632,18 @@ async def list_llm_tools_tool(
     type=str,
     help="Application key, required by the Datadog backend in addition to "
     "--api-key (overrides BACKEND_APP_KEY env var)",
+)
+@click.option(
+    "--sentry-org",
+    type=str,
+    help="Sentry organization slug, required by the Sentry backend "
+    "(overrides BACKEND_SENTRY_ORG env var)",
+)
+@click.option(
+    "--sentry-project",
+    type=str,
+    help="Sentry project slug, optional for the Sentry backend "
+    "(overrides BACKEND_SENTRY_PROJECT env var)",
 )
 @click.option(
     "--environments",
@@ -651,6 +673,8 @@ def main(
     url: str | None,
     api_key: str | None,
     app_key: str | None,
+    sentry_org: str | None,
+    sentry_project: str | None,
     environments: str | None,
     transport: str,
     host: str,
@@ -658,7 +682,7 @@ def main(
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
-    Supports multiple backends: Jaeger, Tempo, Traceloop, and Datadog.
+    Supports multiple backends: Jaeger, Tempo, Traceloop, Datadog, and Sentry.
     Configuration can be provided via environment variables or CLI arguments.
 
     Transport options:
@@ -685,12 +709,14 @@ def main(
         logging.getLogger().setLevel(_config.log_level)
 
         # Apply CLI overrides
-        if backend or url or api_key or app_key or environments:
+        if backend or url or api_key or app_key or sentry_org or sentry_project or environments:
             _config.apply_cli_overrides(
                 backend_type=backend,
                 backend_url=url,
                 api_key=api_key,
                 app_key=app_key,
+                sentry_org=sentry_org,
+                sentry_project=sentry_project,
                 environments=environments,
             )
 

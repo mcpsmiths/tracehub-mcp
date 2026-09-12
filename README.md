@@ -440,7 +440,7 @@ pip install tracehub-mcp
 
 ### Core Capabilities
 
-- **🔌 Multiple Backend Support** - Connect to Jaeger, Grafana Tempo, Traceloop, or Datadog
+- **🔌 Multiple Backend Support** - Connect to Jaeger, Grafana Tempo, Traceloop, Datadog, or Sentry
 - **🤖 LLM-First Design** - Specialized tools for analyzing AI application traces
 - **🔍 Advanced Filtering** - Generic filter system with powerful operators
 - **📊 Token Analytics** - Track and aggregate LLM token usage across models and services
@@ -463,18 +463,19 @@ pip install tracehub-mcp
 
 ### Backend Support Matrix
 
-| Feature          | Jaeger | Tempo | Traceloop | Datadog |
-| ---------------- | :----: | :---: | :-------: | :-----: |
-| Search traces    |   ✓    |   ✓   |     ✓     |   ✓†    |
-| Advanced filters |   ✓    |   ✓   |     ✓     |    ✓    |
-| Span search      |  ✓\*   |   ✓   |     ✓     |    ✓    |
-| Token tracking   |   ✓    |   ✓   |     ✓     |    ✓    |
-| Error traces     |   ✓    |   ✓   |     ✓     |    ✓    |
-| LLM tools        |   ✓    |   ✓   |     ✓     |    ✓    |
+| Feature          | Jaeger | Tempo | Traceloop | Datadog | Sentry |
+| ---------------- | :----: | :---: | :-------: | :-----: | :----: |
+| Search traces    |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓    |
+| Advanced filters |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |
+| Span search      |  ✓\*   |   ✓   |     ✓     |    ✓    |   ✓    |
+| Token tracking   |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |
+| Error traces     |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |
+| LLM tools        |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |
 
 <sub>\* Jaeger requires `service_name` parameter for span search</sub>
 <sub>† Datadog has no trace-level API; traces are reconstructed by searching spans and
-grouping by `trace_id`</sub>
+grouping by `trace_id`. Sentry, unlike Datadog, does have a native trace-lookup
+endpoint, so `get_trace` calls it directly.</sub>
 
 ### For Developers
 
@@ -504,6 +505,7 @@ uv pip install -e ".[dev]"
 | **Tempo**     | Local/Cloud | `http://localhost:3200`     | Grafana's trace backend        |
 | **Traceloop** | Cloud       | `https://api.traceloop.com` | Requires API key                |
 | **Datadog**   | Cloud       | `https://api.datadoghq.com` | Requires API key + App key     |
+| **Sentry**    | Cloud/Self-hosted | `https://sentry.io`   | Requires API key + org slug    |
 
 ### Quick Configuration
 
@@ -528,10 +530,12 @@ tracehub-mcp --backend traceloop --url https://api.traceloop.com --api-key YOUR_
 
 | Variable               | Type    | Default  | Description                                                  |
 | ---------------------- | ------- | -------- | -------------------------------------------------------------- |
-| `BACKEND_TYPE`         | string  | `jaeger` | Backend type: `jaeger`, `tempo`, `traceloop`, or `datadog`    |
+| `BACKEND_TYPE`         | string  | `jaeger` | Backend type: `jaeger`, `tempo`, `traceloop`, `datadog`, or `sentry` |
 | `BACKEND_URL`          | URL     | -        | Backend API endpoint (required)                                |
-| `BACKEND_API_KEY`      | string  | -        | API key (required for Traceloop and Datadog)                   |
+| `BACKEND_API_KEY`      | string  | -        | API key (required for Traceloop, Datadog, and Sentry)           |
 | `BACKEND_APP_KEY`      | string  | -        | Application key (required for Datadog, in addition to API key) |
+| `BACKEND_SENTRY_ORG`   | string  | -        | Organization slug (required for Sentry)                        |
+| `BACKEND_SENTRY_PROJECT` | string | -      | Project slug (optional for Sentry, narrows queries)             |
 | `BACKEND_TIMEOUT`      | integer | `30`     | Request timeout in seconds                                     |
 | `LOG_LEVEL`            | string  | `INFO`   | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `MAX_TRACES_PER_QUERY` | integer | `100`    | Maximum traces to return per query (1-1000)        |
@@ -625,6 +629,56 @@ Claude Desktop integration example:
 > the App key specifically for querying, even though ingestion only needs the
 > API key. If you're on the EU site, double check `BACKEND_URL` is
 > `https://api.datadoghq.eu`, not the US default.
+
+### Sentry
+
+```bash
+BACKEND_TYPE=sentry
+# SaaS (may be region-specific, e.g. https://us.sentry.io):
+BACKEND_URL=https://sentry.io
+BACKEND_API_KEY=your_auth_token_here
+BACKEND_SENTRY_ORG=your-org-slug
+# Optional: narrow queries to one project
+BACKEND_SENTRY_PROJECT=your-project-slug
+```
+
+Claude Desktop integration example:
+
+```json
+{
+  "mcpServers": {
+    "opentelemetry": {
+      "command": "tracehub-mcp",
+      "env": {
+        "BACKEND_TYPE": "sentry",
+        "BACKEND_URL": "https://sentry.io",
+        "BACKEND_API_KEY": "your_auth_token_here",
+        "BACKEND_SENTRY_ORG": "your-org-slug"
+      }
+    }
+  }
+}
+```
+
+> **Note:** Sentry requires **both** an auth token *and* an organization
+> slug - every Sentry API endpoint this backend calls is organization-scoped,
+> so there is no way to query without one. Trace search uses
+> [Sentry's search syntax](https://docs.sentry.io/concepts/search/) against
+> the Discover/Explore Events API rather than TraceQL or Jaeger-style tag
+> params. Unlike Datadog, Sentry does have a native trace-lookup endpoint, so
+> `get_trace` calls it directly instead of reconstructing a trace from a span
+> search - `search_traces` still discovers candidate trace IDs via a span
+> search first, since Sentry's search surface is itself span-centric.
+>
+> **Troubleshooting:** a `403`/`401` from the Sentry API almost always means
+> the auth token is missing, invalid, or lacks the necessary scopes - a
+> `404` on an org-scoped endpoint usually means the organization slug is
+> wrong. For a self-hosted install, `BACKEND_URL` should be the install's own
+> base URL, not `https://sentry.io`. Some of the tracing endpoints this
+> backend depends on are newer/experimental on Sentry's side and may not be
+> available on every plan or self-hosted version - see the module docstring
+> in [backends/sentry.py](src/opentelemetry_mcp/backends/sentry.py) for the
+> specific endpoints and known limitations.
 
 </details>
 
