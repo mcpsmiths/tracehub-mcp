@@ -1,0 +1,11 @@
+This project (obs-mcp) is a fork of opentelemetry-mcp-server
+(https://github.com/traceloop/opentelemetry-mcp-server), licensed under the
+Apache License, Version 2.0. See LICENSE for the full license text.
+
+Full history of changes made to the original codebase is preserved in this
+repository's git history (this fork was created via `git clone` + `git remote`,
+not by copying files into a fresh repository).
+
+Substantial modifications and additions — including a Datadog backend, and
+additional observability backends and capabilities planned beyond the
+original Jaeger/Tempo/Traceloop support — are Copyright (c) 2026 sairam0424.

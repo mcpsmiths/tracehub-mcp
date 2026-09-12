@@ -1,11 +1,12 @@
 [project]
-name = "opentelemetry-mcp"
-version = "0.2.2"
-description = "MCP server for querying OpenTelemetry traces from LLM applications with Opentelemetry support"
+name = "obs-mcp"
+version = "0.1.0"
+description = "MCP server for querying OpenTelemetry traces across multiple observability backends (Jaeger, Tempo, Traceloop, Datadog, and more) for LLM application debugging"
 authors = [
     {name = "Doron Kopit", email = "doron@traceloop.com"},
     {name = "Gal Klienman", email = "gal@traceloop.com"},
-    {name = "Nir Gazit", email = "nir@traceloop.com"}
+    {name = "Nir Gazit", email = "nir@traceloop.com"},
+    {name = "sairam0424", email = "uggesairam0000@gmail.com"}
 ]
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -21,7 +22,8 @@ keywords = [
     "telemetry",
     "jaeger",
     "tempo",
-    "traceloop"
+    "traceloop",
+    "datadog"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -54,7 +56,7 @@ Issues = "https://github.com/traceloop/opentelemetry-mcp-server/issues"
 Changelog = "https://github.com/traceloop/opentelemetry-mcp-server/blob/main/CHANGELOG.md"
 
 [project.scripts]
-opentelemetry-mcp = "opentelemetry_mcp.server:main"
+obs-mcp = "opentelemetry_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
