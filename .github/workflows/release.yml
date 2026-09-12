@@ -50,8 +50,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.cz.outputs.version }}" \
-            --title "Release ${{ steps.cz.outputs.version }}" \
+          # steps.cz.outputs.version is the BARE version (e.g. "0.2.0"), but
+          # `cz bump` itself creates its git tag using this repo's tag_format
+          # ("v$version" per .cz.toml) -- using the bare version here instead
+          # creates a second, different tag with no commit history relation
+          # to the one cz already made, attaching the Release to the wrong
+          # one. Apply the same "v" prefix so the Release lands on the tag
+          # that actually exists.
+          gh release create "v${{ steps.cz.outputs.version }}" \
+            --title "Release v${{ steps.cz.outputs.version }}" \
             --notes-file "body.md"
 
   build-and-publish:
