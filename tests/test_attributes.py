@@ -18,6 +18,9 @@ intermediate variable or a `# type: ignore[arg-type]`); model_validate is
 the pattern the rest of this test suite already uses for the same reason.
 """
 
+from hypothesis import given
+from hypothesis import strategies as st
+
 from opentelemetry_mcp.attributes import SpanAttributes
 
 
@@ -59,3 +62,28 @@ def test_finish_reasons_does_not_raise_on_unparseable_garbage() -> None:
 def test_legacy_llm_response_finish_reasons_gets_the_same_coercion() -> None:
     attrs = SpanAttributes.model_validate({"llm.response.finish_reasons": '["stop"]'})
     assert attrs.llm_response_finish_reasons == ["stop"]
+
+
+@given(
+    value=st.one_of(
+        st.none(),
+        st.text(),
+        st.lists(st.text()),
+        st.integers(),
+        st.floats(allow_nan=True, allow_infinity=True),
+        st.booleans(),
+        st.dictionaries(st.text(), st.integers()),
+        st.tuples(st.integers(), st.integers()),
+    )
+)
+def test_finish_reasons_coercion_never_raises(value: object) -> None:
+    """Property pinning _coerce_finish_reasons's own stated contract: no
+    matter what shape this field arrives in, construction must succeed and
+    the field must end up either None or a real list[str] - never propagate
+    a ValidationError, since that is exactly what silently dropped whole
+    spans upstream (see module docstring)."""
+    attrs = SpanAttributes.model_validate({"gen_ai.response.finish_reasons": value})
+    result = attrs.gen_ai_response_finish_reasons
+    assert result is None or (
+        isinstance(result, list) and all(isinstance(item, str) for item in result)
+    )

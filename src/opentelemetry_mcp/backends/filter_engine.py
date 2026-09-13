@@ -1,6 +1,7 @@
 """Client-side filter engine for post-query filtering of traces and spans."""
 
 import logging
+import math
 from typing import Any, TypeVar, overload
 
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, SpanData, TraceData
@@ -219,6 +220,16 @@ class FilterEngine:
                 expected_values_num = (
                     [float(v) for v in expected_values] if expected_values is not None else None
                 )
+
+                # NaN compares False against everything, including itself, so GT/LTE
+                # (and LT/GTE) silently agree on False instead of being complements -
+                # a NaN-valued attribute would otherwise pass neither a "greater than"
+                # nor a "less than or equal to" filter, rather than being rejected
+                # once like any other malformed numeric value below.
+                if math.isnan(actual_num) or (
+                    expected_num is not None and math.isnan(expected_num)
+                ):
+                    raise ValueError(f"NaN is not a comparable numeric value: {actual!r}")
 
                 # Apply numeric operators
                 if operator == FilterOperator.EQUALS:

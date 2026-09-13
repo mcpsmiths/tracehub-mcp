@@ -87,7 +87,11 @@ class SpanAttributes(BaseModel):
                 if isinstance(parsed, list):
                     return [str(item) for item in parsed]
             return [part.strip() for part in stripped.split(",") if part.strip()]
-        return value
+        # Any other type (int, dict, bool, ...) can't be interpreted as a list
+        # of finish reasons. Coercing to None - dropping just this field - is
+        # a strictly smaller loss than the ValidationError raising here would
+        # cause, per this function's own never-raise contract above.
+        return None
 
     def to_dict(self) -> dict[str, str | int | float | bool]:
         """
