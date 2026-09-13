@@ -6,6 +6,9 @@
 [![PyPI](https://img.shields.io/pypi/v/tracehub-mcp.svg)](https://pypi.org/project/tracehub-mcp/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
+[![mcpsmiths/tracehub-mcp MCP server](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp/badges/score.svg)](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp)
+
+Also listed on the [official MCP registry](https://registry.modelcontextprotocol.io/v0/servers?search=tracehub) as `io.github.mcpsmiths/tracehub-mcp`.
 
 **Give your AI assistant a direct line into your observability backend.** tracehub-mcp is an MCP (Model Context Protocol) server that lets Claude, Cursor, Windsurf, Gemini CLI, or any MCP client query OpenTelemetry traces from your LLM/GenAI application and reason about them — find expensive calls, debug errors, compare model performance, track token usage — without you copy-pasting trace JSON into a chat window.
 
@@ -768,7 +771,7 @@ git clone https://github.com/mcpsmiths/tracehub-mcp.git
 cd tracehub-mcp
 uv sync --group dev   # pulls in pytest, mypy, ruff, etc. for local iteration
 
-# Tests (213 passed, 2 skipped at time of writing)
+# Tests (458 passed, 2 skipped at time of writing)
 uv run pytest
 
 # With coverage

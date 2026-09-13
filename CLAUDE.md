@@ -9,7 +9,7 @@ tracehub-mcp is an MCP (Model Context Protocol) server that enables AI agents to
 **Key Features:**
 
 - Multi-backend support: Jaeger, Grafana Tempo, Traceloop, Datadog, and Sentry
-- 9 MCP tools: Core tools + LLM-oriented discovery and analysis tools
+- 11 MCP tools: Core tools + LLM-oriented discovery and analysis tools
 - Token usage tracking and aggregation across models/services
 - Finish reasons tracking for debugging truncated/filtered responses
 - Enhanced token calculation supporting all `gen_ai.usage.*` attributes
