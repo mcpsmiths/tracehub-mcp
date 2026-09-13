@@ -14,6 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
+from opentelemetry_mcp import __version__
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.datadog import DatadogBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
@@ -70,7 +71,7 @@ _backend: BaseBackend | None = None
 _config: ServerConfig | None = None
 
 # Initialize FastMCP server
-mcp = FastMCP("tracehub-mcp")
+mcp = FastMCP("tracehub-mcp", version=__version__)
 
 
 def _create_backend(config: ServerConfig) -> BaseBackend:
