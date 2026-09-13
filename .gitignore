@@ -8,6 +8,10 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+
+# MCPB bundle build artifact (mcpb/ has the source; the packed .mcpb is
+# rebuilt on demand via `mcpb pack mcpb/ tracehub-mcp.mcpb`, not committed)
+*.mcpb
 build/
 develop-eggs/
 dist/

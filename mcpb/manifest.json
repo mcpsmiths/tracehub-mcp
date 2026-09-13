@@ -1,0 +1,149 @@
+{
+  "manifest_version": "0.4",
+  "name": "tracehub-mcp",
+  "display_name": "TraceHub MCP",
+  "version": "0.4.0",
+  "description": "MCP server for querying OpenTelemetry traces across multiple observability backends (Jaeger, Tempo, Traceloop, Datadog, and more) for LLM application debugging",
+  "long_description": "TraceHub MCP lets AI agents query and analyze OpenTelemetry traces from LLM applications. It parses gen_ai.* / llm.* semantic-convention attributes to enable automated debugging, cost analysis, and observability across Jaeger, Grafana Tempo, Traceloop, Datadog, and Sentry backends.\n\nThis bundle does not vendor the server's source: it declares the published `tracehub-mcp` PyPI package as a dependency in a bundled pyproject.toml and runs it via `uv run`, which resolves and installs the real package from PyPI at launch time.",
+  "author": {
+    "name": "Doron Kopit, Gal Klienman, Nir Gazit, sairam0424",
+    "url": "https://github.com/mcpsmiths/tracehub-mcp"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mcpsmiths/tracehub-mcp.git"
+  },
+  "homepage": "https://github.com/mcpsmiths/tracehub-mcp",
+  "documentation": "https://github.com/mcpsmiths/tracehub-mcp#readme",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "opentelemetry",
+    "observability",
+    "tracing",
+    "llm",
+    "model-context-protocol",
+    "debugging",
+    "telemetry",
+    "jaeger",
+    "tempo",
+    "traceloop",
+    "datadog"
+  ],
+  "server": {
+    "type": "uv",
+    "entry_point": "src/server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "${__dirname}",
+        "src/server.py"
+      ],
+      "env": {
+        "BACKEND_TYPE": "${user_config.backend_type}",
+        "BACKEND_URL": "${user_config.backend_url}",
+        "BACKEND_API_KEY": "${user_config.backend_api_key}",
+        "BACKEND_APP_KEY": "${user_config.backend_app_key}",
+        "BACKEND_TEMPO_INSTANCE_ID": "${user_config.backend_tempo_instance_id}",
+        "BACKEND_SENTRY_ORG": "${user_config.backend_sentry_org}",
+        "BACKEND_SENTRY_PROJECT": "${user_config.backend_sentry_project}",
+        "BACKEND_ENVIRONMENTS": "${user_config.backend_environments}",
+        "BACKEND_TIMEOUT": "${user_config.backend_timeout}",
+        "LOG_LEVEL": "${user_config.log_level}",
+        "MAX_TRACES_PER_QUERY": "${user_config.max_traces_per_query}"
+      }
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "linux",
+      "win32"
+    ],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  },
+  "user_config": {
+    "backend_type": {
+      "type": "string",
+      "title": "Backend Type",
+      "description": "Observability backend to query. One of: jaeger, tempo, traceloop, datadog, sentry.",
+      "default": "jaeger",
+      "required": true
+    },
+    "backend_url": {
+      "type": "string",
+      "title": "Backend URL",
+      "description": "Backend API endpoint, e.g. http://localhost:16686 for Jaeger, http://localhost:3200 for Tempo, https://api.traceloop.com/v2 for Traceloop, https://api.datadoghq.com for Datadog, or https://sentry.io for Sentry.",
+      "default": "http://localhost:16686",
+      "required": true
+    },
+    "backend_api_key": {
+      "type": "string",
+      "title": "Backend API Key",
+      "description": "Authentication key for the backend. Required for Traceloop and Datadog; for Sentry this must be an auth token with trace/event read permissions. Not needed for a local/self-hosted Jaeger or Tempo.",
+      "sensitive": true,
+      "required": false
+    },
+    "backend_app_key": {
+      "type": "string",
+      "title": "Backend App Key",
+      "description": "Datadog application key, used together with Backend API Key. Required only when Backend Type is datadog.",
+      "sensitive": true,
+      "required": false
+    },
+    "backend_tempo_instance_id": {
+      "type": "string",
+      "title": "Tempo Instance ID (Grafana Cloud)",
+      "description": "Grafana Cloud stack/instance ID, used together with Backend API Key (a Cloud Access Policy token) for Basic Auth. Required only for Grafana Cloud-hosted Tempo; not needed for self-hosted Tempo.",
+      "required": false
+    },
+    "backend_sentry_org": {
+      "type": "string",
+      "title": "Sentry Organization Slug",
+      "description": "Sentry organization slug. Required only when Backend Type is sentry, since every Sentry API endpoint this backend uses is organization-scoped.",
+      "required": false
+    },
+    "backend_sentry_project": {
+      "type": "string",
+      "title": "Sentry Project Slug",
+      "description": "Sentry project slug to narrow queries to. Optional; when omitted, queries span every project the auth token can access. Only used when Backend Type is sentry.",
+      "required": false
+    },
+    "backend_environments": {
+      "type": "string",
+      "title": "Traceloop Environments",
+      "description": "Comma-separated list of environments. Only used when Backend Type is traceloop.",
+      "default": "prd",
+      "required": false
+    },
+    "backend_timeout": {
+      "type": "number",
+      "title": "Backend Request Timeout (seconds)",
+      "description": "Request timeout in seconds for calls to the backend.",
+      "default": 30,
+      "min": 1,
+      "max": 300,
+      "required": false
+    },
+    "log_level": {
+      "type": "string",
+      "title": "Log Level",
+      "description": "Logging level. One of: DEBUG, INFO, WARNING, ERROR.",
+      "default": "INFO",
+      "required": false
+    },
+    "max_traces_per_query": {
+      "type": "number",
+      "title": "Max Traces Per Query",
+      "description": "Maximum number of traces parsed per query.",
+      "default": 500,
+      "min": 1,
+      "max": 1000,
+      "required": false
+    }
+  }
+}
