@@ -27,11 +27,19 @@ jobs:
 
       - name: Extract version tag
         id: version
+        env:
+          GH_RUN_ID: ${{ github.run_id }}
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          # GITHUB_REF is already provided as a real env var by the runner -
+          # inlining ${{ github.ref }} (or any other expression) directly
+          # into this script's text is a known GitHub Actions injection
+          # pattern, since the substitution happens before bash parses the
+          # script. Read every expression through an env var instead, so
+          # the value is always treated as data, never as script text.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             echo "tag=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=manual-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+            echo "tag=manual-${GH_RUN_ID}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Docker Buildx
