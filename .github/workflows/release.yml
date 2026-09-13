@@ -19,7 +19,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           fetch-depth: 0  # Full history required for Commitizen
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # The default GITHUB_TOKEN authenticates as the github-actions[bot]
+          # app identity, which the main-protection ruleset's bypass_actors
+          # (OrganizationAdmin only) does not cover - its push below would be
+          # rejected with "Changes must be made through a pull request."
+          # RELEASE_PAT belongs to a real org-admin account the ruleset
+          # already trusts, scoped to just this repo with Contents: read/write.
+          token: ${{ secrets.RELEASE_PAT }}
 
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
@@ -33,7 +39,10 @@ jobs:
         id: cz
         uses: commitizen-tools/commitizen-action@338bbd841b75aaee6bf5340e1fa12f6ab58ff9ff  # master (no tagged releases; pinned snapshot, re-pin periodically)
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Same reason as the checkout step above: this action does the
+          # actual `git push` of the bump commit, which needs a token the
+          # main-protection ruleset's bypass covers.
+          github_token: ${{ secrets.RELEASE_PAT }}
           changelog_increment_filename: body.md
           # The action's own entrypoint runs `git config --local user.name/email`
           # unconditionally using these inputs (default: github-actions[bot]) --
