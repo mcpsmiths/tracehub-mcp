@@ -1,6 +1,9 @@
+<!-- mcp-name: io.github.mcpsmiths/tracehub-mcp -->
+
 # tracehub-mcp
 
 [![CI](https://github.com/mcpsmiths/tracehub-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mcpsmiths/tracehub-mcp/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/tracehub-mcp.svg)](https://pypi.org/project/tracehub-mcp/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
@@ -34,7 +37,7 @@ tracehub-mcp started as a fork of [traceloop/opentelemetry-mcp-server](https://g
 
 ## Quick Start
 
-**tracehub-mcp is not yet published to PyPI** (v0.1, pre-release — Trusted Publisher setup is a separate pending step). Until then, run it straight from GitHub with `uv` — no clone required:
+tracehub-mcp is on PyPI. No install step needed — `uvx` fetches and runs it in one shot:
 
 ```json
 // claude_desktop_config.json
@@ -42,7 +45,7 @@ tracehub-mcp started as a fork of [traceloop/opentelemetry-mcp-server](https://g
   "mcpServers": {
     "tracehub-mcp": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/mcpsmiths/tracehub-mcp.git", "tracehub-mcp"],
+      "args": ["tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "jaeger",
         "BACKEND_URL": "http://localhost:16686"
@@ -52,9 +55,15 @@ tracehub-mcp started as a fork of [traceloop/opentelemetry-mcp-server](https://g
 }
 ```
 
+Or from Claude Code directly:
+
+```bash
+claude mcp add tracehub-mcp -e BACKEND_TYPE=jaeger -e BACKEND_URL=http://localhost:16686 -- uvx tracehub-mcp
+```
+
 **That's it.** Ask your assistant: _"Show me traces with errors from the last hour."_
 
-Once this is live on PyPI, the same config collapses to `"command": "uvx", "args": ["tracehub-mcp"]` — see [Installation](#installation) for the from-source path used by everything below in the meantime.
+See [MCP Client Setup](#mcp-client-setup) for Cursor, Windsurf, VS Code, and Gemini CLI, and [Installation](#installation) for `pip`/`pipx`/from-source alternatives.
 
 ---
 
@@ -80,23 +89,32 @@ Upstream `opentelemetry-mcp-server` shipped Jaeger, Tempo, and Traceloop. traceh
 - **Exact-ID re-verification.** Where a backend's search API can return neighbors instead of an exact match (notably Datadog's trace reconstruction from grouped spans), every result is re-checked against the exact ID that was asked for before being returned.
 - **No fabricated data on malformed responses, in the backends we built.** Datadog and Sentry reject a span outright — rather than substituting a placeholder like `now()` for a missing timestamp or a literal `"unknown"` for a missing `service_name`/`operation_name` — since a fabricated value would silently corrupt trace ordering, duration aggregation, and any tool that groups by service or operation. (The three backends inherited from upstream — Jaeger, Tempo, Traceloop — predate this discipline and haven't been retrofitted; that's deliberate scope discipline, not an oversight, mirroring this project's own precedent of not reaching into shared/inherited code without full regression coverage for it.)
 
-All of this is backed by **213 passing tests (2 skipped, zero regressions)**, a clean `ruff check` and `mypy --strict` run, and two rounds of adversarial CodeRabbit review on the new backends.
+All of this is backed by **458 passing tests (2 skipped, zero regressions)**, a clean `ruff check` and `mypy --strict` run, and two rounds of adversarial CodeRabbit review on the new backends.
 
 ---
 
 ## Installation
 
-Until tracehub-mcp lands on PyPI, there are two supported ways to run it — both work with any MCP client, and both are used throughout this README.
+tracehub-mcp is [on PyPI](https://pypi.org/project/tracehub-mcp/). Pick whichever of these your workflow already uses — they're equivalent.
 
-### Option 1: Run directly from GitHub (no clone)
+### Option 1: `uvx` (no install step)
 
 ```bash
-uvx --from git+https://github.com/mcpsmiths/tracehub-mcp.git tracehub-mcp --backend jaeger --url http://localhost:16686
+uvx tracehub-mcp --backend jaeger --url http://localhost:16686
 ```
 
-This is what the [Quick Start](#quick-start) config above uses. `uv` fetches the repo, builds an isolated environment, and runs the `tracehub-mcp` entry point — same experience as `uvx tracehub-mcp` will be once the package is published.
+This is what the [Quick Start](#quick-start) config above uses — `uv` fetches the package and runs the `tracehub-mcp` entry point in one shot, nothing left behind on disk between runs.
 
-### Option 2: Clone and run from source
+### Option 2: `pip` / `pipx`
+
+```bash
+pipx install tracehub-mcp
+# or: pip install tracehub-mcp
+
+tracehub-mcp --backend jaeger --url http://localhost:16686
+```
+
+### Option 3: Clone and run from source
 
 ```bash
 git clone https://github.com/mcpsmiths/tracehub-mcp.git
@@ -108,7 +126,7 @@ uv run tracehub-mcp --backend jaeger --url http://localhost:16686
 
 Use this if you're developing locally, want to pin to a specific commit, or want the dev tooling installed (`uv sync --group dev`).
 
-**Prerequisites:** Python 3.11+ and [uv](https://github.com/astral-sh/uv). `pipx`/`pip` also work once the package is on PyPI (`pipx install tracehub-mcp`, `pip install tracehub-mcp`) — not yet, today.
+**Prerequisites:** Python 3.11+, plus [uv](https://github.com/astral-sh/uv) for Options 1 and 3.
 
 ---
 
@@ -224,10 +242,12 @@ Sentry requires **both** an auth token *and* an organization slug — every endp
 
 ```bash
 # stdio (default) — local use, Claude Desktop, single process
+uvx tracehub-mcp
 tracehub-mcp                      # pipx/pip install
 uv run tracehub-mcp               # from-source install
 
 # HTTP — remote access, multiple clients, network deployment, sample applications
+uvx tracehub-mcp --transport http --host 0.0.0.0 --port 8000
 tracehub-mcp --transport http --host 0.0.0.0 --port 8000              # pipx/pip install
 uv run tracehub-mcp --transport http --host 0.0.0.0 --port 8000       # from-source install
 ```
@@ -238,7 +258,7 @@ With HTTP transport, clients connect to `http://<host>:<port>/mcp` (streamable-H
 
 ## MCP Client Setup
 
-Every example below uses the from-source install (Option 2 above); swap in the `uvx --from git+...` form from [Quick Start](#quick-start) if you'd rather skip cloning.
+Every example below uses `uvx tracehub-mcp` (no install step). Swap in `tracehub-mcp` (pip/pipx install) or `uv run tracehub-mcp` (from-source, `--directory /absolute/path/to/tracehub-mcp`) if you installed it a different way — see [Installation](#installation).
 
 <details>
 <summary><b>Claude Desktop</b></summary>
@@ -253,8 +273,8 @@ Config file location:
 {
   "mcpServers": {
     "tracehub-mcp": {
-      "command": "uv",
-      "args": ["--directory", "/absolute/path/to/tracehub-mcp", "run", "tracehub-mcp"],
+      "command": "uvx",
+      "args": ["tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "jaeger",
         "BACKEND_URL": "http://localhost:16686"
@@ -270,8 +290,8 @@ Config file location:
 {
   "mcpServers": {
     "tracehub-mcp": {
-      "command": "uv",
-      "args": ["--directory", "/absolute/path/to/tracehub-mcp", "run", "tracehub-mcp"],
+      "command": "uvx",
+      "args": ["tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "datadog",
         "BACKEND_URL": "https://api.datadoghq.com",
@@ -289,8 +309,8 @@ Config file location:
 {
   "mcpServers": {
     "tracehub-mcp": {
-      "command": "uv",
-      "args": ["--directory", "/absolute/path/to/tracehub-mcp", "run", "tracehub-mcp"],
+      "command": "uvx",
+      "args": ["tracehub-mcp"],
       "env": {
         "BACKEND_TYPE": "sentry",
         "BACKEND_URL": "https://sentry.io",
@@ -302,7 +322,7 @@ Config file location:
 }
 ```
 
-Or use the bundled wrapper script for easy backend switching during local dev:
+If you're running from a clone instead, the bundled wrapper script gives easy backend switching during local dev:
 
 ```json
 {
@@ -321,7 +341,11 @@ Or use the bundled wrapper script for easy backend switching during local dev:
 <details>
 <summary><b>Claude Code</b></summary>
 
-Claude Code reads the same MCP server config as Claude Desktop. Once configured:
+```bash
+claude mcp add tracehub-mcp -e BACKEND_TYPE=jaeger -e BACKEND_URL=http://localhost:16686 -- uvx tracehub-mcp
+```
+
+Datadog/Sentry work the same way — add more `-e KEY=value` flags for each backend's required env vars (see [Backend-Specific Setup](#backend-specific-setup)). Then:
 
 ```bash
 claude mcp list
@@ -333,14 +357,66 @@ claude "Show me traces with errors from the last hour"
 <details>
 <summary><b>Cursor</b></summary>
 
-**Settings → MCP → Add new MCP Server**, then use the same JSON shape as Claude Desktop above (Cursor's config omits the outer `mcpServers` wrapper in some versions — check your Cursor version's MCP settings UI for the exact shape it expects).
+`.cursor/mcp.json` (project-level) or your global Cursor MCP config:
+
+```json
+{
+  "mcpServers": {
+    "tracehub-mcp": {
+      "command": "uvx",
+      "args": ["tracehub-mcp"],
+      "env": {
+        "BACKEND_TYPE": "jaeger",
+        "BACKEND_URL": "http://localhost:16686"
+      }
+    }
+  }
+}
+```
 
 </details>
 
 <details>
 <summary><b>Windsurf</b></summary>
 
-**Settings → MCP Servers → Add New MCP Server**, then use the same JSON shape as Claude Desktop above.
+`~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "tracehub-mcp": {
+      "command": "uvx",
+      "args": ["tracehub-mcp"],
+      "env": {
+        "BACKEND_TYPE": "jaeger",
+        "BACKEND_URL": "http://localhost:16686"
+      }
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><b>VS Code (GitHub Copilot)</b></summary>
+
+`.vscode/mcp.json` in your workspace — note the top-level key is `servers`, not `mcpServers`, and stdio servers need no `"type"` field:
+
+```json
+{
+  "servers": {
+    "tracehub-mcp": {
+      "command": "uvx",
+      "args": ["tracehub-mcp"],
+      "env": {
+        "BACKEND_TYPE": "jaeger",
+        "BACKEND_URL": "http://localhost:16686"
+      }
+    }
+  }
+}
+```
 
 </details>
 
