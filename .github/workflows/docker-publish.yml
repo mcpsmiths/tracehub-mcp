@@ -1,0 +1,63 @@
+name: Publish Docker Image
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: # Manual trigger via GitHub Actions UI, for re-publishing without a new tag
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: Build and Push to GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version tag
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=manual-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/mcpsmiths/tracehub-mcp:${{ steps.version.outputs.tag }}
+            ghcr.io/mcpsmiths/tracehub-mcp:latest
+
+      - name: Make package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # GHCR packages default to private on first publish - this repo is
+          # already public, and a private image would silently break every
+          # docker-based MCP client config that points at it.
+          gh api --method PATCH \
+            "/orgs/mcpsmiths/packages/container/tracehub-mcp/visibility" \
+            -f visibility=public || \
+          gh api --method PATCH \
+            "/user/packages/container/tracehub-mcp/visibility" \
+            -f visibility=public || \
+          echo "Could not set visibility via API - check ghcr.io/mcpsmiths/tracehub-mcp/pkgs/container/tracehub-mcp/settings manually."

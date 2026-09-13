@@ -62,7 +62,7 @@ ENV BACKEND_TYPE="" \
     BACKEND_URL="" \
     BACKEND_TIMEOUT="30" \
     LOG_LEVEL="INFO" \
-    MAX_TRACES_PER_QUERY="100"
+    MAX_TRACES_PER_QUERY="500"
 
 # Health check (optional - checks if the process is running)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

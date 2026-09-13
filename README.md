@@ -126,7 +126,17 @@ uv run tracehub-mcp --backend jaeger --url http://localhost:16686
 
 Use this if you're developing locally, want to pin to a specific commit, or want the dev tooling installed (`uv sync --group dev`).
 
-**Prerequisites:** Python 3.11+, plus [uv](https://github.com/astral-sh/uv) for Options 1 and 3.
+### Option 4: Docker
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e BACKEND_TYPE=jaeger -e BACKEND_URL=http://host.docker.internal:16686 \
+  ghcr.io/mcpsmiths/tracehub-mcp:latest
+```
+
+Runs HTTP transport by default (the image's `CMD`); clients connect to `http://localhost:8000/mcp`. This is also the form to use for MCP clients whose config takes a `command`/`args` pair pointing at `docker` directly (Cursor, Windsurf) instead of a local binary.
+
+**Prerequisites:** Python 3.11+, plus [uv](https://github.com/astral-sh/uv) for Options 1 and 3; Docker for Option 4.
 
 ---
 
