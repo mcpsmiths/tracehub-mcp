@@ -46,6 +46,7 @@ dependencies = [
     "uvicorn>=0.40,<0.53",
     "opentelemetry-semantic-conventions-ai>=0.4.13",
     "opentelemetry-semantic-conventions>=0.60b0",
+    "tenacity>=9.1,<10",
 ]
 
 [project.urls]

@@ -167,6 +167,7 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 | `BACKEND_URL`            | URL     | -        | Backend API endpoint (required)                                     |
 | `BACKEND_API_KEY`        | string  | -        | API key/auth token (required for Traceloop, Datadog, and Sentry)     |
 | `BACKEND_APP_KEY`        | string  | -        | Application key (Datadog only, in addition to `BACKEND_API_KEY`)     |
+| `BACKEND_TEMPO_INSTANCE_ID` | string | -     | Grafana Cloud stack/instance ID (Tempo only, enables Basic Auth in addition to `BACKEND_API_KEY`) |
 | `BACKEND_SENTRY_ORG`     | string  | -        | Organization slug (required for Sentry)                             |
 | `BACKEND_SENTRY_PROJECT` | string  | -        | Project slug (optional for Sentry, narrows queries to one project)   |
 | `BACKEND_ENVIRONMENTS`   | string  | `prd`    | Comma-separated environments (Traceloop only)                        |
@@ -174,7 +175,7 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 | `LOG_LEVEL`              | string  | `INFO`   | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`                   |
 | `MAX_TRACES_PER_QUERY`   | integer | `500`    | Parsed and validated (1-1000) but not currently wired into any query — each tool's own `limit` parameter is the real per-call cap |
 
-Every CLI flag has a matching env var (`--backend`/`BACKEND_TYPE`, `--url`/`BACKEND_URL`, `--api-key`/`BACKEND_API_KEY`, `--app-key`/`BACKEND_APP_KEY`, `--sentry-org`/`BACKEND_SENTRY_ORG`, `--sentry-project`/`BACKEND_SENTRY_PROJECT`, `--environments`/`BACKEND_ENVIRONMENTS`). Run `tracehub-mcp --help` for the full list.
+Every CLI flag has a matching env var (`--backend`/`BACKEND_TYPE`, `--url`/`BACKEND_URL`, `--api-key`/`BACKEND_API_KEY`, `--app-key`/`BACKEND_APP_KEY`, `--tempo-instance-id`/`BACKEND_TEMPO_INSTANCE_ID`, `--sentry-org`/`BACKEND_SENTRY_ORG`, `--sentry-project`/`BACKEND_SENTRY_PROJECT`, `--environments`/`BACKEND_ENVIRONMENTS`). Run `tracehub-mcp --help` for the full list.
 
 ### Backend-Specific Setup
 
@@ -199,6 +200,15 @@ BACKEND_URL=http://localhost:3200
 ```
 
 No API key required for a local/self-hosted install. Search uses [TraceQL](https://grafana.com/docs/tempo/latest/traceql/) under the hood; `service_name` is optional.
+
+For **Grafana Cloud**-hosted Tempo, also set `BACKEND_TEMPO_INSTANCE_ID` to the stack's instance ID and `BACKEND_API_KEY` to a Cloud Access Policy token scoped to `traces:read` — Grafana Cloud requires Basic Auth (instance ID as username, token as password) instead of self-hosted Tempo's Bearer-token auth:
+
+```bash
+BACKEND_TYPE=tempo
+BACKEND_URL=https://tempo-prod-XX-prod-XX-XXXX.grafana.net
+BACKEND_TEMPO_INSTANCE_ID=your_stack_instance_id
+BACKEND_API_KEY=your_cloud_access_policy_token
+```
 
 </details>
 

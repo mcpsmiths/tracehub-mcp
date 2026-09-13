@@ -33,6 +33,7 @@ FAKE_API_KEY = "dd-key1"
 FAKE_APP_KEY = "dd-app1"
 FAKE_SENTRY_ORG = "fake-org"
 FAKE_SENTRY_PROJECT = "fake-project"
+FAKE_TEMPO_INSTANCE_ID = "123456"
 
 
 def _config(**overrides: object) -> ServerConfig:
@@ -72,12 +73,18 @@ class TestCreateBackend:
         assert backend.timeout == 12.0
 
     def test_tempo(self) -> None:
-        config = _config(type="tempo", api_key=FAKE_API_KEY, timeout=9.0)
+        config = _config(
+            type="tempo",
+            api_key=FAKE_API_KEY,
+            timeout=9.0,
+            tempo_instance_id=FAKE_TEMPO_INSTANCE_ID,
+        )
         backend = server._create_backend(config)
 
         assert isinstance(backend, TempoBackend)
         assert backend.api_key == FAKE_API_KEY
         assert backend.timeout == 9.0
+        assert backend.tempo_instance_id == FAKE_TEMPO_INSTANCE_ID
 
     def test_traceloop(self) -> None:
         config = _config(
@@ -499,6 +506,8 @@ class TestMainCli:
                     FAKE_API_KEY,
                     "--app-key",
                     FAKE_APP_KEY,
+                    "--tempo-instance-id",
+                    FAKE_TEMPO_INSTANCE_ID,
                     "--sentry-org",
                     FAKE_SENTRY_ORG,
                     "--sentry-project",
@@ -516,6 +525,7 @@ class TestMainCli:
             app_key=FAKE_APP_KEY,
             sentry_org=FAKE_SENTRY_ORG,
             sentry_project=FAKE_SENTRY_PROJECT,
+            tempo_instance_id=FAKE_TEMPO_INSTANCE_ID,
             environments="prd,staging",
         )
 

@@ -1,5 +1,6 @@
 """Grafana Tempo backend implementation with TraceQL support."""
 
+import base64
 import logging
 from datetime import datetime
 from typing import Any, Literal
@@ -23,14 +24,46 @@ logger = logging.getLogger(__name__)
 class TempoBackend(BaseBackend):
     """Grafana Tempo backend with TraceQL query support."""
 
+    def __init__(
+        self,
+        url: str,
+        api_key: str | None = None,
+        timeout: float = 30.0,
+        tempo_instance_id: str | None = None,
+    ):
+        """Initialize Tempo backend with connection parameters.
+
+        Args:
+            url: Backend API URL
+            api_key: Optional API key/token. Used as a Bearer token for
+                self-hosted Tempo, or as the Basic Auth password when
+                tempo_instance_id is also set (Grafana Cloud-hosted Tempo).
+            timeout: Request timeout in seconds
+            tempo_instance_id: Optional Grafana Cloud stack/instance ID.
+                When set together with api_key, Basic Auth is used instead
+                of Bearer auth (required for Grafana Cloud-hosted Tempo).
+        """
+        super().__init__(url=url, api_key=api_key, timeout=timeout)
+        self.tempo_instance_id = tempo_instance_id
+
     def _create_headers(self) -> dict[str, str]:
         """Create headers for Tempo API requests.
 
+        Grafana Cloud's hosted Tempo requires Basic Auth (stack/instance ID
+        as username, a Cloud Access Policy token as password) instead of
+        the Bearer-token auth self-hosted Tempo uses. When tempo_instance_id
+        is set alongside api_key, Basic Auth takes precedence; otherwise
+        the existing Bearer-token behavior is unchanged.
+
         Returns:
-            Dictionary with optional Bearer token authorization
+            Dictionary with optional Basic or Bearer authorization
         """
         headers = {}
-        if self.api_key:
+        if self.tempo_instance_id and self.api_key:
+            credentials = f"{self.tempo_instance_id}:{self.api_key}"
+            encoded = base64.b64encode(credentials.encode()).decode()
+            headers["Authorization"] = f"Basic {encoded}"
+        elif self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 

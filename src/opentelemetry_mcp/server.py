@@ -100,6 +100,7 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             timeout=backend_config.timeout,
+            tempo_instance_id=backend_config.tempo_instance_id,
         )
     elif backend_config.type == "traceloop":
         logger.info(f"Initializing Traceloop backend: {backend_config.url}")
@@ -679,6 +680,14 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     "--api-key (overrides BACKEND_APP_KEY env var)",
 )
 @click.option(
+    "--tempo-instance-id",
+    type=str,
+    help="Grafana Cloud stack/instance ID, used for Basic Auth with --api-key "
+    "instead of Bearer auth (Tempo backend only, required for Grafana "
+    "Cloud-hosted Tempo, not needed for self-hosted Tempo; overrides "
+    "BACKEND_TEMPO_INSTANCE_ID env var)",
+)
+@click.option(
     "--sentry-org",
     type=str,
     help="Sentry organization slug, required by the Sentry backend "
@@ -718,6 +727,7 @@ def main(
     url: str | None,
     api_key: str | None,
     app_key: str | None,
+    tempo_instance_id: str | None,
     sentry_org: str | None,
     sentry_project: str | None,
     environments: str | None,
@@ -754,7 +764,16 @@ def main(
         logging.getLogger().setLevel(_config.log_level)
 
         # Apply CLI overrides
-        if backend or url or api_key or app_key or sentry_org or sentry_project or environments:
+        if (
+            backend
+            or url
+            or api_key
+            or app_key
+            or tempo_instance_id
+            or sentry_org
+            or sentry_project
+            or environments
+        ):
             _config.apply_cli_overrides(
                 backend_type=backend,
                 backend_url=url,
@@ -762,6 +781,7 @@ def main(
                 app_key=app_key,
                 sentry_org=sentry_org,
                 sentry_project=sentry_project,
+                tempo_instance_id=tempo_instance_id,
                 environments=environments,
             )
 

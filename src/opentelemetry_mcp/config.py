@@ -30,6 +30,13 @@ class BackendConfig(BaseModel):
         exclude=True,
         description="Sentry project slug, optional (Sentry backend only)",
     )
+    tempo_instance_id: str | None = Field(
+        default=None,
+        exclude=True,
+        description="Grafana Cloud stack/instance ID for Basic Auth (Tempo backend only, "
+        "used instead of Bearer auth when set - required for Grafana Cloud-hosted Tempo, "
+        "not needed for self-hosted Tempo)",
+    )
     timeout: float = Field(default=30.0, gt=0, le=300)
     environments: list[str] = Field(default_factory=lambda: ["prd"])
 
@@ -39,6 +46,13 @@ class BackendConfig(BaseModel):
         """Validate URL scheme."""
         if v.scheme not in ["http", "https"]:
             raise ValueError("URL must use http or https scheme")
+        if v.scheme == "http" and v.host not in ("localhost", "127.0.0.1", "::1"):
+            logger.warning(
+                f"BACKEND_URL '{v}' uses plain HTTP to a non-local host. "
+                "This is vulnerable to network interception (see CVE-2025-6514). "
+                "Use https:// unless this backend is only reachable over a "
+                "trusted private network (e.g. a VPC or Docker Compose network)."
+            )
         return v
 
     @classmethod
@@ -71,6 +85,7 @@ class BackendConfig(BaseModel):
             app_key=os.getenv("BACKEND_APP_KEY"),
             sentry_org=os.getenv("BACKEND_SENTRY_ORG"),
             sentry_project=os.getenv("BACKEND_SENTRY_PROJECT"),
+            tempo_instance_id=os.getenv("BACKEND_TEMPO_INSTANCE_ID"),
             timeout=timeout,
             environments=environments,
         )
@@ -116,6 +131,7 @@ class ServerConfig(BaseModel):
         app_key: str | None = None,
         sentry_org: str | None = None,
         sentry_project: str | None = None,
+        tempo_instance_id: str | None = None,
         environments: str | None = None,
     ) -> None:
         """Apply CLI argument overrides to configuration."""
@@ -141,6 +157,9 @@ class ServerConfig(BaseModel):
 
         if sentry_project:
             self.backend.sentry_project = sentry_project
+
+        if tempo_instance_id:
+            self.backend.tempo_instance_id = tempo_instance_id
 
         if environments:
             self.backend.environments = [

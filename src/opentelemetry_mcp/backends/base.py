@@ -4,9 +4,56 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 import httpx
+from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from opentelemetry_mcp.attributes import HealthCheckResponse
 from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceData, TraceQuery
+
+# Only genuine transport-level failures - a connection that never completed
+# or a request that timed out - are worth retrying. An HTTP response with a
+# 4xx/5xx status code is a *successful* transport exchange (a response body
+# still came back), not one of these exceptions, so it is never retried here.
+_RETRYABLE_TRANSPORT_EXCEPTIONS = (httpx.ConnectError, httpx.TimeoutException)
+
+
+class _RetryingTransport(httpx.AsyncBaseTransport):
+    """Wraps another async transport and retries only transport-level
+    connection failures with exponential backoff, reraising the final
+    exception if every attempt fails.
+    """
+
+    def __init__(self, wrapped: httpx.AsyncBaseTransport | None = None) -> None:
+        """Wrap an underlying transport (defaults to a fresh AsyncHTTPTransport)."""
+        self._wrapped = wrapped if wrapped is not None else httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        """Delegate to the wrapped transport, retrying up to 3 total attempts
+        (with exponential backoff, capped around 10s) on connect/timeout
+        failures only.
+        """
+
+        # A plain `async def` closure (rather than passing
+        # self._wrapped.handle_async_request straight to tenacity) ensures
+        # tenacity always awaits the call correctly - some transport wrappers
+        # (e.g. VCR's cassette-recording patch used in this project's own
+        # integration tests) expose handle_async_request as a *sync* function
+        # that returns a coroutine, which tenacity's coroutine-callable
+        # detection can miss, silently returning an unawaited coroutine.
+        async def _send() -> httpx.Response:
+            return await self._wrapped.handle_async_request(request)
+
+        retrying = AsyncRetrying(
+            retry=retry_if_exception_type(_RETRYABLE_TRANSPORT_EXCEPTIONS),
+            wait=wait_exponential(multiplier=1, max=10),
+            stop=stop_after_attempt(3),
+            reraise=True,
+        )
+        response: httpx.Response = await retrying(_send)
+        return response
+
+    async def aclose(self) -> None:
+        """Close the wrapped transport's connection pool."""
+        await self._wrapped.aclose()
 
 
 class BaseBackend(ABC):
@@ -29,8 +76,12 @@ class BaseBackend(ABC):
     def client(self) -> httpx.AsyncClient:
         """Get or create HTTP client with connection pooling.
 
+        All backends share this client construction, so the retry transport
+        applies automatically to every backend's requests.
+
         Returns:
             Reusable AsyncClient instance with automatic connection pooling
+            and connect/timeout retry with exponential backoff
         """
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
@@ -38,6 +89,7 @@ class BaseBackend(ABC):
                 headers=self._create_headers(),
                 timeout=self.timeout,
                 follow_redirects=True,
+                transport=_RetryingTransport(),
             )
         return self._client
 
