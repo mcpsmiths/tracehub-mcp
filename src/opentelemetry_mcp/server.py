@@ -22,6 +22,7 @@ from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.config import ServerConfig
 from opentelemetry_mcp.tools import (
+    compare,
     errors,
     expensive_traces,
     list_llm_tools,
@@ -509,6 +510,57 @@ async def get_session_stats(
         return result
     except Exception as e:
         return _handle_tool_error("get_session_stats", e)
+
+
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def compare_time_windows(
+    range_a_start: str | None = None,
+    range_a_end: str | None = None,
+    range_b_start: str | None = None,
+    range_b_end: str | None = None,
+    service_name: str | None = None,
+    gen_ai_system: str | None = None,
+    gen_ai_request_model: str | None = None,
+    gen_ai_response_model: str | None = None,
+    limit: int = 1000,
+) -> str:
+    """Compare aggregated LLM usage metrics between two time windows.
+
+    Runs the same usage aggregation for both ranges and returns the delta -
+    useful for "this week vs last week" or "before/after a deploy" style
+    comparisons of request/token counts.
+
+    Args:
+        range_a_start: Range A start time in ISO 8601 format
+        range_a_end: Range A end time in ISO 8601 format
+        range_b_start: Range B start time in ISO 8601 format
+        range_b_end: Range B end time in ISO 8601 format
+        service_name: Filter by service name (applied to both ranges)
+        gen_ai_system: Filter by LLM provider (applied to both ranges)
+        gen_ai_request_model: Filter by requested model name (applied to both ranges)
+        gen_ai_response_model: Filter by actual model used (applied to both ranges)
+        limit: Maximum number of traces to analyze per range (default: 1000)
+
+    Returns:
+        JSON string with range_a, range_b, and a delta summarizing the change
+    """
+    try:
+        backend = await _get_backend()
+        result = await compare.compare_time_windows(
+            backend,
+            range_a_start=range_a_start,
+            range_a_end=range_a_end,
+            range_b_start=range_b_start,
+            range_b_end=range_b_end,
+            service_name=service_name,
+            gen_ai_system=gen_ai_system,
+            gen_ai_request_model=gen_ai_request_model,
+            gen_ai_response_model=gen_ai_response_model,
+            limit=limit,
+        )
+        return result
+    except Exception as e:
+        return _handle_tool_error("compare_time_windows", e)
 
 
 @mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
