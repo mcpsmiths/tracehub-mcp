@@ -1,0 +1,43 @@
+# Pre-commit hooks mirroring the checks CI runs (uv run ruff check / mypy .).
+# Run `pre-commit install` once to enable, or `pre-commit run --all-files` ad hoc.
+# Hook versions are pinned to the exact ruff/mypy versions this project resolves
+# in pyproject.toml/uv.lock, so local pre-commit results match CI.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: fa93bc3224c614a0e9786d3e2d3d48edcca246eb # v0.15.1
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: 57b21406f092110c18776e39b0bda50d37c945c8 # v2.4.3
+    hooks:
+      - id: codespell
+        args:
+          - "--skip=uv.lock,tests/integration/cassettes/**"
+          - "--ignore-words-list=unparseable"
+
+  # mypy needs pydantic (for its BaseModel plugin) and the rest of this
+  # project's real dependency graph to type-check correctly - the mirrors-mypy
+  # hook's isolated env only sees `additional_dependencies`, which drifts from
+  # pyproject.toml. Running it through the project's own uv-managed venv keeps
+  # this hook's result identical to CI's `uv run mypy .` by construction.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy .
+        language: system
+        pass_filenames: false
+        types: [python]
