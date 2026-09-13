@@ -1,0 +1,99 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.mcpsmiths/tracehub-mcp",
+  "description": "Query OpenTelemetry traces from LLM apps across Jaeger, Tempo, Traceloop, Datadog, and Sentry.",
+  "repository": {
+    "url": "https://github.com/mcpsmiths/tracehub-mcp",
+    "source": "github"
+  },
+  "version": "0.2.3",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "tracehub-mcp",
+      "version": "0.2.3",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "BACKEND_TYPE",
+          "description": "Which observability backend to query.",
+          "isRequired": true,
+          "isSecret": false,
+          "format": "string",
+          "choices": ["jaeger", "tempo", "traceloop", "datadog", "sentry"],
+          "default": "jaeger"
+        },
+        {
+          "name": "BACKEND_URL",
+          "description": "Backend API endpoint, e.g. http://localhost:16686 for Jaeger or https://api.datadoghq.com for Datadog.",
+          "isRequired": true,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "BACKEND_API_KEY",
+          "description": "API key or auth token. Required for Traceloop, Datadog, and Sentry; not used by Jaeger or Tempo.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "BACKEND_APP_KEY",
+          "description": "Datadog Application key, required in addition to BACKEND_API_KEY for the Datadog backend only.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "BACKEND_SENTRY_ORG",
+          "description": "Sentry organization slug, required for the Sentry backend only.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "BACKEND_SENTRY_PROJECT",
+          "description": "Sentry project slug, optional for the Sentry backend - narrows queries to one project.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "BACKEND_ENVIRONMENTS",
+          "description": "Comma-separated environments for the Traceloop backend only.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string",
+          "default": "prd"
+        },
+        {
+          "name": "BACKEND_TIMEOUT",
+          "description": "Request timeout in seconds.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number",
+          "default": "30"
+        },
+        {
+          "name": "LOG_LEVEL",
+          "description": "Logging level.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string",
+          "choices": ["DEBUG", "INFO", "WARNING", "ERROR"],
+          "default": "INFO"
+        },
+        {
+          "name": "MAX_TRACES_PER_QUERY",
+          "description": "Maximum traces validated per query (1-1000).",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number",
+          "default": "500"
+        }
+      ]
+    }
+  ]
+}
