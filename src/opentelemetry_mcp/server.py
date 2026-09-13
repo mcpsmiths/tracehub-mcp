@@ -28,6 +28,7 @@ from opentelemetry_mcp.tools import (
     list_llm_tools,
     list_models,
     model_stats,
+    prompt_versions,
     search,
     search_spans,
     services,
@@ -561,6 +562,47 @@ async def compare_time_windows(
         return result
     except Exception as e:
         return _handle_tool_error("compare_time_windows", e)
+
+
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def get_prompt_version_stats(
+    start_time: str | None = None,
+    end_time: str | None = None,
+    service_name: str | None = None,
+    gen_ai_system: str | None = None,
+    limit: int = 1000,
+) -> str:
+    """Get aggregated performance stats grouped by prompt name and version.
+
+    Groups spans by gen_ai.prompt.name + gen_ai.prompt.version, mirroring
+    Langfuse's shipped per-prompt Metrics tab. Real-world adoption of these
+    two attributes is still thin, so this tool may often return an empty
+    list until more instrumentations populate them.
+
+    Args:
+        start_time: Start time in ISO 8601 format (e.g., 2024-01-01T00:00:00Z)
+        end_time: End time in ISO 8601 format
+        service_name: Filter by service name
+        gen_ai_system: Filter by LLM provider (openai, anthropic, etc.)
+        limit: Maximum spans to analyze (default: 1000)
+
+    Returns:
+        JSON string with per-(prompt_name, prompt_version) request counts,
+        time bounds, and duration/token percentiles
+    """
+    try:
+        backend = await _get_backend()
+        result = await prompt_versions.get_prompt_version_stats(
+            backend,
+            start_time=start_time,
+            end_time=end_time,
+            service_name=service_name,
+            gen_ai_system=gen_ai_system,
+            limit=limit,
+        )
+        return result
+    except Exception as e:
+        return _handle_tool_error("get_prompt_version_stats", e)
 
 
 @mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
