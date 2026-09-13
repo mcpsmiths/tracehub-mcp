@@ -1,10 +1,9 @@
 """Opentelemetry MCP Server - Main entry point."""
 
-import json
 import logging
 import re
 import sys
-from typing import Any
+from typing import Any, NoReturn
 
 import click
 from fastmcp import FastMCP
@@ -50,20 +49,21 @@ _READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
 )
 
 
-def _handle_tool_error(tool_name: str, error: Exception) -> str:
+def _handle_tool_error(tool_name: str, error: Exception) -> NoReturn:
     """Centralized error handler for tool functions.
 
-    Logs the error with traceback and returns properly escaped JSON.
+    Logs the error with traceback, then re-raises it. Letting the exception
+    propagate (rather than swallowing it and returning an error-shaped JSON
+    string) is what makes the MCP SDK's lowlevel server report the failure as
+    CallToolResult(isError=True), per SEP-2140 - a plain successful return
+    would leave isError=False even though the tool call failed.
 
     Args:
         tool_name: Name of the tool that encountered the error
         error: The exception that was raised
-
-    Returns:
-        JSON string with error message
     """
     logger.error(f"Error executing {tool_name}: {error}", exc_info=True)
-    return json.dumps({"error": f"Tool execution failed: {str(error)}"})
+    raise error
 
 
 # Global backend instance

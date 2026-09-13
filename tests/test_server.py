@@ -12,12 +12,12 @@ CLI entrypoint.
 # server.py import-style nuance that is out of scope for this test file.
 # mypy: disable-error-code="attr-defined"
 
-import json
 from collections.abc import Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
+from fastmcp import Client
 from pydantic import HttpUrl
 
 from opentelemetry_mcp import server
@@ -50,12 +50,18 @@ def _config(**overrides: object) -> ServerConfig:
 def reset_server_globals() -> Generator[None]:
     """The module-level _backend/_config globals are shared mutable state -
     reset them before and after every test so tests can't leak into each
-    other via caching in _get_backend."""
+    other via caching in _get_backend. TestToolWrappers also reassigns the
+    _get_backend function itself (not just the globals it caches) via raw
+    attribute assignment rather than unittest.mock.patch, so it must be
+    restored here too or a mocked _get_backend silently leaks into every
+    test that runs afterward in the same session."""
+    real_get_backend = server._get_backend
     server._backend = None
     server._config = None
     yield
     server._backend = None
     server._config = None
+    server._get_backend = real_get_backend
 
 
 class TestCreateBackend:
@@ -139,24 +145,31 @@ class TestCreateBackend:
 
 
 class TestHandleToolError:
-    """_handle_tool_error is a pure function - confirm the JSON shape and
-    that both the tool name (via logging) and the error message appear in
-    the returned payload."""
+    """_handle_tool_error logs then re-raises the original exception - it
+    must never swallow it and return a value instead. Swallowing it would
+    make the MCP SDK's lowlevel server treat the call as a *success* whose
+    content merely looks like an error (isError=False), which violates
+    SEP-2140's requirement that tool execution failures be reported as
+    CallToolResult(isError=True)."""
 
-    def test_returns_json_with_error_message(self) -> None:
-        result = server._handle_tool_error("search_traces", ValueError("boom"))
+    def test_reraises_the_original_exception(self) -> None:
+        error = ValueError("boom")
 
-        parsed = json.loads(result)
-        assert parsed == {"error": "Tool execution failed: boom"}
+        with pytest.raises(ValueError, match="boom") as exc_info:
+            server._handle_tool_error("search_traces", error)
 
-    def test_different_error_message_is_reflected(self) -> None:
-        result = server._handle_tool_error("get_trace", RuntimeError("trace not found"))
+        assert exc_info.value is error
 
-        parsed = json.loads(result)
-        assert parsed["error"] == "Tool execution failed: trace not found"
+    def test_different_error_type_is_preserved(self) -> None:
+        error = RuntimeError("trace not found")
+
+        with pytest.raises(RuntimeError, match="trace not found") as exc_info:
+            server._handle_tool_error("get_trace", error)
+
+        assert exc_info.value is error
 
     def test_logs_tool_name(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level("ERROR"):
+        with caplog.at_level("ERROR"), pytest.raises(Exception, match="oops"):
             server._handle_tool_error("list_services", Exception("oops"))
 
         assert "list_services" in caplog.text
@@ -227,10 +240,11 @@ class TestGetBackend:
 class TestToolWrappers:
     """Each @mcp.tool()-decorated function is a thin wrapper: get backend,
     call the matching tools.<module> function with its own parameters, and
-    turn any exception into _handle_tool_error's JSON. Mock at the
-    module-level names the wrapper actually calls (server._get_backend and
-    server.<tools_module>.<function>) so we exercise the wrapper's own glue
-    code rather than the mock."""
+    let any exception propagate through _handle_tool_error (which logs then
+    re-raises, so the MCP SDK reports CallToolResult(isError=True) - see
+    TestHandleToolError). Mock at the module-level names the wrapper
+    actually calls (server._get_backend and server.<tools_module>.<function>)
+    so we exercise the wrapper's own glue code rather than the mock."""
 
     async def _set_backend(self) -> AsyncMock:
         fake_backend = AsyncMock()
@@ -258,15 +272,15 @@ class TestToolWrappers:
         assert kwargs["has_error"] is True
         assert kwargs["limit"] == 42
 
-    async def test_search_traces_exception_becomes_error_json(self) -> None:
+    async def test_search_traces_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(
-            server.search, "search_traces", AsyncMock(side_effect=ValueError("bad filter"))
+        with (
+            patch.object(
+                server.search, "search_traces", AsyncMock(side_effect=ValueError("bad filter"))
+            ),
+            pytest.raises(ValueError, match="bad filter"),
         ):
-            result = await server.search_traces()
-
-        parsed = json.loads(result)
-        assert parsed == {"error": "Tool execution failed: bad filter"}
+            await server.search_traces()
 
     async def test_get_trace_passes_trace_id(self) -> None:
         await self._set_backend()
@@ -279,13 +293,13 @@ class TestToolWrappers:
         _, kwargs = mocked.call_args
         assert kwargs["trace_id"] == "abc123"
 
-    async def test_get_trace_exception_becomes_error_json(self) -> None:
+    async def test_get_trace_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(server.trace, "get_trace", AsyncMock(side_effect=KeyError("nope"))):
-            result = await server.get_trace(trace_id="missing")
-
-        parsed = json.loads(result)
-        assert "error" in parsed
+        with (
+            patch.object(server.trace, "get_trace", AsyncMock(side_effect=KeyError("nope"))),
+            pytest.raises(KeyError, match="nope"),
+        ):
+            await server.get_trace(trace_id="missing")
 
     async def test_get_llm_usage_passes_arguments_through(self) -> None:
         await self._set_backend()
@@ -297,12 +311,13 @@ class TestToolWrappers:
         assert kwargs["gen_ai_system"] == "openai"
         assert kwargs["limit"] == 50
 
-    async def test_get_llm_usage_exception_becomes_error_json(self) -> None:
+    async def test_get_llm_usage_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(server.usage, "get_llm_usage", AsyncMock(side_effect=Exception("fail"))):
-            result = await server.get_llm_usage()
-
-        assert json.loads(result)["error"] == "Tool execution failed: fail"
+        with (
+            patch.object(server.usage, "get_llm_usage", AsyncMock(side_effect=Exception("fail"))),
+            pytest.raises(Exception, match="fail"),
+        ):
+            await server.get_llm_usage()
 
     async def test_list_services_calls_tool_with_backend_only(self) -> None:
         fake_backend = await self._set_backend()
@@ -314,14 +329,15 @@ class TestToolWrappers:
         assert result == '["a","b"]'
         mocked.assert_awaited_once_with(fake_backend)
 
-    async def test_list_services_exception_becomes_error_json(self) -> None:
+    async def test_list_services_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(
-            server.services, "list_services", AsyncMock(side_effect=RuntimeError("down"))
+        with (
+            patch.object(
+                server.services, "list_services", AsyncMock(side_effect=RuntimeError("down"))
+            ),
+            pytest.raises(RuntimeError, match="down"),
         ):
-            result = await server.list_services()
-
-        assert json.loads(result)["error"] == "Tool execution failed: down"
+            await server.list_services()
 
     async def test_find_errors_passes_arguments_through(self) -> None:
         await self._set_backend()
@@ -332,12 +348,13 @@ class TestToolWrappers:
         assert kwargs["service_name"] == "svc"
         assert kwargs["limit"] == 5
 
-    async def test_find_errors_exception_becomes_error_json(self) -> None:
+    async def test_find_errors_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(server.errors, "find_errors", AsyncMock(side_effect=Exception("boom"))):
-            result = await server.find_errors()
-
-        assert json.loads(result)["error"] == "Tool execution failed: boom"
+        with (
+            patch.object(server.errors, "find_errors", AsyncMock(side_effect=Exception("boom"))),
+            pytest.raises(Exception, match="boom"),
+        ):
+            await server.find_errors()
 
     async def test_list_llm_models_passes_arguments_through(self) -> None:
         await self._set_backend()
@@ -350,14 +367,15 @@ class TestToolWrappers:
         assert kwargs["gen_ai_system"] == "anthropic"
         assert kwargs["limit"] == 10
 
-    async def test_list_llm_models_exception_becomes_error_json(self) -> None:
+    async def test_list_llm_models_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(
-            server.list_models, "list_models", AsyncMock(side_effect=Exception("boom"))
+        with (
+            patch.object(
+                server.list_models, "list_models", AsyncMock(side_effect=Exception("boom"))
+            ),
+            pytest.raises(Exception, match="boom"),
         ):
-            result = await server.list_llm_models()
-
-        assert json.loads(result)["error"] == "Tool execution failed: boom"
+            await server.list_llm_models()
 
     async def test_get_llm_model_stats_passes_model_name(self) -> None:
         await self._set_backend()
@@ -370,14 +388,15 @@ class TestToolWrappers:
         assert kwargs["model_name"] == "gpt-4"
         assert kwargs["service_name"] == "svc"
 
-    async def test_get_llm_model_stats_exception_becomes_error_json(self) -> None:
+    async def test_get_llm_model_stats_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(
-            server.model_stats, "get_model_stats", AsyncMock(side_effect=Exception("boom"))
+        with (
+            patch.object(
+                server.model_stats, "get_model_stats", AsyncMock(side_effect=Exception("boom"))
+            ),
+            pytest.raises(Exception, match="boom"),
         ):
-            result = await server.get_llm_model_stats(model_name="gpt-4")
-
-        assert json.loads(result)["error"] == "Tool execution failed: boom"
+            await server.get_llm_model_stats(model_name="gpt-4")
 
     async def test_get_llm_expensive_traces_passes_arguments_through(self) -> None:
         await self._set_backend()
@@ -390,16 +409,17 @@ class TestToolWrappers:
         assert kwargs["limit"] == 3
         assert kwargs["min_tokens"] == 1000
 
-    async def test_get_llm_expensive_traces_exception_becomes_error_json(self) -> None:
+    async def test_get_llm_expensive_traces_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(
-            server.expensive_traces,
-            "get_expensive_traces",
-            AsyncMock(side_effect=Exception("boom")),
+        with (
+            patch.object(
+                server.expensive_traces,
+                "get_expensive_traces",
+                AsyncMock(side_effect=Exception("boom")),
+            ),
+            pytest.raises(Exception, match="boom"),
         ):
-            result = await server.get_llm_expensive_traces()
-
-        assert json.loads(result)["error"] == "Tool execution failed: boom"
+            await server.get_llm_expensive_traces()
 
     async def test_get_llm_slow_traces_passes_arguments_through(self) -> None:
         await self._set_backend()
@@ -412,14 +432,15 @@ class TestToolWrappers:
         assert kwargs["limit"] == 7
         assert kwargs["min_duration_ms"] == 250
 
-    async def test_get_llm_slow_traces_exception_becomes_error_json(self) -> None:
+    async def test_get_llm_slow_traces_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(
-            server.slow_traces, "get_slow_traces", AsyncMock(side_effect=Exception("boom"))
+        with (
+            patch.object(
+                server.slow_traces, "get_slow_traces", AsyncMock(side_effect=Exception("boom"))
+            ),
+            pytest.raises(Exception, match="boom"),
         ):
-            result = await server.get_llm_slow_traces()
-
-        assert json.loads(result)["error"] == "Tool execution failed: boom"
+            await server.get_llm_slow_traces()
 
     async def test_search_spans_tool_passes_arguments_through(self) -> None:
         await self._set_backend()
@@ -432,14 +453,15 @@ class TestToolWrappers:
         assert kwargs["service_name"] == "svc"
         assert kwargs["has_error"] is True
 
-    async def test_search_spans_tool_exception_becomes_error_json(self) -> None:
+    async def test_search_spans_tool_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(
-            server.search_spans, "search_spans", AsyncMock(side_effect=Exception("boom"))
+        with (
+            patch.object(
+                server.search_spans, "search_spans", AsyncMock(side_effect=Exception("boom"))
+            ),
+            pytest.raises(Exception, match="boom"),
         ):
-            result = await server.search_spans_tool()
-
-        assert json.loads(result)["error"] == "Tool execution failed: boom"
+            await server.search_spans_tool()
 
     async def test_list_llm_tools_tool_passes_arguments_through(self) -> None:
         await self._set_backend()
@@ -452,23 +474,52 @@ class TestToolWrappers:
         assert kwargs["gen_ai_system"] == "openai"
         assert kwargs["limit"] == 99
 
-    async def test_list_llm_tools_tool_exception_becomes_error_json(self) -> None:
+    async def test_list_llm_tools_tool_exception_propagates(self) -> None:
         await self._set_backend()
-        with patch.object(
-            server.list_llm_tools, "list_llm_tools", AsyncMock(side_effect=Exception("boom"))
+        with (
+            patch.object(
+                server.list_llm_tools, "list_llm_tools", AsyncMock(side_effect=Exception("boom"))
+            ),
+            pytest.raises(Exception, match="boom"),
         ):
-            result = await server.list_llm_tools_tool()
+            await server.list_llm_tools_tool()
 
-        assert json.loads(result)["error"] == "Tool execution failed: boom"
-
-    async def test_get_backend_failure_becomes_error_json(self) -> None:
+    async def test_get_backend_failure_propagates(self) -> None:
         """If _get_backend itself raises (e.g. config not set), the wrapper
-        must still catch it via _handle_tool_error rather than propagating."""
+        must let it propagate through _handle_tool_error (logged, then
+        re-raised) rather than swallowing it into a fake-success result."""
         server._get_backend = AsyncMock(side_effect=RuntimeError("Server configuration not set"))
 
-        result = await server.list_services()
+        with pytest.raises(RuntimeError, match="Server configuration not set"):
+            await server.list_services()
 
-        assert json.loads(result)["error"] == "Tool execution failed: Server configuration not set"
+
+class TestToolErrorIsErrorFlag:
+    """End-to-end (SEP-2140) proof: a failing tool call must produce a real
+    CallToolResult with isError=True over an actual MCP client handshake,
+    not just a JSON string whose content happens to contain an "error" key.
+    This exercises the real mcp.server.lowlevel.Server plumbing that
+    TestToolWrappers' direct-call tests never touch."""
+
+    async def test_backend_failure_sets_is_error_true(self) -> None:
+        server._config = None
+        server._backend = None
+
+        async with Client(server.mcp) as client:
+            result = await client.call_tool("search_traces", {"limit": 5}, raise_on_error=False)
+
+        assert result.is_error is True
+        assert "Server configuration not set" in result.content[0].text
+
+    async def test_successful_call_sets_is_error_false(self) -> None:
+        server._config = _config()
+        fake_backend = AsyncMock()
+        server._backend = fake_backend
+        with patch.object(server.search, "search_traces", AsyncMock(return_value='{"ok":1}')):
+            async with Client(server.mcp) as client:
+                result = await client.call_tool("search_traces", {"limit": 5}, raise_on_error=False)
+
+        assert result.is_error is False
 
 
 class TestMainCli:
