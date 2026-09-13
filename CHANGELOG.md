@@ -1,3 +1,16 @@
+## v0.4.0 (2026-09-13)
+
+### Feat
+
+- **attributes**: add gen_ai.system_instructions field
+- **backends**: warn on non-local HTTP, Grafana Cloud Tempo auth, retry backoff
+
+### Fix
+
+- **ci**: use a PAT for the release workflow push, not the default token
+- **security**: validate Origin header on HTTP transport, mark tools read-only
+- **filters**: reject NaN in numeric filters, never raise on malformed finish_reasons
+
 ## v0.3.0 (2026-09-13)
 
 ### Feat
