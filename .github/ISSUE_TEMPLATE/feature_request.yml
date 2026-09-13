@@ -1,0 +1,41 @@
+name: Feature Request
+description: Suggest a new tool, backend, or capability for tracehub-mcp
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What are you trying to do that tracehub-mcp cannot do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: A new MCP tool, a new backend, a filter operator, etc. Be as concrete as you can.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - New MCP tool
+        - New backend
+        - Filter system
+        - Performance
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds you're currently using
+    validations:
+      required: false

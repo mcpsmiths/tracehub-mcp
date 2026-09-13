@@ -1,0 +1,74 @@
+name: Bug Report
+description: Something in tracehub-mcp is not working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please do **not** use this template for security
+        vulnerabilities — see [SECURITY.md](../../SECURITY.md) instead.
+
+  - type: input
+    id: version
+    attributes:
+      label: tracehub-mcp version
+      description: Output of `tracehub-mcp --version` or the pinned version in your config
+      placeholder: "0.3.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - Jaeger
+        - Grafana Tempo
+        - Traceloop
+        - Datadog
+        - Sentry
+        - Not backend-specific
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Transport
+      options:
+        - stdio (Claude Desktop / Claude Code / Cursor / etc.)
+        - HTTP
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug. Include the tool call (e.g. `search_traces`, `get_llm_model_stats`) if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, including any relevant filter/query parameters
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Set `LOG_LEVEL=DEBUG` and paste relevant output. Redact any secrets/API keys first.
+      render: shell
+    validations:
+      required: false
