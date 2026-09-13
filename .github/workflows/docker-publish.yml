@@ -47,17 +47,10 @@ jobs:
             ghcr.io/mcpsmiths/tracehub-mcp:${{ steps.version.outputs.tag }}
             ghcr.io/mcpsmiths/tracehub-mcp:latest
 
-      - name: Make package public
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # GHCR packages default to private on first publish - this repo is
-          # already public, and a private image would silently break every
-          # docker-based MCP client config that points at it.
-          gh api --method PATCH \
-            "/orgs/mcpsmiths/packages/container/tracehub-mcp/visibility" \
-            -f visibility=public || \
-          gh api --method PATCH \
-            "/user/packages/container/tracehub-mcp/visibility" \
-            -f visibility=public || \
-          echo "Could not set visibility via API - check ghcr.io/mcpsmiths/tracehub-mcp/pkgs/container/tracehub-mcp/settings manually."
+      # GHCR packages default to private on first publish. Changing that needs
+      # a token with the packages scope - the default GITHUB_TOKEN does not
+      # have it (confirmed: PATCH .../visibility returns a real 404, not a
+      # permissions error, with this exact token). This is a one-time setting
+      # per package, not per version, so it does not need automating here -
+      # flip it once at:
+      # https://github.com/mcpsmiths/tracehub-mcp/pkgs/container/tracehub-mcp/settings
