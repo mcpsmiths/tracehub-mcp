@@ -168,6 +168,19 @@ class SpanAttributes(BaseModel):
 
         return result
 
+    @property
+    def extra_attributes(self) -> dict[str, str | int | float | bool]:
+        """Attributes not covered by any typed field above - e.g. score.*/
+        evaluation.*-shaped attributes an instrumentation added that this
+        model does not explicitly define - surfaced via
+        ConfigDict(extra='allow'). Unlike to_dict(), this excludes the
+        typed fields, so callers that already expose those separately
+        (e.g. SpanSummary's gen_ai_system/total_tokens) do not duplicate
+        them."""
+        if not self.__pydantic_extra__:
+            return {}
+        return {k: v for k, v in self.__pydantic_extra__.items() if v is not None}
+
     def get(
         self, key: str, default: str | int | float | bool | None = None
     ) -> str | int | float | bool | None:

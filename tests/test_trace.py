@@ -222,3 +222,22 @@ async def test_get_trace_empty_gen_ai_system_is_not_counted_as_llm_span() -> Non
 
     assert "llm_attributes" not in result["spans"][0]
     assert "llm_summary" not in result
+
+
+async def test_get_trace_already_surfaces_score_and_evaluation_attributes() -> None:
+    """SpanAttributes.to_dict() already includes any extra="allow" field,
+    so a score.*/evaluation.*-shaped attribute an app writes onto a span
+    reaches get_trace's output with zero code change in this tool - this
+    pins that existing behavior down with a real test."""
+    backend = _fake_backend()
+    span = _make_span(
+        span_id="a",
+        attrs={"score.relevance": 0.87, "evaluation.passed": True},
+    )
+    backend.get_trace.return_value = _make_trace([span])
+
+    result = json.loads(await get_trace(backend, "t1"))
+
+    attributes = result["spans"][0]["attributes"]
+    assert attributes["score.relevance"] == 0.87
+    assert attributes["evaluation.passed"] is True

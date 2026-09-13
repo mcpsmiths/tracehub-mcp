@@ -187,3 +187,29 @@ def test_conversation_id_and_prompt_fields_default_to_none() -> None:
     assert attrs.gen_ai_conversation_id is None
     assert attrs.gen_ai_prompt_name is None
     assert attrs.gen_ai_prompt_version is None
+
+
+def test_extra_attributes_surfaces_score_and_evaluation_shaped_fields() -> None:
+    attrs = SpanAttributes.model_validate(
+        {"gen_ai.system": "openai", "score.relevance": 0.92, "evaluation.passed": True}
+    )
+    assert attrs.extra_attributes == {"score.relevance": 0.92, "evaluation.passed": True}
+
+
+def test_extra_attributes_excludes_typed_fields() -> None:
+    """gen_ai.system is a typed field - it must not also appear in
+    extra_attributes (that would duplicate what to_dict()/typed access
+    already expose)."""
+    attrs = SpanAttributes.model_validate({"gen_ai.system": "openai", "score.relevance": 0.5})
+    assert "gen_ai.system" not in attrs.extra_attributes
+    assert "gen_ai_system" not in attrs.extra_attributes
+
+
+def test_extra_attributes_is_empty_dict_when_none_present() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.system": "openai"})
+    assert attrs.extra_attributes == {}
+
+
+def test_extra_attributes_excludes_none_values() -> None:
+    attrs = SpanAttributes.model_validate({"score.relevance": None})
+    assert attrs.extra_attributes == {}

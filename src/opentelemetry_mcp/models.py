@@ -664,6 +664,7 @@ class SpanSummary(BaseModel):
     is_llm_span: bool = False
     gen_ai_system: str | None = None
     total_tokens: int | None = None
+    extra_attributes: dict[str, str | int | float | bool] | None = None
 
     @classmethod
     def from_span(cls, span: SpanData) -> "SpanSummary":
@@ -682,4 +683,5 @@ class SpanSummary(BaseModel):
             is_llm_span=span.is_llm_span,
             gen_ai_system=llm_attrs.system if llm_attrs else None,
             total_tokens=llm_attrs.total_tokens if llm_attrs else None,
+            extra_attributes=span.attributes.extra_attributes or None,
         )

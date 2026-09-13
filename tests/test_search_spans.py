@@ -343,3 +343,30 @@ class TestSearchSpansEdgeCases:
 
         query = backend.search_spans.call_args.args[0]
         assert query.limit == 100
+
+    async def test_score_and_evaluation_attributes_are_surfaced(self) -> None:
+        """SpanSummary (unlike get_trace's raw attributes.to_dict()) is a
+        curated shape with no attributes field at all - extra_attributes
+        is what makes score.*/evaluation.*-shaped attributes reach
+        search_spans_tool's output."""
+        backend = _fake_backend()
+        span = _plain_span(
+            attributes=SpanAttributes.model_validate(
+                {"score.relevance": 0.75, "evaluation.passed": False}
+            )
+        )
+        backend.search_spans.return_value = [span]
+
+        raw = await search_spans(backend)
+        summary = json.loads(raw)["spans"][0]
+
+        assert summary["extra_attributes"] == {"score.relevance": 0.75, "evaluation.passed": False}
+
+    async def test_extra_attributes_is_null_when_none_present(self) -> None:
+        backend = _fake_backend()
+        backend.search_spans.return_value = [_plain_span()]
+
+        raw = await search_spans(backend)
+        summary = json.loads(raw)["spans"][0]
+
+        assert summary["extra_attributes"] is None
