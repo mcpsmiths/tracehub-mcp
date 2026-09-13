@@ -15,6 +15,10 @@ updates:
       - "dependencies"
       - "python"
     open-pull-requests-limit: 10
+    groups:
+      python-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
@@ -28,3 +32,7 @@ updates:
       - "dependencies"
       - "github-actions"
     open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

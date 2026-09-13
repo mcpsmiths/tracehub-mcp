@@ -51,6 +51,7 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          sbom: true
           tags: |
             ghcr.io/mcpsmiths/tracehub-mcp:${{ steps.version.outputs.tag }}
             ghcr.io/mcpsmiths/tracehub-mcp:latest

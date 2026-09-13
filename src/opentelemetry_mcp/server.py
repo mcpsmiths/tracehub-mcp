@@ -659,7 +659,7 @@ async def list_llm_tools_tool(
 @click.option(
     "--host",
     type=str,
-    default="0.0.0.0",
+    default="0.0.0.0",  # noqa: S104 - HTTP transport is documented for network/Docker deployment, where binding only to loopback would make the exposed port unreachable; pass --host 127.0.0.1 explicitly for a loopback-only server.
     help="Host to bind HTTP server to (only for --transport http, default: 0.0.0.0)",
 )
 @click.option(
