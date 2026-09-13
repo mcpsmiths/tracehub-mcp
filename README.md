@@ -3,6 +3,7 @@
 # tracehub-mcp
 
 [![CI](https://github.com/mcpsmiths/tracehub-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mcpsmiths/tracehub-mcp/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/mcpsmiths/tracehub-mcp/graph/badge.svg)](https://codecov.io/gh/mcpsmiths/tracehub-mcp)
 [![PyPI](https://img.shields.io/pypi/v/tracehub-mcp.svg)](https://pypi.org/project/tracehub-mcp/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
