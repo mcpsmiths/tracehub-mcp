@@ -1,3 +1,9 @@
+## v0.2.3 (2026-09-13)
+
+### Fix
+
+- stop the release workflow crashing on a docs-only dispatch
+
 ## v0.2.2 (2026-09-12)
 
 ### Fix
