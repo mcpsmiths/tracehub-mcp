@@ -5,6 +5,9 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+from pydantic import ValidationError
+
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery
@@ -226,63 +229,54 @@ class TestQueryConstruction:
 
 
 class TestInputValidation:
-    """Invalid inputs must produce `{"error": ...}` JSON, never raise, and
-    must short-circuit before any backend call."""
+    """Invalid inputs must raise, so the MCP server reports
+    CallToolResult(isError=True) per SEP-2140, and must short-circuit
+    before any backend call."""
 
-    async def test_invalid_start_time_returns_error_without_calling_backend(self) -> None:
+    async def test_invalid_start_time_raises_without_calling_backend(self) -> None:
         backend = _mock_backend()
 
-        result = json.loads(await get_slow_traces(backend, start_time="not-a-date"))
-
-        assert "error" in result
-        assert "start_time" in result["error"]
+        with pytest.raises(ValueError, match="start_time"):
+            await get_slow_traces(backend, start_time="not-a-date")
         backend.search_traces.assert_not_called()
 
-    async def test_invalid_end_time_returns_error_without_calling_backend(self) -> None:
+    async def test_invalid_end_time_raises_without_calling_backend(self) -> None:
         backend = _mock_backend()
 
-        result = json.loads(await get_slow_traces(backend, end_time="not-a-date"))
-
-        assert "error" in result
-        assert "end_time" in result["error"]
+        with pytest.raises(ValueError, match="end_time"):
+            await get_slow_traces(backend, end_time="not-a-date")
         backend.search_traces.assert_not_called()
 
-    async def test_zero_limit_is_caught_as_error_json_not_raised(self) -> None:
+    async def test_zero_limit_raises_validation_error(self) -> None:
         """limit=0 makes the fetch limit `min(0 * 10, 1000) == 0`, which fails
-        TraceQuery's `ge=1` constraint. The TraceQuery construction is
-        wrapped in its own try/except ValidationError, so the failure is
-        caught and turned into the dedicated "Invalid query parameters"
-        error-JSON shape rather than the generic
-        "Failed to get slow traces: ..." wrapper."""
+        TraceQuery's `ge=1` constraint - the resulting pydantic
+        ValidationError must propagate."""
         backend = _mock_backend()
 
-        result = json.loads(await get_slow_traces(backend, limit=0))
-
-        assert "error" in result
-        assert result["error"].startswith("Invalid query parameters:")
+        with pytest.raises(ValidationError):
+            await get_slow_traces(backend, limit=0)
         backend.search_traces.assert_not_called()
 
 
 class TestBackendExceptionHandling:
-    """A backend that raises must be caught and turned into error JSON."""
+    """A backend that raises must let the exception propagate, so the MCP
+    server reports CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_search_traces_exception_is_caught_and_formatted(self) -> None:
+    async def test_search_traces_exception_propagates(self) -> None:
         backend = _mock_backend()
         backend.search_traces.side_effect = RuntimeError("backend down")
 
-        result = json.loads(await get_slow_traces(backend))
+        with pytest.raises(RuntimeError, match="backend down"):
+            await get_slow_traces(backend)
 
-        assert result == {"error": "Failed to get slow traces: backend down"}
-
-    async def test_get_trace_exception_is_caught_and_formatted(self) -> None:
+    async def test_get_trace_exception_propagates(self) -> None:
         backend = _mock_backend()
         trace = _trace("t1", [_llm_span()])
         backend.search_traces.return_value = [trace]
         backend.get_trace.side_effect = ConnectionError("trace lookup failed")
 
-        result = json.loads(await get_slow_traces(backend))
-
-        assert result == {"error": "Failed to get slow traces: trace lookup failed"}
+        with pytest.raises(ConnectionError, match="trace lookup failed"):
+            await get_slow_traces(backend)
 
 
 class TestEdgeCases:

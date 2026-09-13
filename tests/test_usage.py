@@ -5,6 +5,9 @@ from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+from pydantic import ValidationError
+
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery
@@ -81,29 +84,24 @@ def _mock_backend() -> AsyncMock:
 
 
 class TestGetLlmUsageValidation:
-    """Invalid time parameters must produce an error JSON, not an exception,
-    and must short-circuit before ever calling the backend."""
+    """Invalid time parameters must raise (so the MCP server reports
+    CallToolResult(isError=True) per SEP-2140), and must short-circuit
+    before ever calling the backend."""
 
-    async def test_invalid_start_time_returns_error_without_calling_backend(self) -> None:
+    async def test_invalid_start_time_raises_without_calling_backend(self) -> None:
         backend = _mock_backend()
 
-        result = await get_llm_usage(backend, start_time="not-a-timestamp")
-        parsed = json.loads(result)
-
-        assert "error" in parsed
-        assert "start_time" in parsed["error"]
+        with pytest.raises(ValueError, match="start_time"):
+            await get_llm_usage(backend, start_time="not-a-timestamp")
         backend.search_traces.assert_not_called()
 
-    async def test_invalid_end_time_returns_error_without_calling_backend(self) -> None:
+    async def test_invalid_end_time_raises_without_calling_backend(self) -> None:
         backend = _mock_backend()
 
-        result = await get_llm_usage(
-            backend, start_time="2024-01-01T00:00:00Z", end_time="also-not-a-timestamp"
-        )
-        parsed = json.loads(result)
-
-        assert "error" in parsed
-        assert "end_time" in parsed["error"]
+        with pytest.raises(ValueError, match="end_time"):
+            await get_llm_usage(
+                backend, start_time="2024-01-01T00:00:00Z", end_time="also-not-a-timestamp"
+            )
         backend.search_traces.assert_not_called()
 
 
@@ -270,17 +268,16 @@ class TestGetLlmUsageHappyPath:
 
 
 class TestGetLlmUsageBackendError:
-    """A backend exception must be caught and turned into an error JSON,
-    never left to propagate."""
+    """A backend exception must propagate (so the MCP server reports
+    CallToolResult(isError=True) per SEP-2140), never be swallowed into a
+    fake-success error JSON payload."""
 
-    async def test_backend_exception_is_caught_and_formatted(self) -> None:
+    async def test_backend_exception_propagates(self) -> None:
         backend = _mock_backend()
         backend.search_traces.side_effect = ConnectionError("backend unreachable")
 
-        result = await get_llm_usage(backend)
-        parsed = json.loads(result)
-
-        assert parsed == {"error": "Failed to get usage metrics: backend unreachable"}
+        with pytest.raises(ConnectionError, match="backend unreachable"):
+            await get_llm_usage(backend)
 
 
 class TestGetLlmUsageEdgeCases:
@@ -351,22 +348,15 @@ class TestGetLlmUsageEdgeCases:
 
 
 class TestGetLlmUsageLimitBoundary:
-    """TraceQuery constrains 'limit' to [1, 1000]; construction happens
-    inside its own try/except in get_llm_usage so an out-of-range value
-    is converted to the documented error-JSON contract."""
+    """TraceQuery constrains 'limit' to [1, 1000]; an out-of-range value
+    raises pydantic.ValidationError, which propagates so the MCP server
+    reports CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_limit_below_minimum_returns_error_json(self) -> None:
-        """An out-of-range 'limit' (a normal, externally controlled MCP
-        tool argument) must be converted to `{"error": ...}` JSON, not
-        raise a raw pydantic.ValidationError, matching the error-JSON
-        contract every other invalid-input path in this tool honors."""
+    async def test_limit_below_minimum_raises(self) -> None:
         backend = _mock_backend()
 
-        result = await get_llm_usage(backend, limit=0)
-        parsed = json.loads(result)
-
-        assert "error" in parsed
-        assert parsed["error"].startswith("Invalid query parameters:")
+        with pytest.raises(ValidationError):
+            await get_llm_usage(backend, limit=0)
         backend.search_traces.assert_not_called()
 
     async def test_limit_at_maximum_boundary_is_accepted(self) -> None:

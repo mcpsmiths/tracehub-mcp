@@ -3,8 +3,6 @@
 import json
 from typing import Any
 
-from pydantic import ValidationError
-
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import LLMSpanAttributes, TraceQuery, TraceSummary
 from opentelemetry_mcp.utils import parse_iso_timestamp
@@ -32,87 +30,80 @@ async def find_errors(
     # Parse timestamps
     start_dt, error = parse_iso_timestamp(start_time, "start_time")
     if error:
-        return json.dumps({"error": error})
+        raise ValueError(error)
 
     end_dt, error = parse_iso_timestamp(end_time, "end_time")
     if error:
-        return json.dumps({"error": error})
+        raise ValueError(error)
 
     # Build query with error filter
-    try:
-        query = TraceQuery(
-            service_name=service_name,
-            start_time=start_dt,
-            end_time=end_dt,
-            has_error=True,
-            limit=limit,
-        )
-    except ValidationError as e:
-        return json.dumps({"error": f"Invalid query parameters: {e}"})
+    query = TraceQuery(
+        service_name=service_name,
+        start_time=start_dt,
+        end_time=end_dt,
+        has_error=True,
+        limit=limit,
+    )
 
-    try:
-        # Search for error traces
-        traces = await backend.search_traces(query)
+    # Search for error traces
+    traces = await backend.search_traces(query)
 
-        # Build detailed error information
-        error_traces = []
+    # Build detailed error information
+    error_traces = []
 
-        for trace in traces:
-            # Find error spans
-            error_spans = [span for span in trace.spans if span.has_error]
+    for trace in traces:
+        # Find error spans
+        error_spans = [span for span in trace.spans if span.has_error]
 
-            trace_info: dict[str, Any] = TraceSummary.from_trace(trace).model_dump(mode="json")
+        trace_info: dict[str, Any] = TraceSummary.from_trace(trace).model_dump(mode="json")
 
-            # Add error details
-            trace_info["error_spans"] = []
-            error_spans_list: list[Any] = trace_info["error_spans"]
-            for span in error_spans:
-                error_info: dict[str, Any] = {
-                    "span_id": span.span_id,
-                    "operation_name": span.operation_name,
-                    "service_name": span.service_name,
-                    "status": span.status,
-                }
+        # Add error details
+        trace_info["error_spans"] = []
+        error_spans_list: list[Any] = trace_info["error_spans"]
+        for span in error_spans:
+            error_info: dict[str, Any] = {
+                "span_id": span.span_id,
+                "operation_name": span.operation_name,
+                "service_name": span.service_name,
+                "status": span.status,
+            }
 
-                # Extract error message using typed attribute access
-                error_message_val = (
-                    span.attributes.get("error.message")
-                    or span.attributes.get("exception.message")
-                    or "Unknown error"
-                )
-                error_info["error_message"] = str(error_message_val)
+            # Extract error message using typed attribute access
+            error_message_val = (
+                span.attributes.get("error.message")
+                or span.attributes.get("exception.message")
+                or "Unknown error"
+            )
+            error_info["error_message"] = str(error_message_val)
 
-                # Extract error type
-                error_type_val = span.attributes.get("error.type") or span.attributes.get(
-                    "exception.type"
-                )
-                if error_type_val:
-                    error_info["error_type"] = str(error_type_val)
+            # Extract error type
+            error_type_val = span.attributes.get("error.type") or span.attributes.get(
+                "exception.type"
+            )
+            if error_type_val:
+                error_info["error_type"] = str(error_type_val)
 
-                # Extract stack trace (truncated)
-                stack_trace_val = span.attributes.get("exception.stacktrace")
-                if stack_trace_val:
-                    # Truncate long stack traces
-                    stack_trace_str = str(stack_trace_val)
-                    if len(stack_trace_str) > 500:
-                        error_info["stack_trace"] = stack_trace_str[:500] + "..."
-                    else:
-                        error_info["stack_trace"] = stack_trace_str
+            # Extract stack trace (truncated)
+            stack_trace_val = span.attributes.get("exception.stacktrace")
+            if stack_trace_val:
+                # Truncate long stack traces
+                stack_trace_str = str(stack_trace_val)
+                if len(stack_trace_str) > 500:
+                    error_info["stack_trace"] = stack_trace_str[:500] + "..."
+                else:
+                    error_info["stack_trace"] = stack_trace_str
 
-                # Check if it's an LLM-related error
-                llm_attrs = LLMSpanAttributes.from_span(span)
-                if llm_attrs:
-                    error_info["is_llm_error"] = True
-                    error_info["llm_provider"] = llm_attrs.system
-                    error_info["llm_model"] = llm_attrs.response_model or llm_attrs.request_model
+            # Check if it's an LLM-related error
+            llm_attrs = LLMSpanAttributes.from_span(span)
+            if llm_attrs:
+                error_info["is_llm_error"] = True
+                error_info["llm_provider"] = llm_attrs.system
+                error_info["llm_model"] = llm_attrs.response_model or llm_attrs.request_model
 
-                error_spans_list.append(error_info)
+            error_spans_list.append(error_info)
 
-            error_traces.append(trace_info)
+        error_traces.append(trace_info)
 
-        result = {"count": len(error_traces), "error_traces": error_traces}
+    result = {"count": len(error_traces), "error_traces": error_traces}
 
-        return json.dumps(result, indent=2, default=str)
-
-    except Exception as e:
-        return json.dumps({"error": f"Failed to find error traces: {str(e)}"})
+    return json.dumps(result, indent=2, default=str)

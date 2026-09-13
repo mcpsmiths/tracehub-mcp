@@ -14,15 +14,11 @@ async def list_services(backend: BaseBackend) -> str:
     Returns:
         JSON string with list of service names
     """
-    try:
-        services = await backend.list_services()
+    services = await backend.list_services()
 
-        result = {"count": len(services), "services": sorted(services)}
+    result = {"count": len(services), "services": sorted(services)}
 
-        return json.dumps(result, indent=2)
-
-    except Exception as e:
-        return json.dumps({"error": f"Failed to list services: {str(e)}"})
+    return json.dumps(result, indent=2)
 
 
 async def get_service_operations(backend: BaseBackend, service_name: str) -> str:
@@ -35,18 +31,12 @@ async def get_service_operations(backend: BaseBackend, service_name: str) -> str
     Returns:
         JSON string with list of operation names
     """
-    try:
-        operations = await backend.get_service_operations(service_name)
+    operations = await backend.get_service_operations(service_name)
 
-        result = {
-            "service_name": service_name,
-            "count": len(operations),
-            "operations": sorted(operations),
-        }
+    result = {
+        "service_name": service_name,
+        "count": len(operations),
+        "operations": sorted(operations),
+    }
 
-        return json.dumps(result, indent=2)
-
-    except Exception as e:
-        return json.dumps(
-            {"error": f"Failed to get operations for service {service_name}: {str(e)}"}
-        )
+    return json.dumps(result, indent=2)

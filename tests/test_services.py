@@ -9,6 +9,8 @@ backend-level tests, e.g. test_datadog.py).
 import json
 from unittest.mock import AsyncMock
 
+import pytest
+
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.tools.services import get_service_operations, list_services
 
@@ -61,24 +63,15 @@ class TestListServices:
         assert result["count"] == 3
         assert result["services"] == ["svc-a", "svc-a", "svc-b"]
 
-    async def test_backend_exception_is_caught_and_returns_error_json(self) -> None:
+    async def test_backend_exception_propagates(self) -> None:
+        """The tool must let a backend exception propagate (rather than
+        swallow it into a fake-success JSON payload) so the MCP server can
+        report CallToolResult(isError=True) per SEP-2140."""
         backend = _backend()
         backend.list_services.side_effect = RuntimeError("connection refused")
 
-        output = await list_services(backend)
-        result = json.loads(output)
-
-        assert result == {"error": "Failed to list services: connection refused"}
-
-    async def test_backend_exception_does_not_propagate(self) -> None:
-        """The tool must never raise - callers only ever see JSON."""
-        backend = _backend()
-        backend.list_services.side_effect = ValueError("backend unreachable")
-
-        # Must not raise.
-        output = await list_services(backend)
-
-        assert json.loads(output)["error"].startswith("Failed to list services:")
+        with pytest.raises(RuntimeError, match="connection refused"):
+            await list_services(backend)
 
 
 class TestGetServiceOperations:
@@ -114,29 +107,25 @@ class TestGetServiceOperations:
         assert result["count"] == 2
         assert result["operations"] == ["op-a", "op-a"]
 
-    async def test_backend_exception_is_caught_and_includes_service_name(self) -> None:
+    async def test_backend_exception_propagates(self) -> None:
         backend = _backend()
         backend.get_service_operations.side_effect = RuntimeError("timeout")
 
-        result = json.loads(await get_service_operations(backend, "payments-service"))
+        with pytest.raises(RuntimeError, match="timeout"):
+            await get_service_operations(backend, "payments-service")
 
-        assert result == {"error": "Failed to get operations for service payments-service: timeout"}
-
-    async def test_backend_exception_does_not_propagate(self) -> None:
+    async def test_backend_exception_of_any_type_propagates(self) -> None:
         backend = _backend()
         backend.get_service_operations.side_effect = ConnectionError("dropped")
 
-        output = await get_service_operations(backend, "svc")
+        with pytest.raises(ConnectionError, match="dropped"):
+            await get_service_operations(backend, "svc")
 
-        assert json.loads(output)["error"].startswith("Failed to get operations for service svc:")
-
-    async def test_unknown_service_name_still_reflected_in_error_message(self) -> None:
+    async def test_unknown_service_name_backend_exception_propagates(self) -> None:
         """A service name the backend doesn't recognize isn't validated here -
-        it's passed straight through, including into the error message if
-        the backend raises for it."""
+        the backend's own exception (e.g. KeyError) is what propagates."""
         backend = _backend()
         backend.get_service_operations.side_effect = KeyError("no such service")
 
-        result = json.loads(await get_service_operations(backend, "does-not-exist"))
-
-        assert "does-not-exist" in result["error"]
+        with pytest.raises(KeyError, match="no such service"):
+            await get_service_operations(backend, "does-not-exist")

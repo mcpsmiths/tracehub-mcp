@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData, TraceSummary
@@ -202,27 +204,21 @@ class TestGetModelStatsHappyPath:
 
 
 class TestGetModelStatsValidation:
-    """Test that invalid inputs return the documented error JSON shape
-    instead of raising."""
+    """Test that invalid inputs raise, so the MCP server reports
+    CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_invalid_start_time_returns_error_json(self) -> None:
+    async def test_invalid_start_time_raises(self) -> None:
         backend = AsyncMock(spec=BaseBackend)
 
-        raw = await get_model_stats(backend, model_name="gpt-4", start_time="not-a-date")
-        result = json.loads(raw)
-
-        assert "error" in result
-        assert "start_time" in result["error"]
+        with pytest.raises(ValueError, match="start_time"):
+            await get_model_stats(backend, model_name="gpt-4", start_time="not-a-date")
         backend.search_traces.assert_not_called()
 
-    async def test_invalid_end_time_returns_error_json(self) -> None:
+    async def test_invalid_end_time_raises(self) -> None:
         backend = AsyncMock(spec=BaseBackend)
 
-        raw = await get_model_stats(backend, model_name="gpt-4", end_time="also-not-a-date")
-        result = json.loads(raw)
-
-        assert "error" in result
-        assert "end_time" in result["error"]
+        with pytest.raises(ValueError, match="end_time"):
+            await get_model_stats(backend, model_name="gpt-4", end_time="also-not-a-date")
         backend.search_traces.assert_not_called()
 
     async def test_invalid_start_time_checked_before_end_time(self) -> None:
@@ -230,40 +226,32 @@ class TestGetModelStatsValidation:
         function's sequential validation order."""
         backend = AsyncMock(spec=BaseBackend)
 
-        raw = await get_model_stats(
-            backend, model_name="gpt-4", start_time="bad-start", end_time="bad-end"
-        )
-        result = json.loads(raw)
-
-        assert "start_time" in result["error"]
+        with pytest.raises(ValueError, match="start_time"):
+            await get_model_stats(
+                backend, model_name="gpt-4", start_time="bad-start", end_time="bad-end"
+            )
 
 
 class TestGetModelStatsBackendExceptionHandling:
-    """Test that backend exceptions are caught and converted to error JSON,
-    never left to propagate to the MCP caller."""
+    """Test that backend exceptions propagate, so the MCP server reports
+    CallToolResult(isError=True) per SEP-2140, rather than being swallowed
+    into a fake-success error JSON payload."""
 
-    async def test_search_traces_exception_is_caught(self) -> None:
+    async def test_search_traces_exception_propagates(self) -> None:
         backend = AsyncMock(spec=BaseBackend)
         backend.search_traces.side_effect = RuntimeError("backend unreachable")
 
-        raw = await get_model_stats(backend, model_name="gpt-4")
-        result = json.loads(raw)
+        with pytest.raises(RuntimeError, match="backend unreachable"):
+            await get_model_stats(backend, model_name="gpt-4")
 
-        assert "error" in result
-        assert "Failed to get model stats" in result["error"]
-        assert "backend unreachable" in result["error"]
-
-    async def test_get_trace_exception_is_caught(self) -> None:
+    async def test_get_trace_exception_propagates(self) -> None:
         backend = AsyncMock(spec=BaseBackend)
         trace = _trace("t1", [_span("t1", "s1", model_attrs={"gen_ai.system": "openai"})])
         backend.search_traces.return_value = [_summary_for(trace)]
         backend.get_trace.side_effect = RuntimeError("trace fetch failed")
 
-        raw = await get_model_stats(backend, model_name="gpt-4")
-        result = json.loads(raw)
-
-        assert "error" in result
-        assert "Failed to get model stats" in result["error"]
+        with pytest.raises(RuntimeError, match="trace fetch failed"):
+            await get_model_stats(backend, model_name="gpt-4")
 
 
 class TestGetModelStatsEdgeCases:

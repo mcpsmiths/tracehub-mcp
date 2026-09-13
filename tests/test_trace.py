@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData
@@ -111,16 +113,15 @@ async def test_get_trace_empty_spans_list() -> None:
     assert "llm_summary" not in result
 
 
-async def test_get_trace_backend_exception_returns_error_json() -> None:
-    """When the backend raises (e.g. trace not found), get_trace must catch
-    it and return an error JSON payload instead of propagating."""
+async def test_get_trace_backend_exception_propagates() -> None:
+    """When the backend raises (e.g. trace not found), get_trace must let it
+    propagate so the MCP server reports CallToolResult(isError=True) per
+    SEP-2140, rather than swallowing it into a fake-success JSON payload."""
     backend = _fake_backend()
     backend.get_trace.side_effect = ValueError("no spans found for trace_id")
 
-    raw = await get_trace(backend, "missing-trace")
-    result = json.loads(raw)
-
-    assert result == {"error": "Failed to fetch trace: no spans found for trace_id"}
+    with pytest.raises(ValueError, match="no spans found for trace_id"):
+        await get_trace(backend, "missing-trace")
 
 
 async def test_get_trace_error_status_span_propagates_has_errors() -> None:

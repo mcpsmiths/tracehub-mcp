@@ -3,8 +3,6 @@
 import json
 from typing import Any
 
-from pydantic import ValidationError
-
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import Filter, TraceQuery, TraceSummary
 from opentelemetry_mcp.utils import parse_iso_timestamp
@@ -60,58 +58,46 @@ async def search_traces(
     # Parse timestamps
     start_dt, error = parse_iso_timestamp(start_time, "start_time")
     if error:
-        return json.dumps({"error": error})
+        raise ValueError(error)
 
     end_dt, error = parse_iso_timestamp(end_time, "end_time")
     if error:
-        return json.dumps({"error": error})
+        raise ValueError(error)
 
     # Parse filters from dicts to Filter models
     filter_objects = []
     if filters:
-        try:
-            for filter_dict in filters:
-                filter_obj = Filter(**filter_dict)
-                filter_objects.append(filter_obj)
-        except ValidationError as e:
-            return json.dumps({"error": f"Invalid filter format: {e}"})
-        except Exception as e:
-            return json.dumps({"error": f"Failed to parse filters: {e}"})
+        for filter_dict in filters:
+            filter_obj = Filter(**filter_dict)
+            filter_objects.append(filter_obj)
 
-    try:
-        # Build query
-        query = TraceQuery(
-            service_name=service_name,
-            operation_name=operation_name,
-            start_time=start_dt,
-            end_time=end_dt,
-            min_duration_ms=min_duration_ms,
-            max_duration_ms=max_duration_ms,
-            gen_ai_system=gen_ai_system,
-            gen_ai_request_model=gen_ai_request_model,
-            gen_ai_response_model=gen_ai_response_model,
-            has_error=has_error,
-            tags=tags or {},
-            filters=filter_objects,
-            limit=limit,
-        )
-    except ValidationError as e:
-        return json.dumps({"error": f"Invalid query parameters: {e}"})
+    # Build query
+    query = TraceQuery(
+        service_name=service_name,
+        operation_name=operation_name,
+        start_time=start_dt,
+        end_time=end_dt,
+        min_duration_ms=min_duration_ms,
+        max_duration_ms=max_duration_ms,
+        gen_ai_system=gen_ai_system,
+        gen_ai_request_model=gen_ai_request_model,
+        gen_ai_response_model=gen_ai_response_model,
+        has_error=has_error,
+        tags=tags or {},
+        filters=filter_objects,
+        limit=limit,
+    )
 
-    try:
-        # Execute search
-        traces = await backend.search_traces(query)
+    # Execute search
+    traces = await backend.search_traces(query)
 
-        # Convert to summaries
-        summaries = [TraceSummary.from_trace(trace) for trace in traces]
+    # Convert to summaries
+    summaries = [TraceSummary.from_trace(trace) for trace in traces]
 
-        # Return as JSON
-        result = {
-            "count": len(summaries),
-            "traces": [s.model_dump(mode="json") for s in summaries],
-        }
+    # Return as JSON
+    result = {
+        "count": len(summaries),
+        "traces": [s.model_dump(mode="json") for s in summaries],
+    }
 
-        return json.dumps(result, indent=2, default=str)
-
-    except Exception as e:
-        return json.dumps({"error": f"Failed to search traces: {str(e)}"})
+    return json.dumps(result, indent=2, default=str)

@@ -3,8 +3,6 @@
 import asyncio
 import json
 
-from pydantic import ValidationError
-
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import LLMSpanAttributes, TraceQuery
 from opentelemetry_mcp.utils import parse_iso_timestamp
@@ -38,85 +36,78 @@ async def get_slow_traces(
     # Parse timestamps
     start_dt, error = parse_iso_timestamp(start_time, "start_time")
     if error:
-        return json.dumps({"error": error})
+        raise ValueError(error)
 
     end_dt, error = parse_iso_timestamp(end_time, "end_time")
     if error:
-        return json.dumps({"error": error})
+        raise ValueError(error)
 
-    try:
-        # Build query to fetch traces (use larger limit to find top N)
-        query = TraceQuery(
-            start_time=start_dt,
-            end_time=end_dt,
-            service_name=service_name,
-            gen_ai_request_model=gen_ai_request_model,
-            gen_ai_response_model=gen_ai_response_model,
-            min_duration_ms=min_duration_ms,
-            limit=min(limit * 10, 1000),  # Fetch more to ensure we get enough slow ones
-        )
-    except ValidationError as e:
-        return json.dumps({"error": f"Invalid query parameters: {e}"})
+    # Build query to fetch traces (use larger limit to find top N)
+    query = TraceQuery(
+        start_time=start_dt,
+        end_time=end_dt,
+        service_name=service_name,
+        gen_ai_request_model=gen_ai_request_model,
+        gen_ai_response_model=gen_ai_response_model,
+        min_duration_ms=min_duration_ms,
+        limit=min(limit * 10, 1000),  # Fetch more to ensure we get enough slow ones
+    )
 
-    try:
-        # Search traces
-        trace_summaries = await backend.search_traces(query)
+    # Search traces
+    trace_summaries = await backend.search_traces(query)
 
-        # Fetch full traces concurrently (was: sequential N+1) to access LLM spans
-        traces = await asyncio.gather(
-            *(backend.get_trace(summary.trace_id) for summary in trace_summaries)
-        )
+    # Fetch full traces concurrently (was: sequential N+1) to access LLM spans
+    traces = await asyncio.gather(
+        *(backend.get_trace(summary.trace_id) for summary in trace_summaries)
+    )
 
-        # Collect trace data with durations
-        slow_traces = []
+    # Collect trace data with durations
+    slow_traces = []
 
-        for trace in traces:
-            # Only include traces that have LLM spans
-            if not trace.llm_spans:
+    for trace in traces:
+        # Only include traces that have LLM spans
+        if not trace.llm_spans:
+            continue
+
+        total_tokens = 0
+        models_used = set()
+
+        for span in trace.llm_spans:
+            llm_attrs = LLMSpanAttributes.from_span(span)
+            if not llm_attrs:
                 continue
 
-            total_tokens = 0
-            models_used = set()
+            # Calculate total tokens
+            if llm_attrs.total_tokens:
+                total_tokens += llm_attrs.total_tokens
 
-            for span in trace.llm_spans:
-                llm_attrs = LLMSpanAttributes.from_span(span)
-                if not llm_attrs:
-                    continue
+            # Track models
+            model = llm_attrs.response_model or llm_attrs.request_model
+            if model:
+                models_used.add(model)
 
-                # Calculate total tokens
-                if llm_attrs.total_tokens:
-                    total_tokens += llm_attrs.total_tokens
+        slow_traces.append(
+            {
+                "trace_id": trace.trace_id,
+                "service_name": trace.service_name,
+                "operation_name": trace.root_operation,
+                "start_time": trace.start_time.isoformat(),
+                "duration_ms": round(trace.duration_ms, 2),
+                "models": sorted(list(models_used)),
+                "total_tokens": total_tokens,
+                "llm_span_count": len(trace.llm_spans),
+                "status": trace.status,
+                "has_errors": trace.has_errors,
+            }
+        )
 
-                # Track models
-                model = llm_attrs.response_model or llm_attrs.request_model
-                if model:
-                    models_used.add(model)
+    # Sort by duration descending and take top N
+    slow_traces.sort(key=lambda x: x["duration_ms"], reverse=True)  # type: ignore[arg-type, return-value]
+    top_traces = slow_traces[:limit]
 
-            slow_traces.append(
-                {
-                    "trace_id": trace.trace_id,
-                    "service_name": trace.service_name,
-                    "operation_name": trace.root_operation,
-                    "start_time": trace.start_time.isoformat(),
-                    "duration_ms": round(trace.duration_ms, 2),
-                    "models": sorted(list(models_used)),
-                    "total_tokens": total_tokens,
-                    "llm_span_count": len(trace.llm_spans),
-                    "status": trace.status,
-                    "has_errors": trace.has_errors,
-                }
-            )
+    result = {
+        "count": len(top_traces),
+        "traces": top_traces,
+    }
 
-        # Sort by duration descending and take top N
-        slow_traces.sort(key=lambda x: x["duration_ms"], reverse=True)  # type: ignore[arg-type, return-value]
-        top_traces = slow_traces[:limit]
-
-        result = {
-            "count": len(top_traces),
-            "traces": top_traces,
-        }
-
-        return json.dumps(result, indent=2)
-
-    except Exception as e:
-        return json.dumps({"error": f"Failed to get slow traces: {str(e)}"})
+    return json.dumps(result, indent=2)

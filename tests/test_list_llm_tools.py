@@ -12,7 +12,9 @@ import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
+import pytest
 from opentelemetry.semconv_ai import TraceloopSpanKindValues
+from pydantic import ValidationError
 
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
@@ -181,27 +183,22 @@ class TestListLlmToolsQueryConstruction:
 
 
 class TestListLlmToolsTimestampValidation:
-    """Invalid ISO timestamps must surface as {"error": ...} JSON, per
-    parse_iso_timestamp's (value, error) return shape - never raise."""
+    """Invalid ISO timestamps must raise (per parse_iso_timestamp's
+    (value, error) return shape being converted to a ValueError), so the
+    MCP server reports CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_invalid_start_time_returns_error_json(self) -> None:
+    async def test_invalid_start_time_raises(self) -> None:
         backend = _fake_backend()
 
-        raw = await list_llm_tools(backend, start_time="not-a-timestamp")
-        result = json.loads(raw)
-
-        assert "error" in result
-        assert "start_time" in result["error"]
+        with pytest.raises(ValueError, match="start_time"):
+            await list_llm_tools(backend, start_time="not-a-timestamp")
         backend.search_spans.assert_not_awaited()
 
-    async def test_invalid_end_time_returns_error_json(self) -> None:
+    async def test_invalid_end_time_raises(self) -> None:
         backend = _fake_backend()
 
-        raw = await list_llm_tools(backend, end_time="also-not-a-timestamp")
-        result = json.loads(raw)
-
-        assert "error" in result
-        assert "end_time" in result["error"]
+        with pytest.raises(ValueError, match="end_time"):
+            await list_llm_tools(backend, end_time="also-not-a-timestamp")
         backend.search_spans.assert_not_awaited()
 
     async def test_start_time_checked_before_end_time(self) -> None:
@@ -209,10 +206,8 @@ class TestListLlmToolsTimestampValidation:
         first, so its failure must be the one reported."""
         backend = _fake_backend()
 
-        raw = await list_llm_tools(backend, start_time="bad-start", end_time="bad-end")
-        result = json.loads(raw)
-
-        assert "start_time" in result["error"]
+        with pytest.raises(ValueError, match="start_time"):
+            await list_llm_tools(backend, start_time="bad-start", end_time="bad-end")
 
     async def test_valid_iso_timestamps_reach_the_query(self) -> None:
         backend = _fake_backend()
@@ -230,25 +225,22 @@ class TestListLlmToolsTimestampValidation:
 
 
 class TestListLlmToolsBackendExceptionHandling:
-    """A backend that raises must be caught and reported as error JSON,
-    never left to propagate out of the tool."""
+    """A backend that raises must let the exception propagate, so the MCP
+    server reports CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_backend_exception_becomes_error_json(self) -> None:
+    async def test_backend_exception_propagates(self) -> None:
         backend = _fake_backend()
         backend.search_spans.side_effect = RuntimeError("upstream unavailable")
 
-        raw = await list_llm_tools(backend, service_name="svc")
-        result = json.loads(raw)
+        with pytest.raises(RuntimeError, match="upstream unavailable"):
+            await list_llm_tools(backend, service_name="svc")
 
-        assert result == {"error": "Failed to list LLM tools: upstream unavailable"}
-
-    async def test_backend_exception_does_not_propagate(self) -> None:
+    async def test_backend_exception_of_any_type_propagates(self) -> None:
         backend = _fake_backend()
         backend.search_spans.side_effect = ConnectionError("boom")
 
-        # Must not raise - the tool contract is always to return a JSON string.
-        raw = await list_llm_tools(backend)
-        assert json.loads(raw)["error"]
+        with pytest.raises(ConnectionError, match="boom"):
+            await list_llm_tools(backend)
 
 
 class TestListLlmToolsEdgeCases:
@@ -279,18 +271,13 @@ class TestListLlmToolsEdgeCases:
 
 
 class TestListLlmToolsLimitValidation:
-    """SpanQuery(limit=...) construction is wrapped in its own try/except
-    (matching the convention in tools/errors.py), so an out-of-range limit
-    must surface as the documented {"error": "Invalid query parameters: ..."}
-    JSON shape rather than raising a raw pydantic ValidationError.
-    """
+    """An out-of-range limit fails SpanQuery's own `ge=1` constraint, and
+    the resulting pydantic ValidationError must propagate so the MCP
+    server reports CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_limit_out_of_bounds_returns_error_json(self) -> None:
+    async def test_limit_out_of_bounds_raises_validation_error(self) -> None:
         backend = _fake_backend()
 
-        raw = await list_llm_tools(backend, limit=0)
-        result = json.loads(raw)
-
-        assert "error" in result
-        assert result["error"].startswith("Invalid query parameters:")
+        with pytest.raises(ValidationError):
+            await list_llm_tools(backend, limit=0)
         backend.search_spans.assert_not_awaited()

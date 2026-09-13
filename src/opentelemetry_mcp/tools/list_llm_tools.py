@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from opentelemetry.semconv_ai import TraceloopSpanKindValues
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.constants import Traceloop
@@ -50,11 +50,11 @@ async def list_llm_tools(
     # Parse timestamps
     start_dt, error = parse_iso_timestamp(start_time, "start_time")
     if error:
-        return json.dumps({"error": error})
+        raise ValueError(error)
 
     end_dt, error = parse_iso_timestamp(end_time, "end_time")
     if error:
-        return json.dumps({"error": error})
+        raise ValueError(error)
 
     # Build filter for traceloop.span.kind == tool
     filters = [
@@ -67,74 +67,67 @@ async def list_llm_tools(
     ]
 
     # Build query
-    try:
-        query = SpanQuery(
-            service_name=service_name,
-            start_time=start_dt,
-            end_time=end_dt,
-            gen_ai_system=gen_ai_system,
-            filters=filters,
-            limit=limit,
+    query = SpanQuery(
+        service_name=service_name,
+        start_time=start_dt,
+        end_time=end_dt,
+        gen_ai_system=gen_ai_system,
+        filters=filters,
+        limit=limit,
+    )
+
+    # Execute search
+    spans = await backend.search_spans(query)
+
+    if not spans:
+        return json.dumps(
+            {
+                "count": 0,
+                "tools": [],
+                "message": "No LLM tool spans found matching the criteria",
+            }
         )
-    except ValidationError as e:
-        return json.dumps({"error": f"Invalid query parameters: {e}"})
 
-    try:
-        # Execute search
-        spans = await backend.search_spans(query)
+    # Group spans by tool name (using operation_name as tool name)
+    tools_map: dict[str, dict[str, Any]] = {}
 
-        if not spans:
-            return json.dumps(
-                {
-                    "count": 0,
-                    "tools": [],
-                    "message": "No LLM tool spans found matching the criteria",
-                }
-            )
+    for span in spans:
+        tool_name = span.operation_name
 
-        # Group spans by tool name (using operation_name as tool name)
-        tools_map: dict[str, dict[str, Any]] = {}
+        if tool_name not in tools_map:
+            tools_map[tool_name] = {
+                "tool_name": tool_name,
+                "usage_count": 0,
+                "services": set(),
+                "first_seen": span.start_time,
+                "last_seen": span.start_time,
+            }
 
-        for span in spans:
-            tool_name = span.operation_name
+        tool_data = tools_map[tool_name]
+        tool_data["usage_count"] += 1
+        tool_data["services"].add(span.service_name)
 
-            if tool_name not in tools_map:
-                tools_map[tool_name] = {
-                    "tool_name": tool_name,
-                    "usage_count": 0,
-                    "services": set(),
-                    "first_seen": span.start_time,
-                    "last_seen": span.start_time,
-                }
+        # Update time bounds
+        if span.start_time < tool_data["first_seen"]:
+            tool_data["first_seen"] = span.start_time
+        if span.start_time > tool_data["last_seen"]:
+            tool_data["last_seen"] = span.start_time
 
-            tool_data = tools_map[tool_name]
-            tool_data["usage_count"] += 1
-            tool_data["services"].add(span.service_name)
+    # Convert to list and serialize
+    tools_list = []
+    for tool_data in tools_map.values():
+        # Convert set to sorted list
+        tool_data["services"] = sorted(list(tool_data["services"]))
+        tool_info = LLMToolInfo(**tool_data)
+        tools_list.append(tool_info.model_dump(mode="json"))
 
-            # Update time bounds
-            if span.start_time < tool_data["first_seen"]:
-                tool_data["first_seen"] = span.start_time
-            if span.start_time > tool_data["last_seen"]:
-                tool_data["last_seen"] = span.start_time
+    # Sort by usage count descending
+    tools_list.sort(key=lambda x: x["usage_count"], reverse=True)
 
-        # Convert to list and serialize
-        tools_list = []
-        for tool_data in tools_map.values():
-            # Convert set to sorted list
-            tool_data["services"] = sorted(list(tool_data["services"]))
-            tool_info = LLMToolInfo(**tool_data)
-            tools_list.append(tool_info.model_dump(mode="json"))
+    result = {
+        "count": len(tools_list),
+        "total_calls": sum(t["usage_count"] for t in tools_list),
+        "tools": tools_list,
+    }
 
-        # Sort by usage count descending
-        tools_list.sort(key=lambda x: x["usage_count"], reverse=True)
-
-        result = {
-            "count": len(tools_list),
-            "total_calls": sum(t["usage_count"] for t in tools_list),
-            "tools": tools_list,
-        }
-
-        return json.dumps(result, indent=2, default=str)
-
-    except Exception as e:
-        return json.dumps({"error": f"Failed to list LLM tools: {str(e)}"})
+    return json.dumps(result, indent=2, default=str)

@@ -5,6 +5,9 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+from pydantic import ValidationError
+
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery
@@ -132,33 +135,29 @@ class TestSearchTracesHappyPath:
 
 
 class TestSearchTracesInputValidation:
-    """Bad input must produce {"error": ...} JSON, never raise."""
+    """Bad input must raise (so the MCP server reports
+    CallToolResult(isError=True) per SEP-2140), never be swallowed into a
+    fake-success {"error": ...} JSON payload."""
 
-    async def test_invalid_start_time_returns_error_without_raising(self) -> None:
+    async def test_invalid_start_time_raises_without_calling_backend(self) -> None:
         backend = _fake_backend()
 
-        result = json.loads(await search_traces(backend, start_time="not-a-timestamp"))
-
-        assert "error" in result
-        assert "start_time" in result["error"]
+        with pytest.raises(ValueError, match="start_time"):
+            await search_traces(backend, start_time="not-a-timestamp")
         backend.search_traces.assert_not_called()
 
-    async def test_invalid_end_time_returns_error_without_raising(self) -> None:
+    async def test_invalid_end_time_raises_without_calling_backend(self) -> None:
         backend = _fake_backend()
 
-        result = json.loads(
+        with pytest.raises(ValueError, match="end_time"):
             await search_traces(
                 backend, start_time="2024-01-01T00:00:00Z", end_time="also-not-a-timestamp"
             )
-        )
-
-        assert "error" in result
-        assert "end_time" in result["error"]
         backend.search_traces.assert_not_called()
 
-    async def test_filter_missing_required_value_returns_validation_error(self) -> None:
+    async def test_filter_missing_required_value_raises_validation_error(self) -> None:
         """Filter.validate_filter_values requires 'value' for EQUALS-type
-        operators; the ValidationError must be caught and formatted."""
+        operators; the resulting ValidationError must propagate."""
         backend = _fake_backend()
         bad_filter = {
             "field": "gen_ai.system",
@@ -167,61 +166,53 @@ class TestSearchTracesInputValidation:
             # 'value' intentionally omitted
         }
 
-        result = json.loads(await search_traces(backend, filters=[bad_filter]))
-
-        assert "error" in result
-        assert "Invalid filter format" in result["error"]
+        with pytest.raises(ValidationError):
+            await search_traces(backend, filters=[bad_filter])
         backend.search_traces.assert_not_called()
 
-    async def test_filter_entry_that_is_not_a_mapping_returns_generic_parse_error(self) -> None:
-        """A non-dict entry in `filters` can't hit the ValidationError branch
-        (Filter(**entry) raises TypeError before pydantic validation runs) -
-        it must fall into the generic except instead."""
+    async def test_filter_entry_that_is_not_a_mapping_raises(self) -> None:
+        """A non-dict entry in `filters` can't hit pydantic validation at all
+        - Filter(**entry) raises TypeError before validation runs, and that
+        TypeError must propagate rather than be swallowed."""
         backend = _fake_backend()
 
-        result = json.loads(await search_traces(backend, filters=["not-a-dict"]))  # type: ignore[list-item]
-
-        assert "error" in result
-        assert "Failed to parse filters" in result["error"]
+        with pytest.raises(TypeError):
+            await search_traces(backend, filters=["not-a-dict"])  # type: ignore[list-item]
         backend.search_traces.assert_not_called()
 
-    async def test_limit_above_max_returns_invalid_query_parameters_error(self) -> None:
+    async def test_limit_above_max_raises_validation_error(self) -> None:
         backend = _fake_backend()
 
-        result = json.loads(await search_traces(backend, limit=1001))
-
-        assert "error" in result
-        assert "Invalid query parameters" in result["error"]
+        with pytest.raises(ValidationError):
+            await search_traces(backend, limit=1001)
         backend.search_traces.assert_not_called()
 
-    async def test_negative_min_duration_returns_invalid_query_parameters_error(self) -> None:
+    async def test_negative_min_duration_raises_validation_error(self) -> None:
         backend = _fake_backend()
 
-        result = json.loads(await search_traces(backend, min_duration_ms=-1))
-
-        assert "error" in result
-        assert "Invalid query parameters" in result["error"]
+        with pytest.raises(ValidationError):
+            await search_traces(backend, min_duration_ms=-1)
         backend.search_traces.assert_not_called()
 
 
 class TestSearchTracesBackendExceptionHandling:
-    """A raising backend must be caught and turned into error JSON."""
+    """A raising backend must let the exception propagate, so the MCP
+    server reports CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_backend_exception_is_caught_and_formatted(self) -> None:
+    async def test_backend_exception_propagates(self) -> None:
         backend = _fake_backend()
         backend.search_traces.side_effect = RuntimeError("connection reset")
 
-        result = json.loads(await search_traces(backend))
+        with pytest.raises(RuntimeError, match="connection reset"):
+            await search_traces(backend)
 
-        assert result == {"error": "Failed to search traces: connection reset"}
-
-    async def test_backend_exception_after_valid_filters_still_caught(self) -> None:
+    async def test_backend_exception_after_valid_filters_still_propagates(self) -> None:
         """Exercise the case where filter parsing succeeds but the actual
-        backend call still fails - the two try/except blocks are separate."""
+        backend call still fails."""
         backend = _fake_backend()
         backend.search_traces.side_effect = ValueError("Jaeger backend requires 'service_name'")
 
-        result = json.loads(
+        with pytest.raises(ValueError, match="Jaeger backend requires 'service_name'"):
             await search_traces(
                 backend,
                 filters=[
@@ -233,11 +224,6 @@ class TestSearchTracesBackendExceptionHandling:
                     }
                 ],
             )
-        )
-
-        assert result == {
-            "error": "Failed to search traces: Jaeger backend requires 'service_name'"
-        }
 
 
 class TestSearchTracesQueryConstruction:

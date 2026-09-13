@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
 
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
@@ -270,61 +271,49 @@ class TestListModelsQueryConstruction:
 
 
 class TestListModelsValidationErrors:
-    """Invalid inputs must produce {"error": ...} JSON, never raise."""
+    """Invalid inputs must raise, so the MCP server reports
+    CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_invalid_start_time_returns_error_json(self, mock_backend: AsyncMock) -> None:
-        result = await list_models(mock_backend, start_time="not-a-timestamp")
-        data = json.loads(result)
-
-        assert "error" in data
-        assert "start_time" in data["error"]
+    async def test_invalid_start_time_raises(self, mock_backend: AsyncMock) -> None:
+        with pytest.raises(ValueError, match="start_time"):
+            await list_models(mock_backend, start_time="not-a-timestamp")
         mock_backend.search_traces.assert_not_called()
 
-    async def test_invalid_end_time_returns_error_json(self, mock_backend: AsyncMock) -> None:
-        result = await list_models(
-            mock_backend, start_time="2024-01-01T00:00:00Z", end_time="also-not-a-timestamp"
-        )
-        data = json.loads(result)
-
-        assert "error" in data
-        assert "end_time" in data["error"]
+    async def test_invalid_end_time_raises(self, mock_backend: AsyncMock) -> None:
+        with pytest.raises(ValueError, match="end_time"):
+            await list_models(
+                mock_backend, start_time="2024-01-01T00:00:00Z", end_time="also-not-a-timestamp"
+            )
         mock_backend.search_traces.assert_not_called()
 
-    async def test_limit_out_of_bounds_returns_error_json_not_raise(
+    async def test_limit_out_of_bounds_raises_validation_error(
         self, mock_backend: AsyncMock
     ) -> None:
-        """TraceQuery enforces limit ge=1/le=1000; the pydantic ValidationError
-        raised while building the query must be caught by the tool's own
-        try/except and surfaced as an error payload, not propagate."""
-        result = await list_models(mock_backend, limit=0)
-        data = json.loads(result)
-
-        assert "error" in data
-        assert "Failed to list models" in data["error"]
+        """TraceQuery enforces limit ge=1/le=1000; the resulting pydantic
+        ValidationError must propagate."""
+        with pytest.raises(ValidationError):
+            await list_models(mock_backend, limit=0)
         mock_backend.search_traces.assert_not_called()
 
 
 class TestListModelsBackendExceptionHandling:
-    """A raising backend must be turned into an error payload, not crash."""
+    """A raising backend must let the exception propagate, so the MCP
+    server reports CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_search_traces_exception_is_caught(self, mock_backend: AsyncMock) -> None:
+    async def test_search_traces_exception_propagates(self, mock_backend: AsyncMock) -> None:
         mock_backend.search_traces.side_effect = RuntimeError("backend unreachable")
 
-        result = await list_models(mock_backend)
-        data = json.loads(result)
+        with pytest.raises(RuntimeError, match="backend unreachable"):
+            await list_models(mock_backend)
 
-        assert data == {"error": "Failed to list models: backend unreachable"}
-
-    async def test_get_trace_exception_is_caught(self, mock_backend: AsyncMock) -> None:
+    async def test_get_trace_exception_propagates(self, mock_backend: AsyncMock) -> None:
         span = _make_span(start_time=datetime(2024, 1, 1, tzinfo=UTC), request_model="gpt-4")
         trace = _make_trace("t1", [span])
         mock_backend.search_traces.return_value = [TraceSummary.from_trace(trace)]
         mock_backend.get_trace.side_effect = RuntimeError("trace fetch failed")
 
-        result = await list_models(mock_backend)
-        data = json.loads(result)
-
-        assert data == {"error": "Failed to list models: trace fetch failed"}
+        with pytest.raises(RuntimeError, match="trace fetch failed"):
+            await list_models(mock_backend)
 
 
 class TestListModelsEdgeCases:

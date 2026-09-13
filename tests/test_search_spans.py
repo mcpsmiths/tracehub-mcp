@@ -4,6 +4,9 @@ import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
+import pytest
+from pydantic import ValidationError
+
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData
@@ -148,27 +151,22 @@ class TestSearchSpansHappyPath:
 
 
 class TestSearchSpansTimestampValidation:
-    """Invalid ISO timestamps must surface as {"error": ...} JSON, per
-    parse_iso_timestamp's (value, error) return shape - never raise."""
+    """Invalid ISO timestamps must raise (per parse_iso_timestamp's
+    (value, error) return shape being converted to a ValueError), so the
+    MCP server reports CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_invalid_start_time_returns_error_json(self) -> None:
+    async def test_invalid_start_time_raises(self) -> None:
         backend = _fake_backend()
 
-        raw = await search_spans(backend, start_time="not-a-timestamp")
-        result = json.loads(raw)
-
-        assert "error" in result
-        assert "start_time" in result["error"]
+        with pytest.raises(ValueError, match="start_time"):
+            await search_spans(backend, start_time="not-a-timestamp")
         backend.search_spans.assert_not_awaited()
 
-    async def test_invalid_end_time_returns_error_json(self) -> None:
+    async def test_invalid_end_time_raises(self) -> None:
         backend = _fake_backend()
 
-        raw = await search_spans(backend, end_time="also-not-a-timestamp")
-        result = json.loads(raw)
-
-        assert "error" in result
-        assert "end_time" in result["error"]
+        with pytest.raises(ValueError, match="end_time"):
+            await search_spans(backend, end_time="also-not-a-timestamp")
         backend.search_spans.assert_not_awaited()
 
     async def test_start_time_checked_before_end_time(self) -> None:
@@ -177,10 +175,8 @@ class TestSearchSpansTimestampValidation:
         than silently picking one at random."""
         backend = _fake_backend()
 
-        raw = await search_spans(backend, start_time="bad-start", end_time="bad-end")
-        result = json.loads(raw)
-
-        assert "start_time" in result["error"]
+        with pytest.raises(ValueError, match="start_time"):
+            await search_spans(backend, start_time="bad-start", end_time="bad-end")
 
     async def test_valid_iso_timestamps_reach_the_query(self) -> None:
         backend = _fake_backend()
@@ -198,118 +194,99 @@ class TestSearchSpansTimestampValidation:
 
 
 class TestSearchSpansFilterValidation:
-    """Malformed filter dicts must be reported as errors, not raised."""
+    """Malformed filter dicts must raise, not be swallowed into error JSON."""
 
-    async def test_missing_required_field_returns_error_json(self) -> None:
+    async def test_missing_required_field_raises_validation_error(self) -> None:
         backend = _fake_backend()
 
-        raw = await search_spans(
-            backend,
-            filters=[{"operator": "equals", "value": "x", "value_type": "string"}],
-        )
-        result = json.loads(raw)
-
-        assert "error" in result
-        assert "Invalid filter format" in result["error"]
+        with pytest.raises(ValidationError):
+            await search_spans(
+                backend,
+                filters=[{"operator": "equals", "value": "x", "value_type": "string"}],
+            )
         backend.search_spans.assert_not_awaited()
 
-    async def test_unknown_operator_returns_error_json(self) -> None:
+    async def test_unknown_operator_raises_validation_error(self) -> None:
         backend = _fake_backend()
 
-        raw = await search_spans(
-            backend,
-            filters=[
-                {
-                    "field": "gen_ai.system",
-                    "operator": "not_a_real_operator",
-                    "value": "openai",
-                    "value_type": "string",
-                }
-            ],
-        )
-        result = json.loads(raw)
-
-        assert "error" in result
+        with pytest.raises(ValidationError):
+            await search_spans(
+                backend,
+                filters=[
+                    {
+                        "field": "gen_ai.system",
+                        "operator": "not_a_real_operator",
+                        "value": "openai",
+                        "value_type": "string",
+                    }
+                ],
+            )
         backend.search_spans.assert_not_awaited()
 
-    async def test_in_operator_missing_values_returns_error_json(self) -> None:
+    async def test_in_operator_missing_values_raises_validation_error(self) -> None:
         """Filter's own model_validator requires 'values' (not 'value') for
         the 'in' operator - exercises Filter's cross-field validation, not
         just field presence."""
         backend = _fake_backend()
 
-        raw = await search_spans(
-            backend,
-            filters=[
-                {
-                    "field": "gen_ai.system",
-                    "operator": "in",
-                    "value": "openai",
-                    "value_type": "string",
-                }
-            ],
-        )
-        result = json.loads(raw)
-
-        assert "error" in result
+        with pytest.raises(ValidationError):
+            await search_spans(
+                backend,
+                filters=[
+                    {
+                        "field": "gen_ai.system",
+                        "operator": "in",
+                        "value": "openai",
+                        "value_type": "string",
+                    }
+                ],
+            )
         backend.search_spans.assert_not_awaited()
 
 
 class TestSearchSpansQueryValidation:
     """Invalid query-level parameters (caught by SpanQuery's own field
-    constraints) must also become error JSON."""
+    constraints) must also raise, not become error JSON."""
 
-    async def test_limit_over_max_returns_error_json(self) -> None:
+    async def test_limit_over_max_raises_validation_error(self) -> None:
         backend = _fake_backend()
 
-        raw = await search_spans(backend, limit=5000)
-        result = json.loads(raw)
-
-        assert "error" in result
-        assert "Invalid query parameters" in result["error"]
+        with pytest.raises(ValidationError):
+            await search_spans(backend, limit=5000)
         backend.search_spans.assert_not_awaited()
 
-    async def test_limit_below_min_returns_error_json(self) -> None:
+    async def test_limit_below_min_raises_validation_error(self) -> None:
         backend = _fake_backend()
 
-        raw = await search_spans(backend, limit=0)
-        result = json.loads(raw)
-
-        assert "error" in result
+        with pytest.raises(ValidationError):
+            await search_spans(backend, limit=0)
         backend.search_spans.assert_not_awaited()
 
-    async def test_negative_min_duration_returns_error_json(self) -> None:
+    async def test_negative_min_duration_raises_validation_error(self) -> None:
         backend = _fake_backend()
 
-        raw = await search_spans(backend, min_duration_ms=-1)
-        result = json.loads(raw)
-
-        assert "error" in result
+        with pytest.raises(ValidationError):
+            await search_spans(backend, min_duration_ms=-1)
         backend.search_spans.assert_not_awaited()
 
 
 class TestSearchSpansBackendExceptionHandling:
-    """A backend that raises must be caught and reported as error JSON,
-    never left to propagate out of the tool."""
+    """A backend that raises must let the exception propagate, so the MCP
+    server reports CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_backend_exception_becomes_error_json(self) -> None:
+    async def test_backend_exception_propagates(self) -> None:
         backend = _fake_backend()
         backend.search_spans.side_effect = RuntimeError("upstream unavailable")
 
-        raw = await search_spans(backend, service_name="svc")
-        result = json.loads(raw)
+        with pytest.raises(RuntimeError, match="upstream unavailable"):
+            await search_spans(backend, service_name="svc")
 
-        assert "error" in result
-        assert "Failed to search spans" in result["error"]
-        assert "upstream unavailable" in result["error"]
-
-    async def test_backend_exception_does_not_propagate(self) -> None:
+    async def test_backend_exception_of_any_type_propagates(self) -> None:
         backend = _fake_backend()
         backend.search_spans.side_effect = ConnectionError("boom")
 
-        # Must not raise - the tool contract is always to return a JSON string.
-        raw = await search_spans(backend)
-        assert json.loads(raw)["error"]
+        with pytest.raises(ConnectionError, match="boom"):
+            await search_spans(backend)
 
 
 class TestSearchSpansEdgeCases:

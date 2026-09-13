@@ -5,6 +5,9 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from unittest.mock import AsyncMock
 
+import pytest
+from pydantic import ValidationError
+
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData
@@ -290,41 +293,36 @@ class TestQueryConstruction:
 
 
 class TestInputValidation:
-    """Invalid inputs must produce {"error": ...} JSON, never raise, and must
-    short-circuit before any backend call."""
+    """Invalid inputs must raise (so the MCP server reports
+    CallToolResult(isError=True) per SEP-2140), and must short-circuit
+    before any backend call."""
 
-    async def test_invalid_start_time_returns_error_without_calling_backend(self) -> None:
+    async def test_invalid_start_time_raises_without_calling_backend(self) -> None:
         backend = _backend()
 
-        result = json.loads(await find_errors(backend, start_time="not-a-date"))
-
-        assert "error" in result
-        assert "start_time" in result["error"]
+        with pytest.raises(ValueError, match="start_time"):
+            await find_errors(backend, start_time="not-a-date")
         backend.search_traces.assert_not_called()
 
-    async def test_invalid_end_time_returns_error_without_calling_backend(self) -> None:
+    async def test_invalid_end_time_raises_without_calling_backend(self) -> None:
         backend = _backend()
 
-        result = json.loads(await find_errors(backend, end_time="not-a-date"))
-
-        assert "error" in result
-        assert "end_time" in result["error"]
+        with pytest.raises(ValueError, match="end_time"):
+            await find_errors(backend, end_time="not-a-date")
         backend.search_traces.assert_not_called()
 
-    async def test_limit_below_minimum_returns_validation_error(self) -> None:
+    async def test_limit_below_minimum_raises_validation_error(self) -> None:
         backend = _backend()
 
-        result = json.loads(await find_errors(backend, limit=0))
-
-        assert "Invalid query parameters" in result["error"]
+        with pytest.raises(ValidationError):
+            await find_errors(backend, limit=0)
         backend.search_traces.assert_not_called()
 
-    async def test_limit_above_maximum_returns_validation_error(self) -> None:
+    async def test_limit_above_maximum_raises_validation_error(self) -> None:
         backend = _backend()
 
-        result = json.loads(await find_errors(backend, limit=1001))
-
-        assert "Invalid query parameters" in result["error"]
+        with pytest.raises(ValidationError):
+            await find_errors(backend, limit=1001)
         backend.search_traces.assert_not_called()
 
     async def test_limit_at_maximum_boundary_is_accepted(self) -> None:
@@ -347,12 +345,12 @@ class TestInputValidation:
 
 
 class TestBackendExceptionHandling:
-    """A backend that raises must be caught and turned into error JSON."""
+    """A backend that raises must let the exception propagate, so the MCP
+    server reports CallToolResult(isError=True) per SEP-2140."""
 
-    async def test_search_traces_exception_is_caught_and_formatted(self) -> None:
+    async def test_search_traces_exception_propagates(self) -> None:
         backend = _backend()
         backend.search_traces.side_effect = RuntimeError("backend down")
 
-        result = json.loads(await find_errors(backend))
-
-        assert result == {"error": "Failed to find error traces: backend down"}
+        with pytest.raises(RuntimeError, match="backend down"):
+            await find_errors(backend)

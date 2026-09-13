@@ -180,7 +180,13 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
 
 ### 4. Error Handling
 
-- Tools should catch exceptions and return JSON with `error` field
+- Tools must let exceptions propagate (raise `ValueError`/pydantic `ValidationError` for bad input,
+  let backend exceptions bubble up as-is) rather than catching them and returning `{"error": ...}`
+  JSON. `server.py`'s shared `_handle_tool_error` logs then re-raises; letting the exception
+  reach the MCP SDK's lowlevel server is what makes it build `CallToolResult(isError=True)` per
+  SEP-2140. A tool function that swallows an exception and returns a normal JSON string produces
+  `isError=False` even though the call failed - a client checking the spec-correct `isError` flag
+  would see it as a success.
 - Backend health checks are non-blocking
 - Server starts even if backend is initially unhealthy
 
