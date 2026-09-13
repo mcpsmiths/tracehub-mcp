@@ -42,6 +42,11 @@ For anyone auditing this project as a dependency:
 
 ## Scope
 
+Trace and span data returned by this server is treated as untrusted input by design — it
+originates from whatever application your observability backend is instrumenting, not from this
+project. See [Security Considerations](README.md#security-considerations) in the README for the
+full explanation; this document's scope is the vulnerability reporting process below.
+
 This policy covers the tracehub-mcp server code itself (this repository). It does not cover:
 
 - The observability backends it connects to (Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry) —

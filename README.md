@@ -26,6 +26,7 @@ tracehub-mcp started as a fork of [traceloop/opentelemetry-mcp-server](https://g
 - [What's Different From Upstream](#whats-different-from-upstream)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Security Considerations](#security-considerations)
 - [MCP Client Setup](#mcp-client-setup)
 - [Tools Reference](#tools-reference)
 - [Generic Filter System](#generic-filter-system)
@@ -277,6 +278,16 @@ uv run tracehub-mcp --transport http --host 0.0.0.0 --port 8000       # from-sou
 ```
 
 With HTTP transport, clients connect to `http://<host>:<port>/mcp` (streamable-HTTP, for compatibility across MCP clients).
+
+---
+
+## Security Considerations
+
+Trace and span data returned by this server — attribute values, error messages, operation names — comes from whatever application your observability backend is instrumenting, not from tracehub-mcp itself. That makes it fundamentally the same category of untrusted external content as a webpage or a file, even though it's a trusted server (this one) handing it back to your MCP client.
+
+- **Treat backend data as untrusted input.** An LLM client consuming trace/span data from tracehub-mcp should apply the same caution it would to any other external tool output — a span attribute or error message is application data to reason about, not an instruction to follow, no matter how it's phrased.
+- **This is a known MCP risk category, not a tracehub-mcp-specific one.** OWASP's GenAI Security Project covers it in their [Practical Guide for Secure MCP Server Development](https://genai.owasp.org/resource/a-practical-guide-for-secure-mcp-server-development/), and Anthropic's own engineering guidance, [How We Contain Claude](https://www.anthropic.com/engineering/how-we-contain-claude), states plainly that tool output is an attack surface even when the tool itself is trusted.
+- **Practical implication:** if you're querying traces from an application that processes untrusted user input (e.g. a customer-facing chatbot), be aware that adversarial content a user fed into that application could end up in a span attribute this server returns — and from there, in your LLM client's context.
 
 ---
 
