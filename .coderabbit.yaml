@@ -1,0 +1,37 @@
+# CodeRabbit configuration
+# https://docs.coderabbit.ai/reference/configuration
+
+language: en-US
+early_access: false
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  auto_review:
+    enabled: true
+    base_branches:
+      - "^main$"
+  path_instructions:
+    - path: "**/*.py"
+      instructions: >
+        This project already runs ruff (including the flake8-bandit "S" security
+        rules), mypy --strict, and pip-audit in CI. Do not re-flag issues those
+        tools already catch (formatting, unused imports, missing type hints, known
+        CVEs in pinned versions). Focus on logic errors, edge cases in the generic
+        filter system (backends/filter_engine.py), OpenTelemetry attribute parsing
+        correctness (attributes.py, backends/*.py), and test coverage gaps.
+    - path: "tests/**/*.py"
+      instructions: >
+        Flag missing edge-case coverage (empty inputs, malformed OTel attributes,
+        NaN/None values) and assertions that would pass even if the code under
+        test were wrong. Do not flag test-only patterns already allowed by
+        pyproject.toml's per-file ruff ignores (e.g. S101 assert usage).
+    - path: ".github/workflows/*.yml"
+      instructions: >
+        Check that any new third-party Action is pinned to a full commit SHA
+        (not a mutable tag), matching the convention already used throughout
+        this repo's workflows.
+
+chat:
+  auto_reply: true
