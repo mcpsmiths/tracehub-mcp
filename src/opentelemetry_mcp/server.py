@@ -21,6 +21,7 @@ from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.config import ServerConfig
+from opentelemetry_mcp.observability import McpServerTracingMiddleware, configure_tracing
 from opentelemetry_mcp.tools import (
     compare,
     errors,
@@ -897,6 +898,15 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     default=8000,
     help="Port for HTTP server (only for --transport http, default: 8000)",
 )
+@click.option(
+    "--include-args-in-spans",
+    is_flag=True,
+    default=False,
+    envvar="MCP_INCLUDE_ARGS_IN_SPANS",
+    help="Include tool call arguments/results as span attributes when OTel "
+    "self-instrumentation is enabled (default: False, since these may "
+    "contain sensitive data - overrides MCP_INCLUDE_ARGS_IN_SPANS env var)",
+)
 def main(
     backend: str | None,
     url: str | None,
@@ -909,6 +919,7 @@ def main(
     transport: str,
     host: str,
     port: int,
+    include_args_in_spans: bool,
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
@@ -962,6 +973,14 @@ def main(
 
         # Backend will be lazily initialized on first tool call
         # This ensures it's created in FastMCP's event loop, not a separate one
+
+        # OTel self-instrumentation is fully opt-in: configure_tracing() only
+        # returns True (and only then do we register the middleware) when
+        # OTEL_EXPORTER_OTLP_ENDPOINT is actually set, so there is zero
+        # overhead and no dependency on a collector for anyone who has not
+        # opted in.
+        if configure_tracing():
+            mcp.add_middleware(McpServerTracingMiddleware(include_args=include_args_in_spans))
 
         # Run server with selected transport
         if transport == "http":

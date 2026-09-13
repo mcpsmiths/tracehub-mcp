@@ -1,0 +1,125 @@
+"""OTel self-instrumentation for tracehub-mcp itself.
+
+Implements the official OTel GenAI semantic conventions for MCP
+(open-telemetry/semantic-conventions-genai, docs/gen-ai/mcp.md, status
+"Development") for the server's own tools/call handling, mirroring
+grafana/mcp-grafana's real, shipped precedent for this exact pattern: a
+dedicated observability module, standard OTEL_* env var configuration, and
+an --include-args-in-spans opt-in flag defaulting to False.
+
+Fully opt-in / no-op when OTEL_EXPORTER_OTLP_ENDPOINT is not set: no
+TracerProvider is configured and callers should skip registering the
+instrumentation middleware entirely, so there is zero overhead and no
+dependency on having a collector running for anyone who has not opted in.
+"""
+
+import logging
+import os
+from typing import Any
+
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
+
+logger = logging.getLogger(__name__)
+
+_TRACER_NAME = "opentelemetry_mcp"
+_MAX_RESULT_ATTRIBUTE_CHARS = 2000
+
+
+def configure_tracing(service_name: str | None = None) -> bool:
+    """Configure a real OTLP-exporting TracerProvider, but only if
+    OTEL_EXPORTER_OTLP_ENDPOINT is actually set in the environment.
+
+    Returns:
+        True if tracing was configured, False if it was skipped (no
+        endpoint configured). Callers must only register the
+        instrumentation middleware when this returns True.
+    """
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not endpoint:
+        return False
+
+    resource = Resource.create(
+        {SERVICE_NAME: service_name or os.getenv("OTEL_SERVICE_NAME") or "tracehub-mcp"}
+    )
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(provider)
+    logger.info(f"OTel self-instrumentation enabled, exporting spans to {endpoint}")
+    return True
+
+
+class McpServerTracingMiddleware(Middleware):
+    """FastMCP middleware implementing the OTel GenAI semantic conventions
+    for MCP tool calls: mcp.server spans, SERVER kind, required
+    mcp.method.name, conditionally-required error.type/gen_ai.tool.name/
+    gen_ai.operation.name.
+
+    gen_ai.tool.call.arguments/gen_ai.tool.call.result are opt-in only, per
+    the spec's own guidance that they may contain sensitive information.
+    """
+
+    def __init__(self, include_args: bool = False, tracer: Tracer | None = None) -> None:
+        self.include_args = include_args
+        # Accepting an explicit tracer (rather than always resolving one via
+        # trace.get_tracer() here) lets tests inject one bound to an
+        # in-memory exporter without touching the process-global
+        # TracerProvider, which OTel only allows setting once per process.
+        self._tracer = tracer or trace.get_tracer(_TRACER_NAME)
+
+    async def on_call_tool(
+        self, context: MiddlewareContext[Any], call_next: CallNext[Any, Any]
+    ) -> Any:
+        """Wrap a tools/call request in a spec-shaped mcp.server span."""
+        tool_name = getattr(context.message, "name", "unknown")
+        span_name = f"tools/call {tool_name}"
+
+        attributes: dict[str, str] = {
+            "mcp.method.name": "tools/call",
+            "gen_ai.tool.name": tool_name,
+            "gen_ai.operation.name": "execute_tool",
+        }
+        session_id = self._session_id(context)
+        if session_id is not None:
+            attributes["mcp.session.id"] = session_id
+
+        if self.include_args:
+            arguments = getattr(context.message, "arguments", None)
+            if arguments is not None:
+                attributes["gen_ai.tool.call.arguments"] = str(arguments)[
+                    :_MAX_RESULT_ATTRIBUTE_CHARS
+                ]
+
+        with self._tracer.start_as_current_span(
+            span_name, kind=SpanKind.SERVER, attributes=attributes
+        ) as span:
+            try:
+                result = await call_next(context)
+            except Exception as e:
+                self._record_error(span, e)
+                raise
+            if self.include_args:
+                span.set_attribute(
+                    "gen_ai.tool.call.result", str(result)[:_MAX_RESULT_ATTRIBUTE_CHARS]
+                )
+            return result
+
+    @staticmethod
+    def _record_error(span: Span, error: Exception) -> None:
+        span.set_attribute("error.type", type(error).__name__)
+        span.set_status(Status(StatusCode.ERROR, str(error)))
+
+    @staticmethod
+    def _session_id(context: MiddlewareContext[Any]) -> str | None:
+        fastmcp_context = context.fastmcp_context
+        if fastmcp_context is None:
+            return None
+        try:
+            return fastmcp_context.session_id
+        except RuntimeError:
+            return None
