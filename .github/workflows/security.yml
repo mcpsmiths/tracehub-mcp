@@ -26,10 +26,10 @@ jobs:
             docker-platform: linux/arm64
     runs-on: ${{ matrix.runs-on }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Cache Trivy
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: ~/.cache/trivy
           key: trivy-${{ runner.os }}-${{ matrix.platform }}
@@ -37,7 +37,7 @@ jobs:
             trivy-${{ runner.os }}-
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
 
       - name: Build image
         run: |
@@ -48,7 +48,7 @@ jobs:
             .
 
       - name: Trivy scan (JSON)
-        uses: aquasecurity/trivy-action@v0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # v0.35.0
         with:
           image-ref: tracehub-mcp-server:${{ github.sha }}-${{ matrix.platform }}
           format: json
@@ -70,7 +70,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63  # v4
         with:
           sarif_file: trivy-results-${{ matrix.platform }}.sarif
           category: container-security-tracehub-mcp-server-${{ matrix.platform }}
@@ -120,7 +120,7 @@ jobs:
 
       - name: Post PR comment
         if: github.event_name == 'pull_request'
-        uses: marocchino/sticky-pull-request-comment@v2
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405  # v2
         with:
           header: trivy-scan-tracehub-mcp-server-${{ matrix.platform }}
           path: trivy-comment-${{ matrix.platform }}.md
