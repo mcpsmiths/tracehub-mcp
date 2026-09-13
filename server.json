@@ -6,12 +6,12 @@
     "url": "https://github.com/mcpsmiths/tracehub-mcp",
     "source": "github"
   },
-  "version": "0.2.3",
+  "version": "0.4.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "tracehub-mcp",
-      "version": "0.2.3",
+      "version": "0.4.0",
       "transport": {
         "type": "stdio"
       },
@@ -44,6 +44,13 @@
           "description": "Datadog Application key, required in addition to BACKEND_API_KEY for the Datadog backend only.",
           "isRequired": false,
           "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "BACKEND_TEMPO_INSTANCE_ID",
+          "description": "Grafana Cloud stack/instance ID, used with BACKEND_API_KEY for Basic Auth (Tempo backend only, required for Grafana Cloud-hosted Tempo, not needed for self-hosted Tempo).",
+          "isRequired": false,
+          "isSecret": false,
           "format": "string"
         },
         {
