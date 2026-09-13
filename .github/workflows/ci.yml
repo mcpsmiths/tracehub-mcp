@@ -56,6 +56,46 @@ jobs:
                 token: ${{ secrets.CODECOV_TOKEN }}
                 files: ./coverage.xml
                 fail_ci_if_error: true
+    conformance:
+        name: MCP Conformance
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+            - name: Setup UV
+              uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+              with:
+                  version: "latest"
+                  enable-cache: true
+            - name: Setup Python
+              uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+              with:
+                  python-version: "3.13"
+            - name: Setup Node
+              uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903  # v5
+              with:
+                  node-version: "20"
+            - name: Install dependencies
+              run: uv sync --dev
+            - name: Start server (streamable-http)
+              env:
+                  BACKEND_TYPE: jaeger
+                  BACKEND_URL: http://localhost:16686
+              run: |
+                  uv run tracehub-mcp --transport http --host 127.0.0.1 --port 8765 &
+                  echo $! > /tmp/tracehub-mcp.pid
+                  for _ in $(seq 1 10); do
+                    curl -s -o /dev/null http://127.0.0.1:8765/mcp && break
+                    sleep 1
+                  done
+            - name: Run MCP conformance suite
+              run: |
+                  npx --yes @modelcontextprotocol/conformance server \
+                    --url http://127.0.0.1:8765/mcp \
+                    --suite active \
+                    --expected-failures ./conformance-baseline.yml
+            - name: Stop server
+              if: always()
+              run: kill "$(cat /tmp/tracehub-mcp.pid)" 2>/dev/null || true
     build-test:
         needs: test
         runs-on: ubuntu-latest

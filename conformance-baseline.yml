@@ -1,0 +1,51 @@
+# Baseline of expected @modelcontextprotocol/conformance failures for tracehub-mcp.
+#
+# tracehub-mcp is a tools-only MCP server: it does not implement Resources, Prompts,
+# Sampling, or Elicitation (all deliberately out of scope - see the plan's
+# "Explicitly out of scope" section). The conformance suite's default "active" suite
+# includes scenarios for all of these capabilities regardless of what a server
+# declares, so every scenario below fails not because of a protocol bug, but because
+# it exercises a capability this server correctly never advertises.
+#
+# If a future scenario appears here that actually reflects a real gap in the 11
+# tools/server-lifecycle capabilities tracehub-mcp DOES implement, remove it from
+# this list and fix the underlying bug instead of re-adding it.
+server:
+  # Sampling - deprecated by SEP-2577, never implemented here (by design).
+  - tools-call-sampling
+
+  # Elicitation - no real precedent for a trace-query server (per research), not
+  # implemented here.
+  - tools-call-elicitation
+  - elicitation-sep1034-defaults
+  - elicitation-sep1330-enums
+
+  # Multimodal / rich tool-call content - all 11 tools return JSON text only.
+  - tools-call-image
+  - tools-call-audio
+  - tools-call-embedded-resource
+  - tools-call-mixed-content
+
+  # Progress notifications - not implemented; tool calls are single-shot queries.
+  - tools-call-with-progress
+
+  # Logging capability - deprecated by SEP-2577; tracehub-mcp intentionally uses
+  # stderr logging instead (see spec-evolution research).
+  - tools-call-with-logging
+
+  # Completion - requires prompts/resources with argument completion; tracehub-mcp
+  # has neither.
+  - completion-complete
+
+  # Resources capability - not implemented (tools-only server).
+  - resources-read-text
+  - resources-read-binary
+  - resources-templates-read
+  - resources-subscribe
+  - resources-unsubscribe
+
+  # Prompts capability - not implemented (tools-only server).
+  - prompts-get-simple
+  - prompts-get-with-args
+  - prompts-get-embedded-resource
+  - prompts-get-with-image
