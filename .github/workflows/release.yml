@@ -134,12 +134,22 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Wait for package availability
-        run: sleep 60  # Wait for PyPI to index the package
-
-      - name: Test installation from PyPI
+      - name: Wait for package availability and test installation
+        env:
+          NEW_VERSION: ${{ needs.bump-version.outputs.new_version }}
         run: |
-          pip install tracehub-mcp==${{ needs.bump-version.outputs.new_version }}
+          # A fixed sleep before a single install attempt previously failed a
+          # real, successful release (PyPI CDN propagation lag exceeded 60s)
+          # even though the publish itself had already succeeded - poll
+          # instead of guessing a bigger fixed number.
+          for attempt in $(seq 1 10); do
+            if pip install "tracehub-mcp==${NEW_VERSION}" 2>/dev/null; then
+              echo "Installed on attempt ${attempt}"
+              break
+            fi
+            echo "Attempt ${attempt}/10: tracehub-mcp==${NEW_VERSION} not yet available on PyPI, waiting 30s..."
+            sleep 30
+          done
           python -c "import opentelemetry_mcp; print(f'Installed version: {opentelemetry_mcp.__version__}')"
           tracehub-mcp --help
 
