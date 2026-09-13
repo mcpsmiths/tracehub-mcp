@@ -87,3 +87,83 @@ def test_finish_reasons_coercion_never_raises(value: object) -> None:
     assert result is None or (
         isinstance(result, list) and all(isinstance(item, str) for item in result)
     )
+
+
+def test_system_instructions_accepts_a_real_list_unchanged() -> None:
+    instructions = [{"type": "text", "content": "You are a helpful assistant."}]
+    attrs = SpanAttributes.model_validate({"gen_ai.system_instructions": instructions})
+    assert attrs.gen_ai_system_instructions == instructions
+
+
+def test_system_instructions_accepts_none() -> None:
+    attrs = SpanAttributes.model_validate({})
+    assert attrs.gen_ai_system_instructions is None
+
+
+def test_system_instructions_parses_jaeger_style_json_encoded_string() -> None:
+    """Jaeger's tag model has no array-of-objects type - the OTLP collector
+    encodes a list attribute as a JSON string when writing it as a tag.
+    Construction must not raise, and the value must come out as a real
+    list of dicts."""
+    attrs = SpanAttributes.model_validate(
+        {"gen_ai.system_instructions": '[{"type": "text", "content": "Be concise."}]'}
+    )
+    assert attrs.gen_ai_system_instructions == [{"type": "text", "content": "Be concise."}]
+
+
+def test_system_instructions_wraps_json_encoded_list_of_plain_strings() -> None:
+    """Some instrumentation may hand this field a JSON array of plain
+    strings rather than {"type", "content"} objects - each element must be
+    wrapped so it still conforms to list[dict[str, str]]."""
+    attrs = SpanAttributes.model_validate(
+        {"gen_ai.system_instructions": '["Be concise.", "Answer in English."]'}
+    )
+    assert attrs.gen_ai_system_instructions == [
+        {"type": "text", "content": "Be concise."},
+        {"type": "text", "content": "Answer in English."},
+    ]
+
+
+def test_system_instructions_wraps_unparseable_string_as_single_instruction() -> None:
+    """Must never raise regardless of input shape - a raised exception here
+    is exactly what caused the whole span to be silently dropped upstream
+    for the analogous finish_reasons field."""
+    attrs = SpanAttributes.model_validate(
+        {"gen_ai.system_instructions": "You are a helpful assistant."}
+    )
+    assert attrs.gen_ai_system_instructions == [
+        {"type": "text", "content": "You are a helpful assistant."}
+    ]
+
+
+def test_system_instructions_wraps_json_scalar_string() -> None:
+    """Valid JSON that isn't a list (e.g. a bare JSON string or number)
+    must still be wrapped rather than raising or being dropped."""
+    attrs = SpanAttributes.model_validate({"gen_ai.system_instructions": "42"})
+    assert attrs.gen_ai_system_instructions == [{"type": "text", "content": "42"}]
+
+
+@given(
+    value=st.one_of(
+        st.none(),
+        st.text(),
+        st.lists(st.dictionaries(st.text(), st.text())),
+        st.integers(),
+        st.floats(allow_nan=True, allow_infinity=True),
+        st.booleans(),
+        st.dictionaries(st.text(), st.integers()),
+        st.tuples(st.integers(), st.integers()),
+    )
+)
+def test_system_instructions_coercion_never_raises(value: object) -> None:
+    """Property pinning _coerce_system_instructions's own stated contract:
+    no matter what shape this field arrives in, construction must succeed
+    and the field must end up either None or a real list[dict] - never
+    propagate a ValidationError, since that is exactly what silently
+    dropped whole spans upstream for the analogous finish_reasons field
+    (see module docstring)."""
+    attrs = SpanAttributes.model_validate({"gen_ai.system_instructions": value})
+    result = attrs.gen_ai_system_instructions
+    assert result is None or (
+        isinstance(result, list) and all(isinstance(item, dict) for item in result)
+    )

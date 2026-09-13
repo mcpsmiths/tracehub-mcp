@@ -39,6 +39,9 @@ class SpanAttributes(BaseModel):
     gen_ai_response_finish_reasons: list[str] | None = Field(
         None, alias="gen_ai.response.finish_reasons"
     )
+    gen_ai_system_instructions: list[dict[str, str]] | None = Field(
+        None, alias="gen_ai.system_instructions"
+    )
 
     # Usage Metrics (gen_ai.* format)
     gen_ai_usage_prompt_tokens: int | None = Field(None, alias="gen_ai.usage.prompt_tokens")
@@ -91,6 +94,49 @@ class SpanAttributes(BaseModel):
         # of finish reasons. Coercing to None - dropping just this field - is
         # a strictly smaller loss than the ValidationError raising here would
         # cause, per this function's own never-raise contract above.
+        return None
+
+    @field_validator("gen_ai_system_instructions", mode="before")
+    @classmethod
+    def _coerce_system_instructions(cls, value: Any) -> Any:
+        """Coerce system_instructions into a real list before type validation.
+
+        gen_ai.system_instructions is emitted by instrumentation (e.g. the
+        Vercel AI SDK's OTel integration) as its own JSON array of objects
+        shaped like {"type": "text", "content": ...}, distinct from
+        gen_ai.input.messages. Just like finish_reasons above, backends that
+        can't preserve a real list/array structure - Jaeger's flat-tag model,
+        Tempo's hand-rolled OTLP parser - hand this field a JSON-encoded
+        string instead of a list. Without this, list[dict[str, str]]
+        validation raises, SpanAttributes(**attrs) construction fails, and
+        the calling backend's per-span parser silently drops the whole span
+        rather than losing just this field.
+        """
+        if value is None or isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value.strip())
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, list):
+                if all(isinstance(item, dict) for item in parsed):
+                    return parsed
+                # A JSON array of non-dict items (e.g. plain strings) doesn't
+                # conform to list[dict[str, str]] - wrap each element so the
+                # data survives instead of raising.
+                return [{"type": "text", "content": str(item)} for item in parsed]
+            # Either not valid JSON at all, or valid JSON that isn't a list
+            # (e.g. a bare string or number) - never drop the underlying
+            # string data just because it didn't arrive as a clean JSON
+            # array. Mirrors _coerce_finish_reasons's comma-split fallback
+            # in spirit: wrap the whole string as a single instruction.
+            return [{"type": "text", "content": value}]
+        # Any other type (int, dict, bool, ...) can't be interpreted as a
+        # list of system instructions. Coercing to None - dropping just this
+        # field - is a strictly smaller loss than the ValidationError raising
+        # here would cause, per this function's own never-raise contract
+        # above.
         return None
 
     def to_dict(self) -> dict[str, str | int | float | bool]:
