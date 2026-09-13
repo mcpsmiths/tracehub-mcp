@@ -1,3 +1,14 @@
+## v0.3.0 (2026-09-13)
+
+### Feat
+
+- publish the Docker image to GHCR on release
+
+### Fix
+
+- stop inlining GitHub Actions expressions into shell script text
+- drop the fake auto-succeed visibility step in docker-publish
+
 ## v0.2.3 (2026-09-13)
 
 ### Fix
