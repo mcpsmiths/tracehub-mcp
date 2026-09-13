@@ -2,11 +2,17 @@
 
 import json
 import logging
+import re
 import sys
 from typing import Any
 
 import click
 from fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import Request
+from starlette.responses import Response
 
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.datadog import DatadogBackend
@@ -34,6 +40,13 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# All 11 tools below only ever query trace/span backends and never mutate
+# backend state, so the same read-only/idempotent/open-world annotations
+# apply to every one of them.
+_READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=True, idempotentHint=True, openWorldHint=True
+)
 
 
 def _handle_tool_error(tool_name: str, error: Exception) -> str:
@@ -152,7 +165,7 @@ async def _get_backend() -> BaseBackend:
     return _backend
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def search_traces(
     service_name: str | None = None,
     operation_name: str | None = None,
@@ -232,7 +245,7 @@ async def search_traces(
         return _handle_tool_error("search_traces", e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_trace(trace_id: str) -> str:
     """Get complete trace details by trace ID.
 
@@ -252,7 +265,7 @@ async def get_trace(trace_id: str) -> str:
         return _handle_tool_error("get_trace", e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_llm_usage(
     start_time: str | None = None,
     end_time: str | None = None,
@@ -295,7 +308,7 @@ async def get_llm_usage(
         return _handle_tool_error("get_llm_usage", e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def list_services() -> str:
     """List all available services in the OpenTelemetry backend.
 
@@ -310,7 +323,7 @@ async def list_services() -> str:
         return _handle_tool_error("list_services", e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def find_errors(
     start_time: str | None = None,
     end_time: str | None = None,
@@ -344,7 +357,7 @@ async def find_errors(
         return _handle_tool_error("find_errors", e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def list_llm_models(
     start_time: str | None = None,
     end_time: str | None = None,
@@ -381,7 +394,7 @@ async def list_llm_models(
         return _handle_tool_error("list_llm_models", e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_llm_model_stats(
     model_name: str,
     start_time: str | None = None,
@@ -416,7 +429,7 @@ async def get_llm_model_stats(
         return _handle_tool_error("get_llm_model_stats", e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_llm_expensive_traces(
     limit: int = 10,
     start_time: str | None = None,
@@ -459,7 +472,7 @@ async def get_llm_expensive_traces(
         return _handle_tool_error("get_llm_expensive_traces", e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_llm_slow_traces(
     limit: int = 10,
     start_time: str | None = None,
@@ -502,7 +515,7 @@ async def get_llm_slow_traces(
         return _handle_tool_error("get_llm_slow_traces", e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def search_spans_tool(
     service_name: str | None = None,
     operation_name: str | None = None,
@@ -573,7 +586,7 @@ async def search_spans_tool(
         return _handle_tool_error("search_spans_tool", e)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def list_llm_tools_tool(
     start_time: str | None = None,
     end_time: str | None = None,
@@ -609,6 +622,38 @@ async def list_llm_tools_tool(
         return result
     except Exception as e:
         return _handle_tool_error("list_llm_tools_tool", e)
+
+
+_LOCAL_ORIGIN_PATTERN = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$", re.IGNORECASE)
+
+
+class OriginValidationMiddleware(BaseHTTPMiddleware):
+    """Validate the Origin header on requests to the streamable-http transport.
+
+    fastmcp 3.2.0 builds its StreamableHTTPSessionManager without passing
+    security_settings through, which leaves the upstream mcp SDK's own
+    DNS-rebinding/Origin protection (mcp.server.transport_security) disabled
+    by default. fastmcp exposes no kwarg to pass security_settings through,
+    so this middleware restores Origin validation directly, satisfying the
+    MCP spec's (2025-06-18 basic/transports) MUST-requirement for Streamable
+    HTTP servers to validate the Origin header.
+
+    A request with no Origin header is allowed through unmodified: Origin can
+    be absent for same-origin requests, and most MCP HTTP clients are not
+    browsers and never send one in normal use. A request that does send an
+    Origin header is only allowed through if it points at a local dev origin
+    (127.0.0.1 or localhost, any scheme/port) - blocking the actual attack
+    this check exists for: a malicious webpage running in a victim's browser
+    using DNS rebinding or a crafted fetch() to reach a locally-bound
+    tracehub-mcp HTTP server.
+    """
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        origin = request.headers.get("origin")
+        if origin and not _LOCAL_ORIGIN_PATTERN.match(origin):
+            logger.warning(f"Invalid Origin header: {origin}")
+            return Response("Invalid Origin header", status_code=403)
+        return await call_next(request)
 
 
 @click.command()
@@ -728,7 +773,12 @@ def main(
             logger.info(f"Starting MCP server with HTTP transport on {host}:{port}")
             logger.info("Using streamable-http transport for better compatibility")
             logger.info(f"Connect clients to: http://{host}:{port}/mcp")
-            mcp.run(transport="streamable-http", host=host, port=port)
+            mcp.run(
+                transport="streamable-http",
+                host=host,
+                port=port,
+                middleware=[Middleware(OriginValidationMiddleware)],
+            )
         else:
             logger.info(
                 f"Starting MCP server with stdio transport using Backend: {_config.backend.type} connected to: {_config.backend.url}"

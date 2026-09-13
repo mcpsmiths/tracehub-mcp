@@ -550,9 +550,17 @@ class TestMainCli:
             )
 
         assert result.exit_code == 0, result.output
-        mock_mcp.run.assert_called_once_with(
-            transport="streamable-http", host="127.0.0.1", port=9001
-        )
+        mock_mcp.run.assert_called_once()
+        call_kwargs = mock_mcp.run.call_args.kwargs
+        assert call_kwargs["transport"] == "streamable-http"
+        assert call_kwargs["host"] == "127.0.0.1"
+        assert call_kwargs["port"] == 9001
+        # HTTP transport must wire in the Origin-validation middleware
+        # (Tier 1 security fix: fastmcp disables DNS-rebinding protection
+        # by default, see OriginValidationMiddleware's docstring).
+        middleware = call_kwargs["middleware"]
+        assert len(middleware) == 1
+        assert middleware[0].cls is server.OriginValidationMiddleware
 
     def test_keyboard_interrupt_exits_zero(self) -> None:
         runner = CliRunner()
