@@ -48,6 +48,11 @@ class GenAIAttributes:
     # Response
     GEN_AI_RESPONSE_FINISH_REASONS = "gen_ai.response.finish_reasons"
 
+    # Conversation and prompt identity
+    GEN_AI_CONVERSATION_ID = "gen_ai.conversation.id"
+    GEN_AI_PROMPT_NAME = "gen_ai.prompt.name"
+    GEN_AI_PROMPT_VERSION = "gen_ai.prompt.version"
+
     # Usage/tokens
     GEN_AI_USAGE_PROMPT_TOKENS = "gen_ai.usage.prompt_tokens"
     GEN_AI_USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
@@ -89,6 +94,11 @@ class GenAI:
 
     # Response
     RESPONSE_FINISH_REASONS = GenAIAttributes.GEN_AI_RESPONSE_FINISH_REASONS
+
+    # Conversation and prompt identity
+    CONVERSATION_ID = GenAIAttributes.GEN_AI_CONVERSATION_ID
+    PROMPT_NAME = GenAIAttributes.GEN_AI_PROMPT_NAME
+    PROMPT_VERSION = GenAIAttributes.GEN_AI_PROMPT_VERSION
 
     # Usage/tokens
     USAGE_PROMPT_TOKENS = GenAIAttributes.GEN_AI_USAGE_PROMPT_TOKENS

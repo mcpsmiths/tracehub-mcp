@@ -43,6 +43,11 @@ class SpanAttributes(BaseModel):
         None, alias="gen_ai.system_instructions"
     )
 
+    # Conversation and prompt identity (OTel GenAI semconv, Development status)
+    gen_ai_conversation_id: str | None = Field(None, alias="gen_ai.conversation.id")
+    gen_ai_prompt_name: str | None = Field(None, alias="gen_ai.prompt.name")
+    gen_ai_prompt_version: str | None = Field(None, alias="gen_ai.prompt.version")
+
     # Usage Metrics (gen_ai.* format)
     gen_ai_usage_prompt_tokens: int | None = Field(None, alias="gen_ai.usage.prompt_tokens")
     gen_ai_usage_input_tokens: int | None = Field(None, alias="gen_ai.usage.input_tokens")

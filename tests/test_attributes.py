@@ -167,3 +167,23 @@ def test_system_instructions_coercion_never_raises(value: object) -> None:
     assert result is None or (
         isinstance(result, list) and all(isinstance(item, dict) for item in result)
     )
+
+
+def test_conversation_id_parses_via_alias() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.conversation.id": "conv-123"})
+    assert attrs.gen_ai_conversation_id == "conv-123"
+
+
+def test_prompt_name_and_version_parse_via_alias() -> None:
+    attrs = SpanAttributes.model_validate(
+        {"gen_ai.prompt.name": "summarize", "gen_ai.prompt.version": "3"}
+    )
+    assert attrs.gen_ai_prompt_name == "summarize"
+    assert attrs.gen_ai_prompt_version == "3"
+
+
+def test_conversation_id_and_prompt_fields_default_to_none() -> None:
+    attrs = SpanAttributes.model_validate({})
+    assert attrs.gen_ai_conversation_id is None
+    assert attrs.gen_ai_prompt_name is None
+    assert attrs.gen_ai_prompt_version is None

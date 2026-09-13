@@ -30,6 +30,7 @@ from opentelemetry_mcp.tools import (
     search,
     search_spans,
     services,
+    sessions,
     slow_traces,
     trace,
     usage,
@@ -429,6 +430,85 @@ async def get_llm_model_stats(
         return result
     except Exception as e:
         return _handle_tool_error("get_llm_model_stats", e)
+
+
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def list_sessions(
+    start_time: str | None = None,
+    end_time: str | None = None,
+    service_name: str | None = None,
+    gen_ai_system: str | None = None,
+    limit: int = 1000,
+) -> str:
+    """List conversations/sessions grouped by gen_ai.conversation.id.
+
+    Groups spans that carry the gen_ai.conversation.id attribute (a real,
+    cross-industry OTel semantic convention for session/conversation grouping)
+    to surface per-conversation span counts, token usage, and time bounds -
+    useful for understanding multi-turn conversation activity.
+
+    Args:
+        start_time: Start time in ISO 8601 format (e.g., 2024-01-01T00:00:00Z)
+        end_time: End time in ISO 8601 format
+        service_name: Filter by service name
+        gen_ai_system: Filter by LLM provider (openai, anthropic, etc.)
+        limit: Maximum spans to analyze (default: 1000)
+
+    Returns:
+        JSON string with list of sessions and their statistics
+    """
+    try:
+        backend = await _get_backend()
+        result = await sessions.list_sessions(
+            backend,
+            start_time=start_time,
+            end_time=end_time,
+            service_name=service_name,
+            gen_ai_system=gen_ai_system,
+            limit=limit,
+        )
+        return result
+    except Exception as e:
+        return _handle_tool_error("list_sessions", e)
+
+
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def get_session_stats(
+    conversation_id: str,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    service_name: str | None = None,
+    limit: int = 1000,
+) -> str:
+    """Get detailed statistics for a single conversation/session.
+
+    Analyzes span count, distinct services, time bounds, LLM request/success/
+    error counts, latency percentiles, and token usage for every span sharing
+    the given gen_ai.conversation.id.
+
+    Args:
+        conversation_id: The gen_ai.conversation.id to analyze
+        start_time: Start time in ISO 8601 format (e.g., 2024-01-01T00:00:00Z)
+        end_time: End time in ISO 8601 format
+        service_name: Filter by service name
+        limit: Maximum spans to analyze (default: 1000)
+
+    Returns:
+        JSON string with comprehensive session statistics
+    """
+    try:
+        backend = await _get_backend()
+        result = await sessions.get_session_stats(
+            backend,
+            conversation_id=conversation_id,
+            start_time=start_time,
+            end_time=end_time,
+            service_name=service_name,
+            limit=limit,
+        )
+        return result
+    except Exception as e:
+        return _handle_tool_error("get_session_stats", e)
 
 
 @mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
