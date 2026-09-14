@@ -78,6 +78,19 @@ _config: ServerConfig | None = None
 mcp = FastMCP("tracehub-mcp", version=__version__)
 
 
+def _clamp_limit(limit: int) -> int:
+    """Cap a tool's requested limit at the server-wide ceiling
+    (--max-traces-per-query / MAX_TRACES_PER_QUERY), so a single query can
+    never fetch more traces/spans than the operator has allowed, regardless
+    of what the calling agent requests. _config is only None before startup
+    has finished (in practice, _get_backend() already fails first in that
+    case), so there is nothing to clamp against yet.
+    """
+    if _config is None:
+        return limit
+    return min(limit, _config.max_traces_per_query)
+
+
 def _create_backend(config: ServerConfig) -> BaseBackend:
     """Create backend instance based on configuration.
 
@@ -251,7 +264,7 @@ async def search_traces(
             has_error=has_error,
             tags=tags,
             filters=filters,
-            limit=limit,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:
@@ -314,7 +327,7 @@ async def get_llm_usage(
             gen_ai_system=gen_ai_system,
             gen_ai_request_model=gen_ai_request_model,
             gen_ai_response_model=gen_ai_response_model,
-            limit=limit,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:
@@ -363,7 +376,7 @@ async def find_errors(
             start_time=start_time,
             end_time=end_time,
             service_name=service_name,
-            limit=limit,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:
@@ -400,7 +413,7 @@ async def list_llm_models(
             end_time=end_time,
             service_name=service_name,
             gen_ai_system=gen_ai_system,
-            limit=limit,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:
@@ -475,7 +488,7 @@ async def list_sessions(
             end_time=end_time,
             service_name=service_name,
             gen_ai_system=gen_ai_system,
-            limit=limit,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:
@@ -514,7 +527,7 @@ async def get_session_stats(
             start_time=start_time,
             end_time=end_time,
             service_name=service_name,
-            limit=limit,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:
@@ -565,7 +578,7 @@ async def compare_time_windows(
             gen_ai_system=gen_ai_system,
             gen_ai_request_model=gen_ai_request_model,
             gen_ai_response_model=gen_ai_response_model,
-            limit=limit,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:
@@ -606,7 +619,7 @@ async def get_prompt_version_stats(
             end_time=end_time,
             service_name=service_name,
             gen_ai_system=gen_ai_system,
-            limit=limit,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:
@@ -643,7 +656,7 @@ async def get_llm_expensive_traces(
         backend = await _get_backend()
         result = await expensive_traces.get_expensive_traces(
             backend,
-            limit=limit,
+            limit=_clamp_limit(limit),
             start_time=start_time,
             end_time=end_time,
             min_tokens=min_tokens,
@@ -686,7 +699,7 @@ async def get_llm_slow_traces(
         backend = await _get_backend()
         result = await slow_traces.get_slow_traces(
             backend,
-            limit=limit,
+            limit=_clamp_limit(limit),
             start_time=start_time,
             end_time=end_time,
             min_duration_ms=min_duration_ms,
@@ -763,7 +776,7 @@ async def search_spans_tool(
             has_error=has_error,
             tags=tags,
             filters=filters,
-            limit=limit,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:
@@ -801,7 +814,7 @@ async def list_llm_tools_tool(
             end_time=end_time,
             service_name=service_name,
             gen_ai_system=gen_ai_system,
-            limit=limit,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:

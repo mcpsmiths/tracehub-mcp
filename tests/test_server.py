@@ -522,6 +522,50 @@ class TestToolErrorIsErrorFlag:
         assert result.is_error is False
 
 
+class TestClampLimit:
+    """_clamp_limit enforces --max-traces-per-query/MAX_TRACES_PER_QUERY as
+    a real server-wide ceiling. Found by a production-audit pass: the
+    field was parsed, validated, and stored in ServerConfig, but nothing
+    ever read it - every tool's own limit parameter was the only real cap."""
+
+    def test_requested_limit_below_ceiling_is_unchanged(self) -> None:
+        server._config = _config()
+        server._config.max_traces_per_query = 500
+
+        assert server._clamp_limit(100) == 100
+
+    def test_requested_limit_above_ceiling_is_capped(self) -> None:
+        server._config = _config()
+        server._config.max_traces_per_query = 50
+
+        assert server._clamp_limit(1000) == 50
+
+    def test_requested_limit_equal_to_ceiling_is_unchanged(self) -> None:
+        server._config = _config()
+        server._config.max_traces_per_query = 100
+
+        assert server._clamp_limit(100) == 100
+
+    def test_config_not_set_yet_returns_the_requested_limit_unclamped(self) -> None:
+        server._config = None
+
+        assert server._clamp_limit(999999) == 999999
+
+    async def test_search_traces_wrapper_clamps_before_calling_the_tool(self) -> None:
+        """End-to-end through the actual @mcp.tool() wrapper, not just the
+        helper in isolation - proves the wiring, not just the function."""
+        server._config = _config()
+        server._config.max_traces_per_query = 5
+        fake_backend = AsyncMock()
+        server._get_backend = AsyncMock(return_value=fake_backend)
+
+        with patch.object(server.search, "search_traces", AsyncMock(return_value="{}")) as mocked:
+            await server.search_traces(limit=1000)
+
+        _, kwargs = mocked.call_args
+        assert kwargs["limit"] == 5
+
+
 class TestApplyToolGating:
     """_apply_tool_gating wraps mcp.local_provider.remove_tool() for
     --enabled-tools/--disable-tools. Patches server.mcp wholesale (same
