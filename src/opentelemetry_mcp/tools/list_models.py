@@ -1,6 +1,5 @@
 """List LLM models tool implementation."""
 
-import asyncio
 import json
 from typing import Any
 
@@ -48,13 +47,12 @@ async def list_models(
         limit=limit,
     )
 
-    # Search traces
-    trace_summaries = await backend.search_traces(query)
-
-    # Fetch full traces concurrently (was: sequential N+1) to access LLM spans
-    traces = await asyncio.gather(
-        *(backend.get_trace(summary.trace_id) for summary in trace_summaries)
-    )
+    # search_traces already returns full traces with all spans - no need to
+    # re-fetch each one via get_trace() (see BaseBackend.search_traces's own
+    # docstring). A live Sentry account found that a redundant re-fetch here
+    # isn't just wasteful - Sentry's get_trace() endpoint lacks gen_ai.*
+    # attributes that search_traces's own hydration path already restores.
+    traces = await backend.search_traces(query)
 
     # Track models with their statistics
     models_data: dict[str, dict[str, Any]] = {}

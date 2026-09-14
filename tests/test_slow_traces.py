@@ -102,10 +102,6 @@ class TestHappyPath:
             "slow", [_llm_span(trace_id="slow")], duration_ms=9000.0, root_operation="slow-op"
         )
         backend.search_traces.return_value = [fast_trace, slow_trace]
-        backend.get_trace.side_effect = lambda trace_id: {
-            "fast": fast_trace,
-            "slow": slow_trace,
-        }[trace_id]
 
         result = json.loads(await get_slow_traces(backend))
 
@@ -124,7 +120,6 @@ class TestHappyPath:
         span2 = _llm_span(trace_id="t1", span_id="s2", total_tokens=50)
         trace = _trace("t1", [span1, span2])
         backend.search_traces.return_value = [trace]
-        backend.get_trace.return_value = trace
 
         result = json.loads(await get_slow_traces(backend))
 
@@ -138,7 +133,6 @@ class TestHappyPath:
         span_gpt_again = _llm_span(trace_id="t1", span_id="s3", request_model="gpt-4")
         trace = _trace("t1", [span_gpt, span_claude, span_gpt_again])
         backend.search_traces.return_value = [trace]
-        backend.get_trace.return_value = trace
 
         result = json.loads(await get_slow_traces(backend))
 
@@ -150,7 +144,6 @@ class TestHappyPath:
         span = _llm_span(request_model="gpt-4", response_model="gpt-4-0613")
         trace = _trace("t1", [span])
         backend.search_traces.return_value = [trace]
-        backend.get_trace.return_value = trace
 
         result = json.loads(await get_slow_traces(backend))
 
@@ -160,7 +153,6 @@ class TestHappyPath:
         backend = _mock_backend()
         trace = _trace("t1", [_llm_span()], duration_ms=1234.5678)
         backend.search_traces.return_value = [trace]
-        backend.get_trace.return_value = trace
 
         result = json.loads(await get_slow_traces(backend))
 
@@ -269,15 +261,6 @@ class TestBackendExceptionHandling:
         with pytest.raises(RuntimeError, match="backend down"):
             await get_slow_traces(backend)
 
-    async def test_get_trace_exception_propagates(self) -> None:
-        backend = _mock_backend()
-        trace = _trace("t1", [_llm_span()])
-        backend.search_traces.return_value = [trace]
-        backend.get_trace.side_effect = ConnectionError("trace lookup failed")
-
-        with pytest.raises(ConnectionError, match="trace lookup failed"):
-            await get_slow_traces(backend)
-
 
 class TestEdgeCases:
     """Branches specific to this module's own filtering and sorting logic."""
@@ -295,10 +278,6 @@ class TestEdgeCases:
         trace_with_llm = _trace("t1", [_llm_span(trace_id="t1")], duration_ms=5000.0)
         trace_without_llm = _trace("t2", [_non_llm_span(trace_id="t2")], duration_ms=9999.0)
         backend.search_traces.return_value = [trace_with_llm, trace_without_llm]
-        backend.get_trace.side_effect = lambda trace_id: {
-            "t1": trace_with_llm,
-            "t2": trace_without_llm,
-        }[trace_id]
 
         result = json.loads(await get_slow_traces(backend))
 
@@ -313,7 +292,6 @@ class TestEdgeCases:
         span = _llm_span(total_tokens=None)
         trace = _trace("t1", [span])
         backend.search_traces.return_value = [trace]
-        backend.get_trace.return_value = trace
 
         result = json.loads(await get_slow_traces(backend))
 
@@ -327,9 +305,6 @@ class TestEdgeCases:
             for i in range(1, 4)
         ]
         backend.search_traces.return_value = traces
-        backend.get_trace.side_effect = lambda trace_id: next(
-            t for t in traces if t.trace_id == trace_id
-        )
 
         result = json.loads(await get_slow_traces(backend, limit=2))
 
@@ -343,7 +318,6 @@ class TestEdgeCases:
         error_span = error_span.model_copy(update={"status": "ERROR"})
         trace = _trace("t1", [error_span], status="ERROR")
         backend.search_traces.return_value = [trace]
-        backend.get_trace.return_value = trace
 
         result = json.loads(await get_slow_traces(backend))
 

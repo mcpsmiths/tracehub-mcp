@@ -1,13 +1,12 @@
 """Tests for the list_models tool.
 
-The tool fans out over search_traces -> get_trace, extracts LLM span
-attributes, and aggregates per-model request counts / first-seen / last-seen
-timestamps. The backend is mocked at the BaseBackend interface level (not
-HTTP) since this module only ever talks to `backend.search_traces` and
-`backend.get_trace`.
+The tool calls search_traces (which already returns full traces with all
+spans, per BaseBackend's own contract) and aggregates per-model request
+counts / first-seen / last-seen timestamps from the LLM spans found. The
+backend is mocked at the BaseBackend interface level (not HTTP) since this
+module only ever talks to `backend.search_traces`.
 """
 
-import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -18,7 +17,7 @@ from pydantic import ValidationError
 
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
-from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery, TraceSummary
+from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery
 from opentelemetry_mcp.tools.list_models import list_models
 
 
@@ -84,8 +83,7 @@ class TestListModelsHappyPath:
     async def test_single_model_from_sample_trace_data(
         self, mock_backend: AsyncMock, sample_trace_data: TraceData
     ) -> None:
-        mock_backend.search_traces.return_value = [TraceSummary.from_trace(sample_trace_data)]
-        mock_backend.get_trace.return_value = sample_trace_data
+        mock_backend.search_traces.return_value = [sample_trace_data]
 
         result = await list_models(mock_backend)
         data = json.loads(result)
@@ -106,8 +104,7 @@ class TestListModelsHappyPath:
             response_model="gpt-4-0613",
         )
         trace = _make_trace("t1", [span])
-        mock_backend.search_traces.return_value = [TraceSummary.from_trace(trace)]
-        mock_backend.get_trace.return_value = trace
+        mock_backend.search_traces.return_value = [trace]
 
         result = await list_models(mock_backend)
         data = json.loads(result)
@@ -123,8 +120,7 @@ class TestListModelsHappyPath:
             response_model=None,
         )
         trace = _make_trace("t1", [span])
-        mock_backend.search_traces.return_value = [TraceSummary.from_trace(trace)]
-        mock_backend.get_trace.return_value = trace
+        mock_backend.search_traces.return_value = [trace]
 
         result = await list_models(mock_backend)
         data = json.loads(result)
@@ -138,8 +134,7 @@ class TestListModelsHappyPath:
             response_model=None,
         )
         trace = _make_trace("t1", [span])
-        mock_backend.search_traces.return_value = [TraceSummary.from_trace(trace)]
-        mock_backend.get_trace.return_value = trace
+        mock_backend.search_traces.return_value = [trace]
 
         result = await list_models(mock_backend)
         data = json.loads(result)
@@ -165,11 +160,7 @@ class TestListModelsHappyPath:
             ],
         )
 
-        mock_backend.search_traces.return_value = [
-            TraceSummary.from_trace(t) for t in (trace_a, trace_b, trace_c)
-        ]
-        traces_by_id = {"a": trace_a, "b": trace_b, "c": trace_c}
-        mock_backend.get_trace.side_effect = lambda trace_id: traces_by_id[trace_id]
+        mock_backend.search_traces.return_value = [trace_a, trace_b, trace_c]
 
         result = await list_models(mock_backend)
         data = json.loads(result)
@@ -195,8 +186,7 @@ class TestListModelsHappyPath:
             _make_span(span_id="s3", start_time=latest, request_model="gpt-4"),
         ]
         trace = _make_trace("t1", spans)
-        mock_backend.search_traces.return_value = [TraceSummary.from_trace(trace)]
-        mock_backend.get_trace.return_value = trace
+        mock_backend.search_traces.return_value = [trace]
 
         result = await list_models(mock_backend)
         data = json.loads(result)
@@ -205,45 +195,6 @@ class TestListModelsHappyPath:
         assert model["request_count"] == 3
         assert model["first_seen"] == earliest.isoformat()
         assert model["last_seen"] == latest.isoformat()
-
-
-class TestListModelsConcurrency:
-    """Regression test for the N+1 sequential-fetch bug: `get_trace` calls
-    must be issued concurrently (via asyncio.gather), not awaited one trace
-    at a time. Under the old sequential-loop implementation this test's
-    max_in_flight would be 1; the fixed implementation fetches all traces
-    concurrently, so it must be equal to the number of traces."""
-
-    async def test_get_trace_calls_are_concurrent_not_sequential(
-        self, mock_backend: AsyncMock
-    ) -> None:
-        t0 = datetime(2024, 1, 1, tzinfo=UTC)
-        traces = [
-            _make_trace(
-                f"t{i}",
-                [_make_span(trace_id=f"t{i}", start_time=t0, request_model="gpt-4")],
-            )
-            for i in range(3)
-        ]
-        mock_backend.search_traces.return_value = [TraceSummary.from_trace(t) for t in traces]
-        traces_by_id = {t.trace_id: t for t in traces}
-
-        in_flight = 0
-        max_in_flight = 0
-
-        async def _get_trace(trace_id: str) -> TraceData:
-            nonlocal in_flight, max_in_flight
-            in_flight += 1
-            max_in_flight = max(max_in_flight, in_flight)
-            await asyncio.sleep(0.01)
-            in_flight -= 1
-            return traces_by_id[trace_id]
-
-        mock_backend.get_trace.side_effect = _get_trace
-
-        await list_models(mock_backend)
-
-        assert max_in_flight == len(traces)
 
 
 class TestListModelsQueryConstruction:
@@ -306,15 +257,6 @@ class TestListModelsBackendExceptionHandling:
         with pytest.raises(RuntimeError, match="backend unreachable"):
             await list_models(mock_backend)
 
-    async def test_get_trace_exception_propagates(self, mock_backend: AsyncMock) -> None:
-        span = _make_span(start_time=datetime(2024, 1, 1, tzinfo=UTC), request_model="gpt-4")
-        trace = _make_trace("t1", [span])
-        mock_backend.search_traces.return_value = [TraceSummary.from_trace(trace)]
-        mock_backend.get_trace.side_effect = RuntimeError("trace fetch failed")
-
-        with pytest.raises(RuntimeError, match="trace fetch failed"):
-            await list_models(mock_backend)
-
 
 class TestListModelsEdgeCases:
     async def test_no_traces_returns_empty_models_list(self, mock_backend: AsyncMock) -> None:
@@ -324,7 +266,6 @@ class TestListModelsEdgeCases:
         data = json.loads(result)
 
         assert data == {"count": 0, "models": []}
-        mock_backend.get_trace.assert_not_called()
 
     async def test_trace_with_no_llm_spans_produces_no_models(
         self, mock_backend: AsyncMock
@@ -341,8 +282,7 @@ class TestListModelsEdgeCases:
             attributes=SpanAttributes.model_validate({}),
         )
         trace = _make_trace("t1", [non_llm_span])
-        mock_backend.search_traces.return_value = [TraceSummary.from_trace(trace)]
-        mock_backend.get_trace.return_value = trace
+        mock_backend.search_traces.return_value = [trace]
 
         result = await list_models(mock_backend)
         data = json.loads(result)

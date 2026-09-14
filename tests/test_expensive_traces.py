@@ -87,15 +87,10 @@ def _mock_backend() -> AsyncMock:
 
 
 def _wire_backend(backend: AsyncMock, traces: list[TraceData]) -> None:
-    """Wire search_traces to return the given traces (as summaries would)
-    and get_trace to return the matching full trace by trace_id - mirroring
-    the two-step real flow the tool depends on."""
+    """Wire search_traces to return the given full traces - its documented
+    contract (see BaseBackend.search_traces) is traces with all spans
+    already attached, so no separate get_trace mocking is needed."""
     backend.search_traces.return_value = traces
-
-    async def _get_trace(trace_id: str) -> TraceData:
-        return next(t for t in traces if t.trace_id == trace_id)
-
-    backend.get_trace.side_effect = _get_trace
 
 
 class TestHappyPath:
@@ -347,15 +342,6 @@ class TestBackendExceptionHandling:
         backend.search_traces.side_effect = RuntimeError("backend down")
 
         with pytest.raises(RuntimeError, match="backend down"):
-            await get_expensive_traces(backend)
-
-    async def test_get_trace_exception_propagates(self) -> None:
-        backend = _mock_backend()
-        trace = _trace("t1", [_llm_span(trace_id="t1", span_id="s1")])
-        backend.search_traces.return_value = [trace]
-        backend.get_trace.side_effect = RuntimeError("trace lookup failed")
-
-        with pytest.raises(RuntimeError, match="trace lookup failed"):
             await get_expensive_traces(backend)
 
 

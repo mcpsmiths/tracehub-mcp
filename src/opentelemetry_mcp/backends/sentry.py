@@ -286,6 +286,14 @@ class SentryBackend(BaseBackend):
         trace-level filter must hold for the whole reconstructed trace, not
         just the one span that matched the initial search).
 
+        A live account confirmed ``get_trace()``'s own endpoint carries no
+        gen_ai.*/OTel custom attributes and no reliable status signal for
+        OTLP-ingested spans, unlike this search. Requesting the full
+        ``_SPAN_SEARCH_FIELDS`` here (not just ``trace``) and overlaying
+        those richer per-span rows onto the hydrated result closes that gap
+        for every span the search actually matched - see
+        ``_enrich_trace_with_search_rows``.
+
         Args:
             query: Trace query parameters
 
@@ -302,15 +310,21 @@ class SentryBackend(BaseBackend):
         sentry_query = self._build_sentry_query(native_filters)
         start, end = self._time_range(query.start_time, query.end_time)
 
-        rows = await self._search_events_raw(sentry_query, ["trace"], start, end, query.limit * 5)
+        rows = await self._search_events_raw(
+            sentry_query, list(_SPAN_SEARCH_FIELDS), start, end, query.limit * 5
+        )
 
+        rows_by_trace: dict[str, list[dict[str, Any]]] = {}
         trace_ids: list[str] = []
-        seen: set[str] = set()
         for row in rows:
             trace_id = row.get("trace")
-            if trace_id and trace_id not in seen:
-                seen.add(trace_id)
-                trace_ids.append(str(trace_id))
+            if not trace_id:
+                continue
+            trace_id = str(trace_id)
+            if trace_id not in rows_by_trace:
+                rows_by_trace[trace_id] = []
+                trace_ids.append(trace_id)
+            rows_by_trace[trace_id].append(row)
 
         max_to_fetch = min(len(trace_ids), _MAX_TRACES_TO_HYDRATE)
         if len(trace_ids) > max_to_fetch:
@@ -322,14 +336,57 @@ class SentryBackend(BaseBackend):
         traces: list[TraceData] = []
         for trace_id in trace_ids[:max_to_fetch]:
             try:
-                traces.append(await self.get_trace(trace_id))
+                hydrated = await self.get_trace(trace_id)
             except Exception as e:
                 logger.warning(f"Failed to fetch trace {trace_id}: {e}")
+                continue
+            traces.append(self._enrich_trace_with_search_rows(hydrated, rows_by_trace[trace_id]))
 
         if all_filters:
             traces = FilterEngine.apply_filters(traces, all_filters)
 
         return traces[: query.limit]
+
+    def _enrich_trace_with_search_rows(
+        self, trace: TraceData, rows: list[dict[str, Any]]
+    ) -> TraceData:
+        """Overlay richer per-span attributes/status from the original span
+        search onto a ``get_trace()``-hydrated trace.
+
+        ``get_trace()`` stays the source of truth for topology (parent/child
+        structure, timing) since it can return spans the initial search
+        never matched at all. Only attributes and status are overlaid, and
+        only for spans a search row actually matched by span_id - see
+        ``search_traces``'s docstring for why this is needed.
+
+        Args:
+            trace: The trace as parsed by get_trace()
+            rows: This trace's raw rows from the original span search
+
+        Returns:
+            A new TraceData with enriched spans where a match was found
+        """
+        parsed_by_span_id: dict[str, SpanData] = {}
+        for row in rows:
+            parsed = self._parse_sentry_row(row)
+            if parsed is not None:
+                parsed_by_span_id[parsed.span_id] = parsed
+
+        if not parsed_by_span_id:
+            return trace
+
+        enriched_spans = [
+            span.model_copy(
+                update={
+                    "attributes": parsed_by_span_id[span.span_id].attributes,
+                    "status": parsed_by_span_id[span.span_id].status,
+                }
+            )
+            if span.span_id in parsed_by_span_id
+            else span
+            for span in trace.spans
+        ]
+        return self._group_into_trace(trace.trace_id, enriched_spans)
 
     async def search_spans(self, query: SpanQuery) -> list[SpanData]:
         """Search for individual spans matching the query.

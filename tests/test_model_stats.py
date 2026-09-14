@@ -2,7 +2,9 @@
 
 Backend is mocked with AsyncMock(spec=BaseBackend) - no HTTP involved. Tests
 exercise the real transform/aggregation logic in ``get_model_stats`` and the
-``calculate_percentiles`` helper.
+``calculate_percentiles`` helper. search_traces already returns full traces
+with all spans (per BaseBackend's own contract), so mocking it alone is
+enough - no separate get_trace mocking is needed.
 """
 
 import json
@@ -14,7 +16,7 @@ import pytest
 
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
-from opentelemetry_mcp.models import SpanData, TraceData, TraceSummary
+from opentelemetry_mcp.models import SpanData, TraceData
 from opentelemetry_mcp.tools.model_stats import calculate_percentiles, get_model_stats
 
 
@@ -50,10 +52,6 @@ def _trace(trace_id: str, spans: list[SpanData], status: str = "OK") -> TraceDat
         root_operation=spans[0].operation_name,
         status=status,  # type: ignore[arg-type]
     )
-
-
-def _summary_for(trace: TraceData) -> TraceSummary:
-    return TraceSummary.from_trace(trace)
 
 
 class TestCalculatePercentiles:
@@ -136,8 +134,7 @@ class TestGetModelStatsHappyPath:
             status="ERROR",
         )
 
-        backend.search_traces.return_value = [_summary_for(trace1), _summary_for(trace2)]
-        backend.get_trace.side_effect = lambda trace_id: {"t1": trace1, "t2": trace2}[trace_id]
+        backend.search_traces.return_value = [trace1, trace2]
 
         raw = await get_model_stats(backend, model_name="gpt-4")
         result = json.loads(raw)
@@ -172,8 +169,7 @@ class TestGetModelStatsHappyPath:
                 )
             ],
         )
-        backend.search_traces.return_value = [_summary_for(trace)]
-        backend.get_trace.return_value = trace
+        backend.search_traces.return_value = [trace]
 
         raw = await get_model_stats(backend, model_name="claude-3-opus")
         result = json.loads(raw)
@@ -244,15 +240,6 @@ class TestGetModelStatsBackendExceptionHandling:
         with pytest.raises(RuntimeError, match="backend unreachable"):
             await get_model_stats(backend, model_name="gpt-4")
 
-    async def test_get_trace_exception_propagates(self) -> None:
-        backend = AsyncMock(spec=BaseBackend)
-        trace = _trace("t1", [_span("t1", "s1", model_attrs={"gen_ai.system": "openai"})])
-        backend.search_traces.return_value = [_summary_for(trace)]
-        backend.get_trace.side_effect = RuntimeError("trace fetch failed")
-
-        with pytest.raises(RuntimeError, match="trace fetch failed"):
-            await get_model_stats(backend, model_name="gpt-4")
-
 
 class TestGetModelStatsEdgeCases:
     """Test branches this module's own logic actually takes."""
@@ -267,7 +254,6 @@ class TestGetModelStatsEdgeCases:
         assert "error" in result
         assert "gpt-4" in result["error"]
         assert "No traces found" in result["error"]
-        backend.get_trace.assert_not_called()
 
     async def test_no_span_matches_requested_model_returns_no_traces_found(self) -> None:
         """Traces exist, but none contain a span for the requested model -
@@ -286,8 +272,7 @@ class TestGetModelStatsEdgeCases:
                 )
             ],
         )
-        backend.search_traces.return_value = [_summary_for(trace)]
-        backend.get_trace.return_value = trace
+        backend.search_traces.return_value = [trace]
 
         raw = await get_model_stats(backend, model_name="gpt-4")
         result = json.loads(raw)
@@ -306,8 +291,7 @@ class TestGetModelStatsEdgeCases:
             model_attrs={"gen_ai.system": "openai", "gen_ai.response.model": "gpt-4"},
         )
         trace = _trace("t1", [plain_span, llm_span])
-        backend.search_traces.return_value = [_summary_for(trace)]
-        backend.get_trace.return_value = trace
+        backend.search_traces.return_value = [trace]
 
         raw = await get_model_stats(backend, model_name="gpt-4")
         result = json.loads(raw)
@@ -328,8 +312,7 @@ class TestGetModelStatsEdgeCases:
                 )
             ],
         )
-        backend.search_traces.return_value = [_summary_for(trace)]
-        backend.get_trace.return_value = trace
+        backend.search_traces.return_value = [trace]
 
         raw = await get_model_stats(backend, model_name="gpt-4")
         result = json.loads(raw)
@@ -357,8 +340,7 @@ class TestGetModelStatsEdgeCases:
                 )
             ],
         )
-        backend.search_traces.return_value = [_summary_for(trace)]
-        backend.get_trace.return_value = trace
+        backend.search_traces.return_value = [trace]
 
         raw = await get_model_stats(backend, model_name="gpt-4")
         result = json.loads(raw)
@@ -381,8 +363,7 @@ class TestGetModelStatsEdgeCases:
                 )
             ],
         )
-        backend.search_traces.return_value = [_summary_for(trace)]
-        backend.get_trace.return_value = trace
+        backend.search_traces.return_value = [trace]
 
         raw = await get_model_stats(backend, model_name="gpt-4")
         result = json.loads(raw)
@@ -406,8 +387,7 @@ class TestGetModelStatsEdgeCases:
             duration_ms=999.0,
         )
         trace = _trace("t1", [gpt4_span, other_span])
-        backend.search_traces.return_value = [_summary_for(trace)]
-        backend.get_trace.return_value = trace
+        backend.search_traces.return_value = [trace]
 
         raw = await get_model_stats(backend, model_name="gpt-4")
         result = json.loads(raw)
