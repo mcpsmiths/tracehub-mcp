@@ -1012,19 +1012,17 @@ class SentryBackend(BaseBackend):
             if not span_id:
                 return None
 
-            item_trace_id = item.get("trace_id") or item.get("trace")
-            if not item_trace_id:
-                # Never fabricate a trace_id by substituting the requested
-                # one: get_trace()'s belt-and-suspenders check
-                # (`span.trace_id == trace_id`) exists specifically to catch
-                # items that don't actually belong to the requested trace,
-                # and a fabricated value would make that check a no-op.
-                logger.warning(
-                    f"Rejecting Sentry trace item {span_id} for trace "
-                    f"{requested_trace_id}: missing its own trace id"
-                )
-                return None
-            trace_id = str(item_trace_id)
+            # A live account confirmed this endpoint's response items never
+            # carry their own trace_id/trace field - GET /trace/{id}/ is
+            # already scoped to one trace by the URL path itself, so Sentry
+            # doesn't repeat it per item. Trusting requested_trace_id here
+            # is not a fabrication: it's the only trace this response could
+            # possibly contain. get_trace()'s own belt-and-suspenders check
+            # (`span.trace_id == trace_id`) becomes a no-op as a result, but
+            # is left in place rather than removed, in case some other
+            # Sentry deployment's response shape ever does include a
+            # differing value.
+            trace_id = str(item.get("trace_id") or item.get("trace") or requested_trace_id)
 
             parent_span_id = item.get("parent_span_id") or item.get("parentSpanId")
             operation = item.get("op") or item.get("transaction") or item.get("description")

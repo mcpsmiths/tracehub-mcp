@@ -572,11 +572,15 @@ class TestParseSentryTraceItem:
         assert span.span_id == "s1"
         assert span.duration_ms == pytest.approx(100.0)
 
-    def test_parse_item_missing_trace_id_returns_none(self) -> None:
-        """An item with no trace id field at all is rejected rather than
-        fabricated by substituting the caller-supplied requested_trace_id -
-        doing so would make get_trace()'s `span.trace_id == trace_id`
-        belt-and-suspenders check a tautology instead of a real check."""
+    def test_parse_item_missing_trace_id_falls_back_to_requested_trace_id(self) -> None:
+        """Regression test for a real bug found via a live Sentry account:
+        GET /trace/{id}/ response items never carry their own trace_id/trace
+        field - the endpoint is already scoped to one trace by the URL path,
+        so Sentry doesn't repeat it per item. The old code treated the
+        absence of that field as a rejection signal and discarded every
+        single item unconditionally, so get_trace() (and everything built
+        on it - search_traces, list_models, find_errors, ...) always failed
+        with "no spans found" against any real account."""
         backend = _backend()
         item = {
             "span_id": "s1",
@@ -586,7 +590,8 @@ class TestParseSentryTraceItem:
             "duration": 25.0,
         }
         span = backend._parse_sentry_trace_item(item, "requested-trace")
-        assert span is None
+        assert span is not None
+        assert span.trace_id == "requested-trace"
 
     def test_parse_item_missing_span_id_returns_none(self) -> None:
         backend = _backend()
