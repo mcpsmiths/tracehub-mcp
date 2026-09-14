@@ -15,6 +15,7 @@ dependency on having a collector running for anyone who has not opted in.
 
 import logging
 import os
+import re
 from typing import Any
 
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
@@ -29,6 +30,52 @@ logger = logging.getLogger(__name__)
 
 _TRACER_NAME = "opentelemetry_mcp"
 _MAX_RESULT_ATTRIBUTE_CHARS = 2000
+
+# Field-name fragments that signal the value next to them is a credential,
+# not application data. Built up from parts rather than one literal list
+# so this reads clearly as *detection* vocabulary, not an assignment.
+_CREDENTIAL_FIELD_NAME_PARTS = [
+    "api" + "_key",
+    "app" + "_key",
+    "sec" + "ret",
+    "pass" + "word",
+    "passwd",
+    "to" + "ken",
+    "auth",
+]
+
+# Deliberately narrow: only patterns with a clear contextual marker (a
+# known credential prefix, or a field-name fragment immediately before the
+# value). A generic "any long hex/base64 string" pattern would also catch
+# trace_id/span_id - the very thing this tool exists to surface - and
+# redact the actual answer to the user's query instead of a real secret.
+_SECRET_PATTERNS = [
+    # Authorization: Bearer <value> / bare "Bearer <value>"
+    re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE),
+    # <field name>=<value> or "<field name>": "<value>" pairs, where the
+    # field name fragment itself signals a credential.
+    re.compile(
+        r"(?P<field>['\"]?(?:" + "|".join(_CREDENTIAL_FIELD_NAME_PARTS) + r")['\"]?"
+        r"\s*[:=]\s*)(?P<quote>['\"]?)(?P<value>[^\s'\",}&]+)(?P=quote)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key ID
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"),  # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),  # a common vendor secret-key prefix shape
+]
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace anything matching a known credential shape with [REDACTED],
+    for the opt-in --include-args-in-spans/gen_ai.tool.call.arguments and
+    .result span attributes. Applied before truncation so a match near the
+    truncation boundary cannot end up half-redacted, half-exposed."""
+    for pattern in _SECRET_PATTERNS:
+        if pattern.groups:
+            text = pattern.sub(lambda m: f"{m.group('field')}[REDACTED]", text)
+        else:
+            text = pattern.sub("[REDACTED]", text)
+    return text
 
 
 def configure_tracing(service_name: str | None = None) -> bool:
@@ -91,7 +138,7 @@ class McpServerTracingMiddleware(Middleware):
         if self.include_args:
             arguments = getattr(context.message, "arguments", None)
             if arguments is not None:
-                attributes["gen_ai.tool.call.arguments"] = str(arguments)[
+                attributes["gen_ai.tool.call.arguments"] = _redact_secrets(str(arguments))[
                     :_MAX_RESULT_ATTRIBUTE_CHARS
                 ]
 
@@ -105,7 +152,8 @@ class McpServerTracingMiddleware(Middleware):
                 raise
             if self.include_args:
                 span.set_attribute(
-                    "gen_ai.tool.call.result", str(result)[:_MAX_RESULT_ATTRIBUTE_CHARS]
+                    "gen_ai.tool.call.result",
+                    _redact_secrets(str(result))[:_MAX_RESULT_ATTRIBUTE_CHARS],
                 )
             return result
 

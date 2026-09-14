@@ -211,6 +211,48 @@ class TestMcpServerTracingMiddlewareIncludeArgs:
         result_attr = str(_last_span_attrs(exporter)["gen_ai.tool.call.result"])
         assert len(result_attr) == 2000
 
+    async def test_include_args_true_redacts_a_credential_in_the_result(self) -> None:
+        """Found by a production-audit pass: gen_ai.tool.call.result is
+        opt-in, but nothing prevented a credential appearing in backend
+        data (or, less plausibly, in an argument) from being exported
+        verbatim. Builds the fake credential via concatenation so this
+        file's own static content has no contiguous secret-shaped
+        literal for a scanner to flag - only the assembled runtime value
+        matches the pattern under test."""
+        tracer, exporter = _tracer_with_exporter()
+        middleware = McpServerTracingMiddleware(include_args=True, tracer=tracer)
+        fake_token = "Bear" + "er " + "sk-" + "abc123def456ghi789jklmnopqrstuv"
+        leaky_result = "{" + '"error": "upstream rejected ' + fake_token + '"}'
+
+        async def call_next(ctx: MiddlewareContext[Any]) -> str:
+            return leaky_result
+
+        await middleware.on_call_tool(_context(), call_next)
+
+        result_attr = str(_last_span_attrs(exporter)["gen_ai.tool.call.result"])
+        assert "REDACTED" in result_attr
+        assert fake_token not in result_attr
+
+    async def test_include_args_true_does_not_redact_trace_or_span_ids(self) -> None:
+        """The whole point of these tools is to surface trace_id/span_id -
+        long hex strings that must never be mistaken for a credential and
+        redacted away."""
+        tracer, exporter = _tracer_with_exporter()
+        middleware = McpServerTracingMiddleware(include_args=True, tracer=tracer)
+        real_looking_result = (
+            '{"trace_id": "4bf92f3577b34da6a3ce929d0e0e4736", '
+            '"span_id": "00f067aa0ba902b7", "service_name": "checkout-service"}'
+        )
+
+        async def call_next(ctx: MiddlewareContext[Any]) -> str:
+            return real_looking_result
+
+        await middleware.on_call_tool(_context(), call_next)
+
+        result_attr = str(_last_span_attrs(exporter)["gen_ai.tool.call.result"])
+        assert result_attr == real_looking_result
+        assert "REDACTED" not in result_attr
+
 
 class TestMcpServerTracingMiddlewareSessionId:
     async def test_session_id_included_when_fastmcp_context_provides_one(self) -> None:

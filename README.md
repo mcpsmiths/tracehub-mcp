@@ -177,7 +177,7 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 | `MAX_TRACES_PER_QUERY`   | integer | `500`    | Server-wide ceiling (1-1000, `--max-traces-per-query`) - caps every tool's `limit` argument before it reaches a backend query, regardless of what the calling agent requests |
 | `SLOW_REQUEST_THRESHOLD_MS` | float | unset  | Logs a WARNING for any backend request slower than this, independent of `LOG_LEVEL` (`--slow-request-threshold-ms`) |
 | `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` | string/int | `stdio`/`0.0.0.0`/`8000` | Env-var equivalents of `--transport`/`--host`/`--port` |
-| `MCP_INCLUDE_ARGS_IN_SPANS` | bool | `false` | Include tool call arguments/results as OTel span attributes when self-instrumentation is enabled below - off by default since they may contain sensitive data (`--include-args-in-spans`) |
+| `MCP_INCLUDE_ARGS_IN_SPANS` | bool | `false` | Include tool call arguments/results as OTel span attributes when self-instrumentation is enabled below - off by default since they may contain sensitive data. Known credential shapes (Bearer tokens, `api_key=`/`secret=`/`password=`-style fields, AWS/GitHub/common vendor key prefixes) are redacted before export, but this is a pattern match, not a guarantee - trace_id/span_id and other legitimate trace data are deliberately left untouched (`--include-args-in-spans`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | unset | Enables opt-in OTel self-instrumentation of tool calls when set; unset means zero overhead (no TracerProvider configured, no middleware registered) |
 | `OTEL_SERVICE_NAME`      | string  | `tracehub-mcp` | Service name reported in self-instrumentation spans                |
 
