@@ -153,6 +153,13 @@ _GEN_AI_FIELDS = (
     "gen_ai.usage.prompt_tokens",
     "gen_ai.usage.completion_tokens",
     "gen_ai.usage.total_tokens",
+    # Needed for list_sessions/get_session_stats (grouped by conversation.id)
+    # and get_prompt_version_stats (grouped by prompt.name+version) to see
+    # any results at all against this backend - without these, both tools
+    # silently returned empty regardless of what data Sentry actually held.
+    "gen_ai.conversation.id",
+    "gen_ai.prompt.name",
+    "gen_ai.prompt.version",
 )
 
 _SPAN_SEARCH_FIELDS = list(_SPAN_STRUCTURAL_FIELDS) + list(_GEN_AI_FIELDS)

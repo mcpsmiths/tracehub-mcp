@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from opentelemetry_mcp.backends.sentry import _MAX_SEARCH_PAGES, SentryBackend
+from opentelemetry_mcp.backends.sentry import _MAX_SEARCH_PAGES, _SPAN_SEARCH_FIELDS, SentryBackend
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType
 
 FAKE_AUTH = "sentry-key1"
@@ -344,6 +344,15 @@ class TestFieldNameInjection:
         assert backend._filter_to_sentry_query(f) == "gen_ai.usage.total_tokens:100"
 
 
+def test_span_search_fields_requests_conversation_and_prompt_version_columns() -> None:
+    """The other half of the list_sessions/get_prompt_version_stats bug: a
+    span row can only carry gen_ai.conversation.id/prompt.name/prompt.version
+    if the search request actually asked the Events API for those columns."""
+    assert "gen_ai.conversation.id" in _SPAN_SEARCH_FIELDS
+    assert "gen_ai.prompt.name" in _SPAN_SEARCH_FIELDS
+    assert "gen_ai.prompt.version" in _SPAN_SEARCH_FIELDS
+
+
 class TestQueryEscaping:
     """Test that untrusted values can't inject additional query clauses."""
 
@@ -391,6 +400,37 @@ class TestParseSentryRow:
         assert span.status == "OK"
         assert span.attributes.gen_ai_system == "openai"
         assert span.attributes.gen_ai_request_model == "gpt-4"
+
+    def test_parse_root_span_carries_conversation_and_prompt_version_fields(self) -> None:
+        """Regression test: _GEN_AI_FIELDS previously omitted
+        gen_ai.conversation.id/prompt.name/prompt.version, so even a span
+        row that actually contained them would have them silently dropped
+        before this method ever saw them (never requested from the search
+        API in the first place) - list_sessions/get_session_stats/
+        get_prompt_version_stats always returned empty against Sentry
+        regardless of what data existed. This test proves the parse side:
+        once present in the row, they must reach SpanAttributes."""
+        backend = _backend()
+        row = {
+            "id": "span1",
+            "trace": "trace1",
+            "parent_span": None,
+            "span.op": "chat_completion",
+            "project": "my-llm-service",
+            "timestamp": "2023-01-02T09:42:36.320Z",
+            "span.duration": 100.0,
+            "span.status": "ok",
+            "gen_ai.conversation.id": "conv-123",
+            "gen_ai.prompt.name": "summarize",
+            "gen_ai.prompt.version": "2",
+        }
+
+        span = backend._parse_sentry_row(row)
+
+        assert span is not None
+        assert span.attributes.gen_ai_conversation_id == "conv-123"
+        assert span.attributes.gen_ai_prompt_name == "summarize"
+        assert span.attributes.gen_ai_prompt_version == "2"
 
     def test_parse_child_span_with_real_parent(self) -> None:
         backend = _backend()

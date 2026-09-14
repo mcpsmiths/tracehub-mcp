@@ -36,7 +36,7 @@ from typing import Any
 import httpx
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes, SpanEvent
-from opentelemetry_mcp.backends.base import BaseBackend
+from opentelemetry_mcp.backends.base import BaseBackend, _RetryingTransport
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
 from opentelemetry_mcp.constants import Fields
 from opentelemetry_mcp.models import (
@@ -132,7 +132,9 @@ class DatadogBackend(BaseBackend):
         DD-API-KEY/DD-APPLICATION-KEY are non-standard headers that httpx
         does not strip on cross-origin redirects (unlike Authorization/
         Cookie/Proxy-Authorization), so following a redirect to an
-        unexpected host would leak both credentials there.
+        unexpected host would leak both credentials there. Still uses the
+        shared _RetryingTransport (connect/timeout retry, slow-request
+        logging) - only follow_redirects differs from BaseBackend.client.
 
         Returns:
             Reusable AsyncClient instance with automatic connection pooling
@@ -143,6 +145,9 @@ class DatadogBackend(BaseBackend):
                 headers=self._create_headers(),
                 timeout=self.timeout,
                 follow_redirects=False,
+                transport=_RetryingTransport(
+                    slow_request_threshold_ms=self.slow_request_threshold_ms
+                ),
             )
         return self._client
 
@@ -612,6 +617,8 @@ class DatadogBackend(BaseBackend):
         elif operator == FilterOperator.NOT_EQUALS:
             if field == "status" and value == "ERROR":
                 return "-status:error"
+            if field == "status" and value == "OK":
+                return "-status:ok"
             v = value * scale if isinstance(value, int | float) else value
             return f"-{field}:{self._escape_dd_query_value(str(v))}"
 

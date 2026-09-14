@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from opentelemetry_mcp.backends.base import _RetryingTransport
 from opentelemetry_mcp.backends.datadog import _MAX_SEARCH_PAGES, DatadogBackend
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType
 
@@ -49,6 +50,16 @@ def test_datadog_client_disables_redirects() -> None:
         url="https://api.datadoghq.com", api_key=FAKE_API_KEY, app_key=FAKE_APP_KEY
     )
     assert backend.client.follow_redirects is False
+
+
+def test_datadog_client_still_uses_the_retrying_transport() -> None:
+    """Regression test: overriding client() to disable redirects previously
+    dropped the shared _RetryingTransport entirely (no connect/timeout retry,
+    no slow-request logging), unlike every other backend."""
+    backend = DatadogBackend(
+        url="https://api.datadoghq.com", api_key=FAKE_API_KEY, app_key=FAKE_APP_KEY
+    )
+    assert isinstance(backend.client._transport, _RetryingTransport)
 
 
 def test_datadog_backend_initialization() -> None:
@@ -128,6 +139,21 @@ class TestBuildDatadogQuery:
             value_type=FilterType.STRING,
         )
         assert backend._filter_to_dd_query(f) == "status:error"
+
+    def test_status_ok_not_equals(self) -> None:
+        """Regression test: the EQUALS branch has always special-cased
+        status=="OK" (-> "status:ok"), but the NOT_EQUALS branch was missing
+        the equivalent case, so status != "OK" fell through to the generic
+        field:value branch and produced the wrong query (-status:"OK"
+        instead of -status:ok - wrong case, and quoted instead of bare)."""
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.NOT_EQUALS,
+            value="OK",
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_dd_query(f) == "-status:ok"
 
     def test_duration_gte_converts_ms_to_ns(self) -> None:
         backend = _backend()
