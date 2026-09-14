@@ -214,6 +214,7 @@ __marimo__/
 
 # Internal planning notes (not part of the public product)
 HANDOFF.md
+scratch-pad/
 .gstack/
 mcpb/uv.lock
 mcpb/.venv/
