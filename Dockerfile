@@ -53,14 +53,17 @@ ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8000
 
 # Environment variables (can be overridden at runtime)
-# Note: BACKEND_API_KEY should be provided at runtime via:
+# Note: BACKEND_TYPE/BACKEND_URL are intentionally left unset here (not set
+# to "") so config.py's own os.getenv(key, default) fallback applies -
+# os.getenv only returns its default when the var is truly unset, not when
+# it is set to an empty string, so declaring them here with empty values
+# previously made every container crash on startup with "Invalid
+# BACKEND_TYPE: .". BACKEND_API_KEY should be provided at runtime via:
 #   - docker run -e BACKEND_API_KEY=secret
 #   - Docker Compose environment files
 #   - Kubernetes secrets
 #   - .env files mounted at runtime
-ENV BACKEND_TYPE="" \
-    BACKEND_URL="" \
-    BACKEND_TIMEOUT="30" \
+ENV BACKEND_TIMEOUT="30" \
     LOG_LEVEL="INFO" \
     MAX_TRACES_PER_QUERY="500"
 
