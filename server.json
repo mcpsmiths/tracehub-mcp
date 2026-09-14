@@ -99,6 +99,37 @@
           "isSecret": false,
           "format": "number",
           "default": "500"
+        },
+        {
+          "name": "SLOW_REQUEST_THRESHOLD_MS",
+          "description": "Logs a WARNING for any backend request slower than this, independent of LOG_LEVEL. Unset disables slow-request logging.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number"
+        },
+        {
+          "name": "OTEL_EXPORTER_OTLP_ENDPOINT",
+          "description": "Enables opt-in OTel self-instrumentation of tool calls when set. Unset means zero overhead - no TracerProvider is configured and no middleware is registered.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "OTEL_SERVICE_NAME",
+          "description": "Service name reported in self-instrumentation spans, only used when OTEL_EXPORTER_OTLP_ENDPOINT is set.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string",
+          "default": "tracehub-mcp"
+        },
+        {
+          "name": "MCP_INCLUDE_ARGS_IN_SPANS",
+          "description": "Include tool call arguments/results as OTel span attributes when self-instrumentation is enabled. Off by default since they may contain sensitive data.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string",
+          "choices": ["true", "false"],
+          "default": "false"
         }
       ]
     }

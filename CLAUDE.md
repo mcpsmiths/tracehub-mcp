@@ -9,11 +9,12 @@ tracehub-mcp is an MCP (Model Context Protocol) server that enables AI agents to
 **Key Features:**
 
 - Multi-backend support: Jaeger, Grafana Tempo, Traceloop, Datadog, and Sentry
-- 11 MCP tools: Core tools + LLM-oriented discovery and analysis tools
+- 15 MCP tools: Core tools + LLM-oriented discovery and analysis tools + session/prompt-version/time-window aggregation
 - Token usage tracking and aggregation across models/services
 - Finish reasons tracking for debugging truncated/filtered responses
 - Enhanced token calculation supporting all `gen_ai.usage.*` attributes
 - Dual transport modes: stdio (Claude Desktop) and HTTP/SSE (network access)
+- Opt-in OTel self-instrumentation of the server itself (see Configuration)
 
 ## Development Commands
 
@@ -101,6 +102,9 @@ Each MCP capability is implemented as a separate tool module in [opentelemetry_m
 - [tools/expensive_traces.py](opentelemetry_mcp/tools/expensive_traces.py) - Find highest token usage traces
 - [tools/slow_traces.py](opentelemetry_mcp/tools/slow_traces.py) - Find slowest LLM traces
 - [tools/list_llm_tools.py](opentelemetry_mcp/tools/list_llm_tools.py) - List LLM tools used (via traceloop.span.kind == tool)
+- [tools/sessions.py](opentelemetry_mcp/tools/sessions.py) - `list_sessions`/`get_session_stats`: group spans by `gen_ai.conversation.id`
+- [tools/compare.py](opentelemetry_mcp/tools/compare.py) - `compare_time_windows`: diff aggregated usage between two time ranges
+- [tools/prompt_versions.py](opentelemetry_mcp/tools/prompt_versions.py) - `get_prompt_version_stats`: group spans by `gen_ai.prompt.name`/`gen_ai.prompt.version`
 
 **Critical:** All tools MUST return JSON strings (not dicts). This is required by the MCP protocol.
 
@@ -130,8 +134,23 @@ return {"result": data}
 - `BACKEND_SENTRY_ORG` - Required for Sentry backend only: Organization slug
 - `BACKEND_SENTRY_PROJECT` - Optional for Sentry backend: Project slug to narrow queries
 - `BACKEND_TIMEOUT` - Optional: Request timeout (default: 30s)
+- `BACKEND_TEMPO_INSTANCE_ID` - Optional for Tempo backend: Grafana Cloud stack/instance ID (Basic Auth with `BACKEND_API_KEY` instead of Bearer auth)
 - `LOG_LEVEL` - Optional: Logging level (default: INFO)
-- `MAX_TRACES_PER_QUERY` - Optional: Result limit (default: 100)
+- `MAX_TRACES_PER_QUERY` - Optional: Result limit (default: 500, 1-1000)
+- `SLOW_REQUEST_THRESHOLD_MS` - Optional: Logs a WARNING for any backend request slower than this, independent of `LOG_LEVEL` (default: unset/disabled)
+- `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` - Optional: Env-var equivalents of `--transport`/`--host`/`--port` (see CLI flags below)
+- `MCP_INCLUDE_ARGS_IN_SPANS` - Optional: Env-var equivalent of `--include-args-in-spans` (default: `false`)
+- `OTEL_EXPORTER_OTLP_ENDPOINT` - Optional: Enables opt-in OTel self-instrumentation of tool calls when set (unset by default - no TracerProvider is configured and no middleware is registered, so there is zero overhead if you don't opt in)
+- `OTEL_SERVICE_NAME` - Optional: Service name reported in self-instrumentation spans (default: `tracehub-mcp`)
+
+**CLI Flags** (all mirror an env var above where noted; run `tracehub-mcp --help` for the full list):
+
+- `--log-level [DEBUG|INFO|WARNING|ERROR]` - Overrides `LOG_LEVEL`
+- `--max-traces-per-query <1-1000>` - Overrides `MAX_TRACES_PER_QUERY`
+- `--disable-tools <name1,name2,...>` - Removes the named tools from this server instance (applied after `--enabled-tools`)
+- `--enabled-tools <name1,name2,...>` - Allowlist: every tool not named here is removed from this server instance
+- `--slow-request-threshold-ms <float>` - Overrides `SLOW_REQUEST_THRESHOLD_MS`
+- `--include-args-in-spans` - Overrides `MCP_INCLUDE_ARGS_IN_SPANS`
 
 **Configuration Precedence:** CLI args > environment variables > defaults
 
@@ -294,6 +313,76 @@ Find slowest LLM traces by duration to identify latency bottlenecks.
 **Returns:** Top N traces sorted by duration with token counts and model info
 
 **Example:** "What are the slowest LLM calls in the last hour?"
+
+### `list_sessions` / `get_session_stats` - Conversation/Session Analysis
+
+Group spans by the `gen_ai.conversation.id` attribute - a real, cross-industry
+OTel semantic convention (Weave, LangWatch, Sentry, Google ADK, Azure SDK,
+OpenLit, Dynatrace) for session/conversation grouping.
+
+**Use Cases:**
+
+- Understand multi-turn conversation activity without correlating spans by hand
+- Track per-conversation token usage and cost
+- Drill into a single conversation's request/success/error breakdown
+
+**Parameters (`list_sessions`):**
+
+- `start_time`, `end_time` - Time range filter
+- `service_name` - Filter by service name
+- `gen_ai_system` - Filter by LLM provider
+- `limit` - Maximum spans to analyze (default: 1000)
+
+**Returns (`list_sessions`):** One row per conversation - `conversation_id`, `span_count`, `services`, `first_seen`/`last_seen`, `total_tokens` - sorted by span count descending.
+
+**Parameters (`get_session_stats`):** `conversation_id` (required), plus `start_time`, `end_time`, `service_name`, `limit`.
+
+**Returns (`get_session_stats`):** Span/service counts, LLM request/success/error counts and rates, duration and token percentiles, finish reasons - for every span sharing that conversation ID.
+
+**Example:** "What happened in conversation abc-123?"
+
+### `compare_time_windows` - Period-over-Period Comparison
+
+Runs the same usage aggregation for two time ranges and returns the delta -
+composition over `get_llm_usage`, not new aggregation logic.
+
+**Use Cases:**
+
+- "This week vs last week" or "before/after a deploy" comparisons
+- Spot a regression in request volume or token usage between two periods
+
+**Parameters:**
+
+- `range_a_start`/`range_a_end`, `range_b_start`/`range_b_end` - Time range filters (ISO 8601)
+- `service_name`, `gen_ai_system`, `gen_ai_request_model`, `gen_ai_response_model` - Filters (applied to both ranges)
+- `limit` - Maximum traces to analyze per range (default: 1000)
+
+**Returns:** `range_a` and `range_b` (each the full `get_llm_usage` shape) plus a `delta` with `change`/`percent_change` per metric (`percent_change` is `null`, not an error, when the range A value is 0).
+
+**Example:** "Compare this week's token usage to last week's"
+
+### `get_prompt_version_stats` - Prompt Version Performance
+
+Groups spans by `gen_ai.prompt.name` + `gen_ai.prompt.version`, mirroring
+Langfuse's shipped per-prompt Metrics tab. Real-world adoption of these two
+attributes is still thin (early-stage OTel GenAI semconv), so this tool may
+often return an empty list until more instrumentations populate them - that
+is expected, not a bug.
+
+**Use Cases:**
+
+- Compare latency/token cost across prompt versions before promoting one to production
+
+**Parameters:**
+
+- `start_time`, `end_time` - Time range filter
+- `service_name` - Filter by service name
+- `gen_ai_system` - Filter by LLM provider
+- `limit` - Maximum spans to analyze (default: 1000)
+
+**Returns:** One row per `(prompt_name, prompt_version)` pair with request count, time bounds, and duration/token percentiles, sorted by request count descending.
+
+**Example:** "How does prompt v2 compare to v1?"
 
 ## Enhanced Token Calculation
 

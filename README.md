@@ -173,10 +173,15 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 | `BACKEND_SENTRY_PROJECT` | string  | -        | Project slug (optional for Sentry, narrows queries to one project)   |
 | `BACKEND_ENVIRONMENTS`   | string  | `prd`    | Comma-separated environments (Traceloop only)                        |
 | `BACKEND_TIMEOUT`        | float   | `30`     | Request timeout in seconds                                           |
-| `LOG_LEVEL`              | string  | `INFO`   | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`                   |
-| `MAX_TRACES_PER_QUERY`   | integer | `500`    | Parsed and validated (1-1000) but not currently wired into any query — each tool's own `limit` parameter is the real per-call cap |
+| `LOG_LEVEL`              | string  | `INFO`   | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (`--log-level`)    |
+| `MAX_TRACES_PER_QUERY`   | integer | `500`    | Parsed and validated (1-1000, `--max-traces-per-query`) but not currently wired into any query — each tool's own `limit` parameter is the real per-call cap |
+| `SLOW_REQUEST_THRESHOLD_MS` | float | unset  | Logs a WARNING for any backend request slower than this, independent of `LOG_LEVEL` (`--slow-request-threshold-ms`) |
+| `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` | string/int | `stdio`/`0.0.0.0`/`8000` | Env-var equivalents of `--transport`/`--host`/`--port` |
+| `MCP_INCLUDE_ARGS_IN_SPANS` | bool | `false` | Include tool call arguments/results as OTel span attributes when self-instrumentation is enabled below - off by default since they may contain sensitive data (`--include-args-in-spans`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | unset | Enables opt-in OTel self-instrumentation of tool calls when set; unset means zero overhead (no TracerProvider configured, no middleware registered) |
+| `OTEL_SERVICE_NAME`      | string  | `tracehub-mcp` | Service name reported in self-instrumentation spans                |
 
-Every CLI flag has a matching env var (`--backend`/`BACKEND_TYPE`, `--url`/`BACKEND_URL`, `--api-key`/`BACKEND_API_KEY`, `--app-key`/`BACKEND_APP_KEY`, `--tempo-instance-id`/`BACKEND_TEMPO_INSTANCE_ID`, `--sentry-org`/`BACKEND_SENTRY_ORG`, `--sentry-project`/`BACKEND_SENTRY_PROJECT`, `--environments`/`BACKEND_ENVIRONMENTS`). Run `tracehub-mcp --help` for the full list.
+Every backend-related CLI flag has a matching env var (`--backend`/`BACKEND_TYPE`, `--url`/`BACKEND_URL`, `--api-key`/`BACKEND_API_KEY`, `--app-key`/`BACKEND_APP_KEY`, `--tempo-instance-id`/`BACKEND_TEMPO_INSTANCE_ID`, `--sentry-org`/`BACKEND_SENTRY_ORG`, `--sentry-project`/`BACKEND_SENTRY_PROJECT`, `--environments`/`BACKEND_ENVIRONMENTS`). `--disable-tools <name1,name2,...>` / `--enabled-tools <name1,name2,...>` (CLI-only, no env var) remove/allowlist tools for reduced-trust deployments - `--enabled-tools` is applied first, `--disable-tools` on top of whatever it kept. Run `tracehub-mcp --help` for the full list.
 
 ### Backend-Specific Setup
 
@@ -470,7 +475,7 @@ gemini "Analyze token usage for gpt-4 requests today"
 
 ## Tools Reference
 
-tracehub-mcp exposes **11 MCP tools**:
+tracehub-mcp exposes **15 MCP tools**:
 
 | Tool                       | Description                                       | Use Case                           |
 | --------------------------- | -------------------------------------------------- | ----------------------------------- |
@@ -485,6 +490,10 @@ tracehub-mcp exposes **11 MCP tools**:
 | `get_llm_expensive_traces` | Find highest token-usage traces                   | Cost optimization                  |
 | `get_llm_slow_traces`      | Find slowest traces by duration                   | Latency debugging                  |
 | `list_llm_tools_tool`      | Discover LLM tool/function calls (`traceloop.span.kind == tool`) | Track agent tool usage |
+| `list_sessions`            | Group spans by `gen_ai.conversation.id`           | Understand multi-turn conversation activity |
+| `get_session_stats`        | Detailed stats for one conversation ID            | Drill into a single conversation   |
+| `compare_time_windows`     | Diff aggregated usage between two time ranges     | "This week vs last week" comparisons |
+| `get_prompt_version_stats` | Group spans by `gen_ai.prompt.name`/`.version`    | Compare prompt versions before promoting one |
 
 ### Backend Support Matrix
 
@@ -556,7 +565,7 @@ Returns aggregated prompt/completion/total tokens, broken down by model and by s
 
 Returns error messages, error types, truncated stack traces, and LLM-specific error info.
 
-**`list_llm_models` / `get_llm_model_stats` / `get_llm_expensive_traces` / `get_llm_slow_traces` / `list_llm_tools_tool` / `search_spans_tool`** are documented in detail, with worked examples, in [CLAUDE.md](CLAUDE.md) — this README covers the shape every tool shares; CLAUDE.md is the fuller reference for exact parameters and response fields on the LLM-analysis tools.
+**`list_llm_models` / `get_llm_model_stats` / `get_llm_expensive_traces` / `get_llm_slow_traces` / `list_llm_tools_tool` / `search_spans_tool` / `list_sessions` / `get_session_stats` / `compare_time_windows` / `get_prompt_version_stats`** are documented in detail, with worked examples, in [CLAUDE.md](CLAUDE.md) — this README covers the shape every tool shares; CLAUDE.md is the fuller reference for exact parameters and response fields on the LLM-analysis tools.
 
 ---
 
