@@ -67,9 +67,11 @@ ENV BACKEND_TIMEOUT="30" \
     LOG_LEVEL="INFO" \
     MAX_TRACES_PER_QUERY="500"
 
-# Health check (optional - checks if the process is running)
+# Health check - see docker_healthcheck.py (already present, copied in via
+# COPY --from=builder /app /app above) for what "healthy" means here and
+# why stdio-transport deployments should disable this check.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)"
+    CMD ["python", "docker_healthcheck.py"]
 
 # Default command: Run server in HTTP transport mode
 # Override with docker run command or docker-compose for different configurations
