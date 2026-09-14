@@ -205,3 +205,30 @@ class TestSlowRequestLogging:
                 await client.get("/health")
 
         assert any("Slow backend request" in r.message for r in caplog.records)
+
+    async def test_query_string_is_stripped_from_the_logged_url(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Found by a production-audit pass: query strings can carry trace
+        IDs, filter values, or (for backends using query-param rather than
+        header auth) credentials - the log message must never include them."""
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0.05)
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), slow_request_threshold_ms=10.0
+        )
+
+        with caplog.at_level(logging.WARNING):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://backend.test"
+            ) as client:
+                await client.get("/search", params={"api_key": "super-secret-value"})
+
+        messages = [r.message for r in caplog.records if "Slow backend request" in r.message]
+        assert len(messages) == 1
+        assert "/search" in messages[0]
+        assert "super-secret-value" not in messages[0]
+        assert "api_key" not in messages[0]

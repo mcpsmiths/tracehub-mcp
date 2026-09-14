@@ -69,8 +69,13 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         if self._slow_request_threshold_ms is not None:
             duration_ms = (time.perf_counter() - start) * 1000
             if duration_ms > self._slow_request_threshold_ms:
+                # Query strings can carry trace IDs, filter values, or (for
+                # backends that use query-param rather than header auth)
+                # credentials - logging the path only is enough to identify
+                # which endpoint was slow without exposing that.
+                url_without_query = request.url.copy_with(query=None)
                 logger.warning(
-                    f"Slow backend request: {request.method} {request.url} took "
+                    f"Slow backend request: {request.method} {url_without_query} took "
                     f"{duration_ms:.0f}ms (threshold: {self._slow_request_threshold_ms:.0f}ms)"
                 )
         return response
