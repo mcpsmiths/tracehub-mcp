@@ -95,4 +95,28 @@ jobs:
       - name: Validate and publish server.json
         run: |
           ./mcp-publisher validate server.json
-          ./mcp-publisher publish
+
+          # The registry does its own server-side PyPI lookup at publish
+          # time, on a different network path than the wait-loop above -
+          # confirmed in production: that wait loop's own curl already saw
+          # the release, but the registry's own check still 404ed for
+          # ~30s longer ("PyPI package exists, but version was not found -
+          # a newly published release can take a moment to appear on
+          # PyPI. Wait and retry"). Retry only that specific, known-
+          # transient error; anything else (e.g. "cannot publish
+          # duplicate version") fails immediately rather than wasting time
+          # retrying a non-transient error identically.
+          for attempt in $(seq 1 5); do
+            if output="$(./mcp-publisher publish 2>&1)"; then
+              echo "$output"
+              exit 0
+            fi
+            echo "$output"
+            if ! printf '%s' "$output" | grep -q "was not found (status: 404)"; then
+              exit 1
+            fi
+            echo "Attempt ${attempt}/5: registry has not yet seen this PyPI release, waiting 30s..."
+            sleep 30
+          done
+          echo "::error::mcp-publisher publish still failing after 5 attempts"
+          exit 1
