@@ -260,6 +260,81 @@ class TestGetSessionStatsHappyPath:
         assert "error" in result
         assert "missing-conv" in result["error"]
 
+    async def test_zero_llm_spans_gives_null_rates_not_a_crash(self) -> None:
+        """Spans exist (span_count > 0) but none are LLM spans - dividing
+        by a zero llm_request_count must produce None, not raise
+        ZeroDivisionError."""
+        backend = _fake_backend()
+        backend.search_spans.return_value = [
+            _non_llm_span_with_conversation(span_id="s1"),
+            _non_llm_span_with_conversation(span_id="s2"),
+        ]
+
+        result = json.loads(await get_session_stats(backend, conversation_id="conv-1"))
+
+        assert result["span_count"] == 2
+        assert result["llm_request_count"] == 0
+        assert result["success_rate"] is None
+        assert result["error_rate"] is None
+
+    async def test_first_seen_and_last_seen_track_min_and_max_out_of_order(self) -> None:
+        """Spans intentionally out of chronological order (middle, then
+        earliest, then latest) to exercise the min-update branch, not just
+        the initial-value case."""
+        backend = _fake_backend()
+        earliest = datetime(2024, 1, 1, tzinfo=UTC)
+        middle = datetime(2024, 1, 5, tzinfo=UTC)
+        latest = datetime(2024, 1, 10, tzinfo=UTC)
+        backend.search_spans.return_value = [
+            _llm_span(span_id="s1", start_time=middle),
+            _llm_span(span_id="s2", start_time=earliest),
+            _llm_span(span_id="s3", start_time=latest),
+        ]
+
+        result = json.loads(await get_session_stats(backend, conversation_id="conv-1"))
+
+        assert result["first_seen"] == earliest.isoformat()
+        assert result["last_seen"] == latest.isoformat()
+
+    async def test_finish_reasons_are_counted_across_spans(self) -> None:
+        backend = _fake_backend()
+        backend.search_spans.return_value = [
+            _llm_span(
+                span_id="s1",
+                attributes=SpanAttributes.model_validate(
+                    {
+                        "gen_ai.system": "openai",
+                        "gen_ai.conversation.id": "conv-1",
+                        "gen_ai.response.finish_reasons": ["stop"],
+                    }
+                ),
+            ),
+            _llm_span(
+                span_id="s2",
+                attributes=SpanAttributes.model_validate(
+                    {
+                        "gen_ai.system": "openai",
+                        "gen_ai.conversation.id": "conv-1",
+                        "gen_ai.response.finish_reasons": ["stop"],
+                    }
+                ),
+            ),
+            _llm_span(
+                span_id="s3",
+                attributes=SpanAttributes.model_validate(
+                    {
+                        "gen_ai.system": "openai",
+                        "gen_ai.conversation.id": "conv-1",
+                        "gen_ai.response.finish_reasons": ["length"],
+                    }
+                ),
+            ),
+        ]
+
+        result = json.loads(await get_session_stats(backend, conversation_id="conv-1"))
+
+        assert result["finish_reasons"] == {"stop": 2, "length": 1}
+
 
 class TestGetSessionStatsQueryConstruction:
     async def test_forwards_conversation_id_equals_filter(self) -> None:
@@ -283,6 +358,13 @@ class TestGetSessionStatsValidation:
 
         with pytest.raises(ValueError, match="start_time"):
             await get_session_stats(backend, conversation_id="conv-1", start_time="bad")
+        backend.search_spans.assert_not_awaited()
+
+    async def test_invalid_end_time_raises(self) -> None:
+        backend = _fake_backend()
+
+        with pytest.raises(ValueError, match="end_time"):
+            await get_session_stats(backend, conversation_id="conv-1", end_time="bad")
         backend.search_spans.assert_not_awaited()
 
 
