@@ -174,7 +174,7 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 | `BACKEND_ENVIRONMENTS`   | string  | `prd`    | Comma-separated environments (Traceloop only)                        |
 | `BACKEND_TIMEOUT`        | float   | `30`     | Request timeout in seconds                                           |
 | `LOG_LEVEL`              | string  | `INFO`   | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (`--log-level`)    |
-| `MAX_TRACES_PER_QUERY`   | integer | `500`    | Parsed and validated (1-1000, `--max-traces-per-query`) but not currently wired into any query — each tool's own `limit` parameter is the real per-call cap |
+| `MAX_TRACES_PER_QUERY`   | integer | `500`    | Server-wide ceiling (1-1000, `--max-traces-per-query`) - caps every tool's `limit` argument before it reaches a backend query, regardless of what the calling agent requests |
 | `SLOW_REQUEST_THRESHOLD_MS` | float | unset  | Logs a WARNING for any backend request slower than this, independent of `LOG_LEVEL` (`--slow-request-threshold-ms`) |
 | `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` | string/int | `stdio`/`0.0.0.0`/`8000` | Env-var equivalents of `--transport`/`--host`/`--port` |
 | `MCP_INCLUDE_ARGS_IN_SPANS` | bool | `false` | Include tool call arguments/results as OTel span attributes when self-instrumentation is enabled below - off by default since they may contain sensitive data (`--include-args-in-spans`) |
