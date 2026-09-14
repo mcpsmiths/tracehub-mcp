@@ -65,7 +65,7 @@ jobs:
           for i in $(seq 1 40); do
             desc="$(curl -sf "https://pypi.org/pypi/tracehub-mcp/${NEW_VERSION}/json" \
               | jq -r '.info.description' 2>/dev/null || true)"
-            if printf '%s' "$desc" | grep -q "mcp-name: ${name}"; then
+            if printf '%s' "$desc" | grep -qF "mcp-name: ${name}"; then
               echo "Ownership marker present on PyPI ${NEW_VERSION}"
               exit 0
             fi
@@ -112,7 +112,7 @@ jobs:
               exit 0
             fi
             echo "$output"
-            if ! printf '%s' "$output" | grep -q "was not found (status: 404)"; then
+            if ! printf '%s' "$output" | grep -qF "was not found (status: 404)"; then
               exit 1
             fi
             echo "Attempt ${attempt}/5: registry has not yet seen this PyPI release, waiting 30s..."
