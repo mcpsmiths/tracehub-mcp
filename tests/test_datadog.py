@@ -339,7 +339,7 @@ class TestParseDatadogSpan:
                 "start_timestamp": "2023-01-02T09:42:36.320Z",
                 "end_timestamp": "2023-01-02T09:42:36.420Z",
                 "tags": ["env:prod", "team:A"],
-                "attributes": {
+                "custom": {
                     "gen_ai.system": "openai",
                     "gen_ai.request.model": "gpt-4",
                     "gen_ai.usage.total_tokens": 150,
@@ -394,7 +394,7 @@ class TestParseDatadogSpan:
                 "resource_name": "op",
                 "start_timestamp": "2023-01-02T09:42:36.320Z",
                 "end_timestamp": "2023-01-02T09:42:36.420Z",
-                "attributes": {"error": True, "error.message": "boom"},
+                "custom": {"error": True, "error.message": "boom"},
             },
         }
 
@@ -434,7 +434,7 @@ class TestParseDatadogSpan:
                 "resource_name": "op",
                 "start_timestamp": "2023-01-02T09:42:36.320Z",
                 "end_timestamp": "2023-01-02T09:42:36.420Z",
-                "attributes": {"gen_ai": {"system": "anthropic", "request": {"model": "claude"}}},
+                "custom": {"gen_ai": {"system": "anthropic", "request": {"model": "claude"}}},
             },
         }
 
@@ -443,6 +443,73 @@ class TestParseDatadogSpan:
         assert span is not None
         assert span.attributes.gen_ai_system == "anthropic"
         assert span.attributes.gen_ai_request_model == "claude"
+
+    def test_top_level_status_field_takes_precedence_over_heuristics(self) -> None:
+        """Regression test for a real bug found via a live Datadog account:
+        an OTLP-ingested span carries a first-class top-level status field
+        ("ok"/"error"), previously not checked at all - see module
+        docstring. Confirmed authoritative, so it must win even when no
+        custom-attribute/tag heuristic would otherwise fire."""
+        backend = _backend()
+        span_obj = {
+            "attributes": {
+                "trace_id": "t1",
+                "span_id": "s1",
+                "service": "svc",
+                "resource_name": "op",
+                "start_timestamp": "2023-01-02T09:42:36.320Z",
+                "end_timestamp": "2023-01-02T09:42:36.420Z",
+                "status": "error",
+            },
+        }
+
+        span = backend._parse_dd_span(span_obj)
+
+        assert span is not None
+        assert span.status == "ERROR"
+
+    def test_top_level_status_ok_is_respected(self) -> None:
+        backend = _backend()
+        span_obj = {
+            "attributes": {
+                "trace_id": "t1",
+                "span_id": "s1",
+                "service": "svc",
+                "resource_name": "op",
+                "start_timestamp": "2023-01-02T09:42:36.320Z",
+                "end_timestamp": "2023-01-02T09:42:36.420Z",
+                "status": "ok",
+            },
+        }
+
+        span = backend._parse_dd_span(span_obj)
+
+        assert span is not None
+        assert span.status == "OK"
+
+    def test_custom_attributes_are_nested_under_the_custom_key_not_attributes(self) -> None:
+        """Regression test for a real bug found via a live Datadog account:
+        the custom/OTel attributes object is keyed "custom" on the real API
+        response, not "attributes" nested inside itself - the old code
+        looked for the wrong key and silently got an empty dict every time,
+        so no gen_ai.* field was ever populated against a real account."""
+        backend = _backend()
+        span_obj = {
+            "attributes": {
+                "trace_id": "t1",
+                "span_id": "s1",
+                "service": "svc",
+                "resource_name": "op",
+                "start_timestamp": "2023-01-02T09:42:36.320Z",
+                "end_timestamp": "2023-01-02T09:42:36.420Z",
+                "custom": {"gen_ai.system": "openai"},
+            },
+        }
+
+        span = backend._parse_dd_span(span_obj)
+
+        assert span is not None
+        assert span.attributes.gen_ai_system == "openai"
 
 
 class TestGroupIntoTrace:
@@ -475,7 +542,7 @@ class TestGroupIntoTrace:
                     "resource_name": "child-op",
                     "start_timestamp": now.isoformat().replace("+00:00", "Z"),
                     "end_timestamp": now.isoformat().replace("+00:00", "Z"),
-                    "attributes": {"error": True},
+                    "custom": {"error": True},
                 }
             }
         )

@@ -7,25 +7,27 @@ uses Datadog's span search query syntax (the same syntax that powers the Logs
 Explorer - see https://docs.datadoghq.com/logs/explorer/search_syntax/),
 not TraceQL or Jaeger-style tag params.
 
-Schema note: this implementation is grounded in Datadog's published OpenAPI
-spec (SpansListRequest/SpansListResponse/SpansAttributes in
-https://github.com/DataDog/datadog-api-client-python/blob/master/.generator/schemas/v2/openapi.yaml)
-rather than guessed field names. Two things the spec does not pin down, and
-that could not be verified without a live Datadog account:
+Schema note: this implementation was originally grounded only in Datadog's
+published OpenAPI spec (SpansListRequest/SpansListResponse/SpansAttributes in
+https://github.com/DataDog/datadog-api-client-python/blob/master/.generator/schemas/v2/openapi.yaml),
+which left two things unpinned. Both are now confirmed against a real
+OTLP-ingested span from a live Datadog trial account (2026-09):
 
-1. Where OTel ``gen_ai.*``/error attributes land in the response - the
-   documented ``SpansAttributes`` has a generic ``attributes`` (custom
-   attributes) object and a ``tags`` array, but doesn't document exactly how
-   OTLP-ingested span attributes are split between the two. This
-   implementation checks both.
-2. There's no documented first-class ``status``/``error`` field on a span
-   resource. Error state is inferred from common signals (an ``error`` custom
-   attribute, an ``error:*``-prefixed tag, or standard ``error.type``/
-   ``error.message`` OTel attributes).
-
-Both are flagged again at the call sites below. Someone with a live Datadog
-account and real gen_ai-instrumented traces should verify against actual
-payloads before merge.
+1. OTel ``gen_ai.*``/semantic-convention attributes land under a
+   ``custom`` object on the span's ``attributes`` (not a field literally
+   named ``attributes`` nested inside itself, and not the ``tags`` array -
+   ``tags`` only ever carried Datadog-internal values like
+   ``ingestion_reason:probabilistic``/``source:apm`` in the confirmed
+   response). ``custom`` is a nested object (``{"gen_ai": {"conversation":
+   {"id": "..."}}}``), not flat dotted keys - ``_extract_semconv_attributes``
+   already flattens either shape, so no change was needed there once pointed
+   at the right key.
+2. There IS a first-class top-level ``status`` field (``"ok"``/``"error"``)
+   on the span resource for OTLP-ingested spans, contradicting the earlier
+   assumption that no such field exists. ``_infer_status`` checks it first,
+   ahead of the custom-attribute/tag heuristics kept as a fallback for
+   spans that might reach this backend via some other, non-OTLP ingestion
+   path where that field may not be populated the same way.
 """
 
 import logging
@@ -710,10 +712,10 @@ class DatadogBackend(BaseBackend):
                 )
                 return None
 
-            custom_attrs = attrs.get("attributes", {}) or {}
+            custom_attrs = attrs.get("custom", {}) or {}
             tags = attrs.get("tags", []) or []
 
-            status = self._infer_status(custom_attrs, tags)
+            status = self._infer_status(attrs, custom_attrs, tags)
             span_attributes = SpanAttributes(**self._extract_semconv_attributes(custom_attrs))
 
             events: list[SpanEvent] = []
@@ -751,23 +753,33 @@ class DatadogBackend(BaseBackend):
             logger.warning(f"Could not parse Datadog timestamp: {value}")
             return None
 
-    def _infer_status(self, custom_attrs: dict[str, Any], tags: list[str]) -> Any:
-        """Best-effort error/status inference.
+    def _infer_status(
+        self, attrs: dict[str, Any], custom_attrs: dict[str, Any], tags: list[str]
+    ) -> Any:
+        """Status inference, preferring the confirmed top-level status field.
 
-        Datadog's documented Span resource has no first-class status/error
-        field (see module docstring) - this checks the signals actually
-        documented elsewhere in Datadog's product (an `error` custom
-        attribute, an `error:*`-prefixed tag, or `error.type`/`error.message`
-        OTel attributes) and defaults to UNSET rather than guessing OK, since
-        an unrecognized shape should not silently read as a passing span.
+        A real OTLP-ingested span carries a top-level ``status`` field
+        (``"ok"``/``"error"``, see module docstring) - checked first, ahead
+        of the heuristics below, which remain as a fallback for spans that
+        might reach this backend via some other ingestion path where that
+        field isn't populated. Defaults to UNSET rather than guessing OK,
+        since an unrecognized shape should not silently read as a passing
+        span.
 
         Args:
+            attrs: The span's top-level attributes object
             custom_attrs: The span's custom/OTel attributes object
             tags: The span's tag list
 
         Returns:
             "ERROR", "OK", or "UNSET"
         """
+        top_level_status = attrs.get("status")
+        if isinstance(top_level_status, str):
+            if top_level_status.lower() == "error":
+                return "ERROR"
+            if top_level_status.lower() == "ok":
+                return "OK"
         if custom_attrs.get("error") in (True, "true", 1):
             return "ERROR"
         if any(k in custom_attrs for k in ("error.type", "error.message", "error.stack")):

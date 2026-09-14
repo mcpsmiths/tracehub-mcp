@@ -93,6 +93,7 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101", "S105", "S106", "S108", "S110"]
+"scripts/**/*.py" = ["S311"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["opentelemetry_mcp"]
