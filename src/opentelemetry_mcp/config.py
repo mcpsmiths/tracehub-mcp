@@ -97,6 +97,7 @@ class ServerConfig(BaseModel):
     backend: BackendConfig
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     max_traces_per_query: int = Field(default=500, ge=1, le=1000)
+    slow_request_threshold_ms: float | None = Field(default=None, gt=0)
 
     @classmethod
     def from_env(cls) -> "ServerConfig":
@@ -117,10 +118,23 @@ class ServerConfig(BaseModel):
             )
             max_traces_per_query = 500
 
+        # Parse slow_request_threshold_ms with validation (optional, unset by default)
+        slow_request_threshold_ms: float | None = None
+        slow_request_threshold_str = os.getenv("SLOW_REQUEST_THRESHOLD_MS")
+        if slow_request_threshold_str:
+            try:
+                slow_request_threshold_ms = float(slow_request_threshold_str)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Invalid SLOW_REQUEST_THRESHOLD_MS value "
+                    f"'{slow_request_threshold_str}': {e}. Slow-request logging disabled."
+                )
+
         return cls(
             backend=BackendConfig.from_env(),
             log_level=log_level,
             max_traces_per_query=max_traces_per_query,
+            slow_request_threshold_ms=slow_request_threshold_ms,
         )
 
     def apply_cli_overrides(
@@ -133,8 +147,34 @@ class ServerConfig(BaseModel):
         sentry_project: str | None = None,
         tempo_instance_id: str | None = None,
         environments: str | None = None,
+        log_level: str | None = None,
+        max_traces_per_query: int | None = None,
+        slow_request_threshold_ms: float | None = None,
     ) -> None:
         """Apply CLI argument overrides to configuration."""
+        if slow_request_threshold_ms is not None:
+            if slow_request_threshold_ms <= 0:
+                raise ValueError(
+                    f"Invalid slow_request_threshold_ms: {slow_request_threshold_ms}. "
+                    "Must be greater than 0"
+                )
+            self.slow_request_threshold_ms = slow_request_threshold_ms
+
+        if log_level:
+            log_level_upper = log_level.upper()
+            if log_level_upper not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+                raise ValueError(
+                    f"Invalid log level: {log_level}. Must be one of: DEBUG, INFO, WARNING, ERROR"
+                )
+            self.log_level = log_level_upper  # type: ignore[assignment]
+
+        if max_traces_per_query is not None:
+            if not (1 <= max_traces_per_query <= 1000):
+                raise ValueError(
+                    f"Invalid max_traces_per_query: {max_traces_per_query}. Must be between 1 and 1000"
+                )
+            self.max_traces_per_query = max_traces_per_query
+
         if backend_type:
             if backend_type not in ["jaeger", "tempo", "traceloop", "datadog", "sentry"]:
                 raise ValueError(

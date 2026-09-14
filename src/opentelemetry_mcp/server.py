@@ -91,17 +91,18 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
         ValueError: If backend type is unsupported
     """
     backend_config = config.backend
+    backend: BaseBackend
 
     if backend_config.type == "jaeger":
         logger.info(f"Initializing Jaeger backend: {backend_config.url}")
-        return JaegerBackend(
+        backend = JaegerBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             timeout=backend_config.timeout,
         )
     elif backend_config.type == "tempo":
         logger.info(f"Initializing Tempo backend: {backend_config.url}")
-        return TempoBackend(
+        backend = TempoBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             timeout=backend_config.timeout,
@@ -109,7 +110,7 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
         )
     elif backend_config.type == "traceloop":
         logger.info(f"Initializing Traceloop backend: {backend_config.url}")
-        return TraceloopBackend(
+        backend = TraceloopBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             timeout=backend_config.timeout,
@@ -117,7 +118,7 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
         )
     elif backend_config.type == "datadog":
         logger.info(f"Initializing Datadog backend: {backend_config.url}")
-        return DatadogBackend(
+        backend = DatadogBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             app_key=backend_config.app_key,
@@ -125,7 +126,7 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
         )
     elif backend_config.type == "sentry":
         logger.info(f"Initializing Sentry backend: {backend_config.url}")
-        return SentryBackend(
+        backend = SentryBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             org_slug=backend_config.sentry_org,
@@ -134,6 +135,12 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
         )
     else:
         raise ValueError(f"Unsupported backend type: {backend_config.type}")
+
+    # Not a constructor parameter (see BaseBackend.__init__'s own comment):
+    # several backend subclasses override __init__ with their own named
+    # params, so this is applied uniformly here instead.
+    backend.slow_request_threshold_ms = config.slow_request_threshold_ms
+    return backend
 
 
 async def _get_backend() -> BaseBackend:
@@ -801,6 +808,60 @@ async def list_llm_tools_tool(
         return _handle_tool_error("list_llm_tools_tool", e)
 
 
+# Every @mcp.tool()-registered function name above. FastMCP's own tool
+# storage is async-only (no synchronous listing API), so this is
+# maintained by hand - keep it in sync with the registrations above.
+_ALL_TOOL_NAMES = frozenset(
+    {
+        "search_traces",
+        "get_trace",
+        "get_llm_usage",
+        "list_services",
+        "find_errors",
+        "list_llm_models",
+        "get_llm_model_stats",
+        "list_sessions",
+        "get_session_stats",
+        "compare_time_windows",
+        "get_prompt_version_stats",
+        "get_llm_expensive_traces",
+        "get_llm_slow_traces",
+        "search_spans_tool",
+        "list_llm_tools_tool",
+    }
+)
+
+
+def _apply_tool_gating(disable_tools: str | None, enabled_tools: str | None) -> None:
+    """Remove tools from this server instance per --enabled-tools (allowlist,
+    applied first) and --disable-tools (removed on top of whatever the
+    allowlist kept), for reduced-trust or multi-tenant deployments.
+
+    Uses FastMCP's own mcp.local_provider.remove_tool() rather than
+    hand-rolling tool exclusion.
+    """
+    if enabled_tools:
+        keep = {name.strip() for name in enabled_tools.split(",") if name.strip()}
+        unknown = keep - _ALL_TOOL_NAMES
+        if unknown:
+            raise ValueError(f"Unknown tool name(s) in --enabled-tools: {sorted(unknown)}")
+        for name in _ALL_TOOL_NAMES - keep:
+            mcp.local_provider.remove_tool(name)
+        logger.info(f"Tool allowlist applied via --enabled-tools: {sorted(keep)}")
+
+    if disable_tools:
+        disable = {name.strip() for name in disable_tools.split(",") if name.strip()}
+        unknown = disable - _ALL_TOOL_NAMES
+        if unknown:
+            raise ValueError(f"Unknown tool name(s) in --disable-tools: {sorted(unknown)}")
+        for name in disable:
+            try:
+                mcp.local_provider.remove_tool(name)
+            except KeyError:
+                pass  # already removed by --enabled-tools above
+        logger.info(f"Tools disabled via --disable-tools: {sorted(disable)}")
+
+
 _LOCAL_ORIGIN_PATTERN = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$", re.IGNORECASE)
 
 
@@ -884,19 +945,25 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     "--transport",
     type=click.Choice(["stdio", "http"]),
     default="stdio",
-    help="Transport type: stdio (default) for local/Claude Desktop, http for network access",
+    envvar="MCP_TRANSPORT",
+    help="Transport type: stdio (default) for local/Claude Desktop, http for "
+    "network access (overrides MCP_TRANSPORT env var)",
 )
 @click.option(
     "--host",
     type=str,
     default="0.0.0.0",  # noqa: S104 - HTTP transport is documented for network/Docker deployment, where binding only to loopback would make the exposed port unreachable; pass --host 127.0.0.1 explicitly for a loopback-only server.
-    help="Host to bind HTTP server to (only for --transport http, default: 0.0.0.0)",
+    envvar="MCP_HOST",
+    help="Host to bind HTTP server to (only for --transport http, default: "
+    "0.0.0.0, overrides MCP_HOST env var)",
 )
 @click.option(
     "--port",
     type=int,
     default=8000,
-    help="Port for HTTP server (only for --transport http, default: 8000)",
+    envvar="MCP_PORT",
+    help="Port for HTTP server (only for --transport http, default: 8000, "
+    "overrides MCP_PORT env var)",
 )
 @click.option(
     "--include-args-in-spans",
@@ -906,6 +973,41 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     help="Include tool call arguments/results as span attributes when OTel "
     "self-instrumentation is enabled (default: False, since these may "
     "contain sensitive data - overrides MCP_INCLUDE_ARGS_IN_SPANS env var)",
+)
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default=None,
+    help="Logging level (overrides LOG_LEVEL env var, default: INFO)",
+)
+@click.option(
+    "--max-traces-per-query",
+    type=click.IntRange(1, 1000),
+    default=None,
+    help="Maximum traces returned per query, 1-1000 (overrides "
+    "MAX_TRACES_PER_QUERY env var, default: 500)",
+)
+@click.option(
+    "--disable-tools",
+    type=str,
+    default=None,
+    help="Comma-separated tool names to remove from this server instance "
+    "(e.g. for reduced-trust deployments). Applied after --enabled-tools.",
+)
+@click.option(
+    "--enabled-tools",
+    type=str,
+    default=None,
+    help="Comma-separated allowlist of tool names - every other tool is "
+    "removed from this server instance. Combine with --disable-tools to "
+    "further narrow the allowlist.",
+)
+@click.option(
+    "--slow-request-threshold-ms",
+    type=float,
+    default=None,
+    help="Log a warning when a backend request takes longer than this many "
+    "milliseconds, independent of --log-level (unset: disabled)",
 )
 def main(
     backend: str | None,
@@ -920,6 +1022,11 @@ def main(
     host: str,
     port: int,
     include_args_in_spans: bool,
+    log_level: str | None,
+    max_traces_per_query: int | None,
+    disable_tools: str | None,
+    enabled_tools: str | None,
+    slow_request_threshold_ms: float | None,
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
@@ -959,6 +1066,9 @@ def main(
             or sentry_org
             or sentry_project
             or environments
+            or log_level
+            or max_traces_per_query is not None
+            or slow_request_threshold_ms is not None
         ):
             _config.apply_cli_overrides(
                 backend_type=backend,
@@ -969,10 +1079,16 @@ def main(
                 sentry_project=sentry_project,
                 tempo_instance_id=tempo_instance_id,
                 environments=environments,
+                log_level=log_level,
+                max_traces_per_query=max_traces_per_query,
+                slow_request_threshold_ms=slow_request_threshold_ms,
             )
+            logging.getLogger().setLevel(_config.log_level)
 
         # Backend will be lazily initialized on first tool call
         # This ensures it's created in FastMCP's event loop, not a separate one
+
+        _apply_tool_gating(disable_tools=disable_tools, enabled_tools=enabled_tools)
 
         # OTel self-instrumentation is fully opt-in: configure_tracing() only
         # returns True (and only then do we register the middleware) when

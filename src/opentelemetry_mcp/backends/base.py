@@ -1,5 +1,7 @@
 """Abstract base backend for OpenTelemetry trace storage systems."""
 
+import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -8,6 +10,8 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt,
 
 from opentelemetry_mcp.attributes import HealthCheckResponse
 from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceData, TraceQuery
+
+logger = logging.getLogger(__name__)
 
 # Only genuine transport-level failures - a connection that never completed
 # or a request that timed out - are worth retrying. An HTTP response with a
@@ -22,9 +26,21 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
     exception if every attempt fails.
     """
 
-    def __init__(self, wrapped: httpx.AsyncBaseTransport | None = None) -> None:
-        """Wrap an underlying transport (defaults to a fresh AsyncHTTPTransport)."""
+    def __init__(
+        self,
+        wrapped: httpx.AsyncBaseTransport | None = None,
+        slow_request_threshold_ms: float | None = None,
+    ) -> None:
+        """Wrap an underlying transport (defaults to a fresh AsyncHTTPTransport).
+
+        Args:
+            wrapped: Transport to delegate to
+            slow_request_threshold_ms: If set, log a warning for any request
+                that takes longer than this, independent of the configured
+                log level
+        """
         self._wrapped = wrapped if wrapped is not None else httpx.AsyncHTTPTransport()
+        self._slow_request_threshold_ms = slow_request_threshold_ms
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         """Delegate to the wrapped transport, retrying up to 3 total attempts
@@ -48,7 +64,15 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
             stop=stop_after_attempt(3),
             reraise=True,
         )
+        start = time.perf_counter()
         response: httpx.Response = await retrying(_send)
+        if self._slow_request_threshold_ms is not None:
+            duration_ms = (time.perf_counter() - start) * 1000
+            if duration_ms > self._slow_request_threshold_ms:
+                logger.warning(
+                    f"Slow backend request: {request.method} {request.url} took "
+                    f"{duration_ms:.0f}ms (threshold: {self._slow_request_threshold_ms:.0f}ms)"
+                )
         return response
 
     async def aclose(self) -> None:
@@ -71,6 +95,11 @@ class BaseBackend(ABC):
         self.api_key = api_key
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
+        # Not a constructor parameter: several subclasses override __init__
+        # with their own named params and call super().__init__(url, api_key,
+        # timeout) positionally, so a caller (server.py's _create_backend)
+        # sets this as a plain attribute after construction instead.
+        self.slow_request_threshold_ms: float | None = None
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -89,7 +118,9 @@ class BaseBackend(ABC):
                 headers=self._create_headers(),
                 timeout=self.timeout,
                 follow_redirects=True,
-                transport=_RetryingTransport(),
+                transport=_RetryingTransport(
+                    slow_request_threshold_ms=self.slow_request_threshold_ms
+                ),
             )
         return self._client
 

@@ -522,6 +522,67 @@ class TestToolErrorIsErrorFlag:
         assert result.is_error is False
 
 
+class TestApplyToolGating:
+    """_apply_tool_gating wraps mcp.local_provider.remove_tool() for
+    --enabled-tools/--disable-tools. Patches server.mcp wholesale (same
+    pattern TestMainCli uses) rather than mutating the real shared mcp
+    singleton, which every other test file's Client(mcp) calls also rely
+    on staying fully populated."""
+
+    def test_disable_tools_removes_exactly_those_names(self) -> None:
+        with patch.object(server, "mcp") as mock_mcp:
+            server._apply_tool_gating(disable_tools="get_trace,find_errors", enabled_tools=None)
+
+        removed = [call.args[0] for call in mock_mcp.local_provider.remove_tool.call_args_list]
+        assert sorted(removed) == ["find_errors", "get_trace"]
+
+    def test_disable_tools_unknown_name_raises_without_removing_anything(self) -> None:
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            pytest.raises(ValueError, match="Unknown tool name.*not_a_real_tool"),
+        ):
+            server._apply_tool_gating(disable_tools="not_a_real_tool", enabled_tools=None)
+
+        mock_mcp.local_provider.remove_tool.assert_not_called()
+
+    def test_enabled_tools_removes_everything_not_in_the_allowlist(self) -> None:
+        with patch.object(server, "mcp") as mock_mcp:
+            server._apply_tool_gating(disable_tools=None, enabled_tools="search_traces,get_trace")
+
+        removed = {call.args[0] for call in mock_mcp.local_provider.remove_tool.call_args_list}
+        assert removed == server._ALL_TOOL_NAMES - {"search_traces", "get_trace"}
+
+    def test_enabled_tools_unknown_name_raises_without_removing_anything(self) -> None:
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            pytest.raises(ValueError, match="Unknown tool name.*not_a_real_tool"),
+        ):
+            server._apply_tool_gating(disable_tools=None, enabled_tools="not_a_real_tool")
+
+        mock_mcp.local_provider.remove_tool.assert_not_called()
+
+    def test_disable_tools_swallows_key_error_for_an_already_removed_tool(self) -> None:
+        """A tool named in --disable-tools that was already removed some
+        other way (e.g. by --enabled-tools) raises KeyError from the real
+        remove_tool - that must be swallowed, not propagate."""
+        with patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.local_provider.remove_tool.side_effect = KeyError("already removed")
+
+            server._apply_tool_gating(disable_tools="get_trace", enabled_tools=None)
+
+    def test_both_none_removes_nothing(self) -> None:
+        with patch.object(server, "mcp") as mock_mcp:
+            server._apply_tool_gating(disable_tools=None, enabled_tools=None)
+
+        mock_mcp.local_provider.remove_tool.assert_not_called()
+
+    def test_empty_strings_are_treated_like_none(self) -> None:
+        with patch.object(server, "mcp") as mock_mcp:
+            server._apply_tool_gating(disable_tools="", enabled_tools="")
+
+        mock_mcp.local_provider.remove_tool.assert_not_called()
+
+
 class TestMainCli:
     """main() is the click CLI entrypoint. mcp.run is mocked so it never
     blocks; ServerConfig.from_env/apply_cli_overrides are exercised for
@@ -578,6 +639,9 @@ class TestMainCli:
             sentry_project=FAKE_SENTRY_PROJECT,
             tempo_instance_id=FAKE_TEMPO_INSTANCE_ID,
             environments="prd,staging",
+            log_level=None,
+            max_traces_per_query=None,
+            slow_request_threshold_ms=None,
         )
 
     def test_no_cli_flags_skips_apply_cli_overrides(self) -> None:

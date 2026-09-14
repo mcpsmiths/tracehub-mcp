@@ -8,6 +8,9 @@ one test confirms every backend actually gets the retry transport through
 the shared `client` property in base.py.
 """
 
+import asyncio
+import logging
+
 import httpx
 import pytest
 
@@ -108,3 +111,97 @@ def test_backend_client_property_uses_the_retrying_transport() -> None:
     client = backend.client
 
     assert isinstance(client._transport, _RetryingTransport)
+
+
+def test_backend_client_forwards_slow_request_threshold_to_transport() -> None:
+    """slow_request_threshold_ms is not a constructor param (several
+    backend subclasses override __init__ without **kwargs forwarding) -
+    it is set as a plain attribute and must reach the transport via the
+    client property."""
+    backend = JaegerBackend(url="http://localhost:16686")
+    backend.slow_request_threshold_ms = 500.0
+
+    client = backend.client
+
+    assert isinstance(client._transport, _RetryingTransport)
+    assert client._transport._slow_request_threshold_ms == 500.0
+
+
+class TestSlowRequestLogging:
+    """_RetryingTransport logs a warning when a request exceeds the
+    configured threshold, independent of the request's own success/failure."""
+
+    async def test_request_slower_than_threshold_logs_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0.05)
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), slow_request_threshold_ms=10.0
+        )
+
+        with caplog.at_level(logging.WARNING):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://backend.test"
+            ) as client:
+                await client.get("/health")
+
+        assert any("Slow backend request" in r.message for r in caplog.records)
+
+    async def test_request_faster_than_threshold_does_not_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), slow_request_threshold_ms=10_000.0
+        )
+
+        with caplog.at_level(logging.WARNING):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://backend.test"
+            ) as client:
+                await client.get("/health")
+
+        assert caplog.records == []
+
+    async def test_threshold_unset_never_logs_regardless_of_duration(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0.05)
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        with caplog.at_level(logging.WARNING):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://backend.test"
+            ) as client:
+                await client.get("/health")
+
+        assert caplog.records == []
+
+    async def test_slow_error_response_still_logs(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A slow request that returns an HTTP error status is still a
+        transport-level success (a response came back), so slow-request
+        logging must fire the same as for a 200."""
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0.05)
+            return httpx.Response(500)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), slow_request_threshold_ms=10.0
+        )
+
+        with caplog.at_level(logging.WARNING):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://backend.test"
+            ) as client:
+                await client.get("/health")
+
+        assert any("Slow backend request" in r.message for r in caplog.records)
