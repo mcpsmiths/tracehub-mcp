@@ -1,0 +1,98 @@
+name: Publish to MCP Registry
+
+# Publishes server.json to the official MCP Registry
+# (registry.modelcontextprotocol.io) via GitHub OIDC - no stored token
+# required. The io.github.mcpsmiths/* namespace is authorized because this
+# workflow runs in the mcpsmiths org/repo server.json itself declares.
+# Adopts the pattern verified live in github.com/docling-project/docling-mcp's
+# own publish-mcp.yml: poll PyPI for the release to actually be live (closes
+# the exact race that caused a stale-registry incident before this workflow
+# existed) before publishing, and use a pinned, SHA256-verified mcp-publisher
+# binary rather than an unpinned build-from-source, which the registry's own
+# currently-open issues #1505/#1523 flag as an insecure pattern its own docs
+# still recommend.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Immutable release ref (tag) whose server.json should be published
+        required: true
+        type: string
+      version:
+        description: The version just released (e.g. 0.5.0), used to sync server.json
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref whose server.json should be published
+        required: true
+        default: main
+        type: string
+      version:
+        description: The version to sync server.json to before publishing
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish-mcp:
+    name: Publish server.json to the MCP Registry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Sync server.json version (in-workspace only, not committed)
+        env:
+          NEW_VERSION: ${{ inputs.version }}
+        run: |
+          jq --arg v "$NEW_VERSION" \
+            '.version = $v | .packages[0].version = $v' \
+            server.json > server.json.tmp
+          mv server.json.tmp server.json
+          cat server.json | jq '{name, version, package_version: .packages[0].version}'
+
+      - name: Wait for PyPI to serve the release with the ownership marker
+        run: |
+          name="$(jq -r '.name' server.json)"
+          echo "Waiting for PyPI tracehub-mcp ${NEW_VERSION} with marker 'mcp-name: ${name}'"
+          for i in $(seq 1 40); do
+            desc="$(curl -sf "https://pypi.org/pypi/tracehub-mcp/${NEW_VERSION}/json" \
+              | jq -r '.info.description' 2>/dev/null || true)"
+            if printf '%s' "$desc" | grep -q "mcp-name: ${name}"; then
+              echo "Ownership marker present on PyPI ${NEW_VERSION}"
+              exit 0
+            fi
+            echo "Attempt ${i}/40: not yet - sleeping 20s"
+            sleep 20
+          done
+          echo "::error::PyPI ${NEW_VERSION} with the ownership marker was not found in time"
+          exit 1
+        env:
+          NEW_VERSION: ${{ inputs.version }}
+
+      - name: Install mcp-publisher (pinned, SHA256-verified)
+        run: |
+          version="1.8.1"
+          archive="mcp-publisher_linux_amd64.tar.gz"
+          expected_sha256="a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
+          url="https://github.com/modelcontextprotocol/registry/releases/download/v${version}/${archive}"
+          curl --fail --location --proto '=https' --tlsv1.2 "$url" --output "$archive"
+          printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" mcp-publisher
+          chmod 0755 mcp-publisher
+          ./mcp-publisher --version
+
+      - name: Authenticate to the MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Validate and publish server.json
+        run: |
+          ./mcp-publisher validate server.json
+          ./mcp-publisher publish

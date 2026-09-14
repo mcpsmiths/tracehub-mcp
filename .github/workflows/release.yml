@@ -155,3 +155,15 @@ jobs:
 
       - name: Installation successful
         run: echo "✅ Package successfully published and verified on PyPI!"
+
+  publish-mcp-registry:
+    name: Publish to MCP Registry
+    needs: [bump-version, test-installation]
+    if: needs.bump-version.outputs.already_released == 'false'
+    uses: ./.github/workflows/mcp-registry-publish.yml
+    with:
+      ref: v${{ needs.bump-version.outputs.new_version }}
+      version: ${{ needs.bump-version.outputs.new_version }}
+    permissions:
+      id-token: write
+      contents: read
