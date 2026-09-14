@@ -154,6 +154,8 @@ return {"result": data}
 
 **Configuration Precedence:** CLI args > environment variables > defaults
 
+**Known third-party egress:** FastMCP itself (not this project's code) checks PyPI for a newer FastMCP release every 12h when it prints the startup banner. Disable with `FASTMCP_CHECK_FOR_UPDATES=off`, or suppress the banner entirely with `FASTMCP_SHOW_SERVER_BANNER=false` (both are FastMCP's own env vars, not tracehub-mcp's). See `.venv/.../fastmcp/utilities/version_check.py` / `settings.py` for the implementation.
+
 ## Opentelemetry Semantic Conventions
 
 The server parses both current and legacy Opentelemetry conventions:

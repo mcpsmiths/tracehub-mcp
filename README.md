@@ -183,6 +183,8 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 
 Every backend-related CLI flag has a matching env var (`--backend`/`BACKEND_TYPE`, `--url`/`BACKEND_URL`, `--api-key`/`BACKEND_API_KEY`, `--app-key`/`BACKEND_APP_KEY`, `--tempo-instance-id`/`BACKEND_TEMPO_INSTANCE_ID`, `--sentry-org`/`BACKEND_SENTRY_ORG`, `--sentry-project`/`BACKEND_SENTRY_PROJECT`, `--environments`/`BACKEND_ENVIRONMENTS`). `--disable-tools <name1,name2,...>` / `--enabled-tools <name1,name2,...>` (CLI-only, no env var) remove/allowlist tools for reduced-trust deployments - `--enabled-tools` is applied first, `--disable-tools` on top of whatever it kept. Run `tracehub-mcp --help` for the full list.
 
+**Known third-party egress dependency:** the underlying FastMCP framework checks PyPI (`https://pypi.org/pypi/fastmcp/json`) for a newer FastMCP release once every 12 hours when it prints its startup banner - this is FastMCP's own behavior, not tracehub-mcp's, and unrelated to the OTel self-instrumentation above. It fails silently if there's no network access. For network-restricted/air-gapped deployments, disable it with `FASTMCP_CHECK_FOR_UPDATES=off`, or suppress the banner entirely with `FASTMCP_SHOW_SERVER_BANNER=false`.
+
 ### Backend-Specific Setup
 
 <details>

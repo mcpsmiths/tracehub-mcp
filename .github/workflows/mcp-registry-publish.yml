@@ -48,6 +48,15 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      - name: Validate version input format
+        env:
+          NEW_VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version input '${NEW_VERSION}' is not a valid semver (expected X.Y.Z or X.Y.Z-prerelease)"
+            exit 1
+          fi
+
       - name: Sync server.json version (in-workspace only, not committed)
         env:
           NEW_VERSION: ${{ inputs.version }}
