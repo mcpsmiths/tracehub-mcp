@@ -1,3 +1,23 @@
+## v0.5.0 (2026-09-14)
+
+### Feat
+
+- **cli**: add log-level, tool-gating, slow-request, and env-var parity flags
+- **observability**: add opt-in OTel self-instrumentation for tool calls
+- **models**: surface score.*/evaluation.* attributes in search_spans_tool
+- **tools**: add get_prompt_version_stats tool
+- **tools**: add compare_time_windows tool
+- **tools**: add gen_ai.conversation.id typed field and session tools
+- add MCPB bundle source for Smithery publishing
+
+### Fix
+
+- **docker**: stop the default container from crashing on startup
+- **tools**: stop swallowing exceptions into fake-success error JSON
+- **server**: report tool failures via CallToolResult isError per SEP-2140
+- **ci**: poll for PyPI availability in the release smoke test, not a fixed sleep
+- **server**: report tracehub-mcp own version in the MCP handshake
+
 ## v0.4.0 (2026-09-13)
 
 ### Feat
