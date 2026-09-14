@@ -73,7 +73,12 @@ jobs:
             - name: Setup Node
               uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903  # v5
               with:
-                  node-version: "20"
+                  # @modelcontextprotocol/conformance's dependency tree (a
+                  # transitive content-type@3.1.0) now requires Node >=22 -
+                  # Node 20 fails with "SyntaxError: The requested module
+                  # 'fs' does not provide an export named 'globSync'"
+                  # before the suite even starts, confirmed live in CI.
+                  node-version: "22"
             - name: Install dependencies
               run: uv sync --dev
             - name: Start server (streamable-http)
