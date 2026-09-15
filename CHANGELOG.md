@@ -1,3 +1,26 @@
+## v0.6.0 (2026-09-15)
+
+### Feat
+
+- **tools**: structured output for search_traces, search_spans_tool, list_sessions
+- **attributes**: resolve OTel gen_ai.system -> gen_ai.provider.name rename
+- **backends**: retry 429 responses with Retry-After-aware backoff
+
+### Fix
+
+- **sentry**: enrich search_traces from search rows, kill redundant get_trace re-fetch
+- **sentry**: get_trace no longer rejects every item for a missing trace_id
+- **datadog**: correct the custom-attributes key and add real status field support
+- **gitignore**: cover .env.<suffix> variants, not just the bare .env file
+- **backends**: restore Datadog retry transport, fix NOT_EQUALS status filter, unbreak 2 Sentry tools
+- **observability**: redact known credential shapes from span attributes
+- **backends**: strip query strings from slow-request log messages
+- **server**: actually enforce max_traces_per_query
+- **ci**: bump conformance job to Node 22, unblocking the pipeline
+- **ci**: match literal strings, not regex, in mcp-registry-publish.yml
+- **docker**: replace the no-op HEALTHCHECK with a real one
+- **ci**: retry mcp-publisher publish on transient PyPI-lag 404
+
 ## v0.5.0 (2026-09-14)
 
 ### Feat
