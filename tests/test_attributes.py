@@ -18,6 +18,8 @@ intermediate variable or a `# type: ignore[arg-type]`); model_validate is
 the pattern the rest of this test suite already uses for the same reason.
 """
 
+from typing import Any
+
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -187,6 +189,55 @@ def test_conversation_id_and_prompt_fields_default_to_none() -> None:
     assert attrs.gen_ai_conversation_id is None
     assert attrs.gen_ai_prompt_name is None
     assert attrs.gen_ai_prompt_version is None
+
+
+class TestGenAiProviderNameRename:
+    """OTel semconv v1.37.0 renamed gen_ai.system to gen_ai.provider.name.
+    Without the model_validator these tests exercise, a span carrying only
+    the new name would silently land in extra_attributes instead of the
+    typed gen_ai_system field that is_llm_span/LLMSpanAttributes.from_span/
+    FilterEngine's client-side filtering all actually read - not a
+    hypothetical, since the rename already shipped upstream over a year
+    ago and any instrumentation library could adopt it at any time."""
+
+    def test_gen_ai_system_alone_still_works(self) -> None:
+        """Control: the existing, canonical name is unaffected."""
+        attrs = SpanAttributes.model_validate({"gen_ai.system": "openai"})
+        assert attrs.gen_ai_system == "openai"
+
+    def test_gen_ai_provider_name_alone_populates_gen_ai_system(self) -> None:
+        attrs = SpanAttributes.model_validate({"gen_ai.provider.name": "openai"})
+        assert attrs.gen_ai_system == "openai"
+
+    def test_gen_ai_system_wins_when_both_present(self) -> None:
+        attrs = SpanAttributes.model_validate(
+            {"gen_ai.system": "anthropic", "gen_ai.provider.name": "openai"}
+        )
+        assert attrs.gen_ai_system == "anthropic"
+
+    def test_neither_name_present_defaults_to_none(self) -> None:
+        attrs = SpanAttributes.model_validate({"gen_ai.request.model": "gpt-4"})
+        assert attrs.gen_ai_system is None
+
+    def test_provider_name_used_as_fallback_does_not_duplicate_into_extras(self) -> None:
+        """Once consumed as the fallback, the raw key should not also
+        reappear in extra_attributes - mirroring
+        test_extra_attributes_excludes_typed_fields's shape for the
+        canonical name."""
+        attrs = SpanAttributes.model_validate({"gen_ai.provider.name": "openai"})
+        assert "gen_ai.provider.name" not in attrs.extra_attributes
+
+    def test_kwargs_construction_style_also_works(self) -> None:
+        """Backends construct via SpanAttributes(**extra), not
+        model_validate(dict) - confirm the same normalization applies to
+        that call style too. Typed as dict[str, Any] (matching every real
+        backend call site, e.g. datadog.py's
+        SpanAttributes(**self._extract_semconv_attributes(...))) rather
+        than a narrower inline-literal type mypy would strictly check the
+        ** spread against per-field."""
+        extra: dict[str, Any] = {"gen_ai.provider.name": "openai", "gen_ai.request.model": "gpt-4"}
+        attrs = SpanAttributes(**extra)
+        assert attrs.gen_ai_system == "openai"
 
 
 def test_extra_attributes_surfaces_score_and_evaluation_shaped_fields() -> None:

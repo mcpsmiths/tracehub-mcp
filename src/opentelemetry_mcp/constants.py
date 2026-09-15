@@ -35,6 +35,11 @@ class GenAIAttributes:
 
     # System and model
     GEN_AI_SYSTEM = "gen_ai.system"
+    # OTel semconv v1.37.0 renamed gen_ai.system to gen_ai.provider.name -
+    # kept as a separate constant (not a replacement) since gen_ai.system
+    # remains this codebase's canonical name; see SpanAttributes's
+    # _normalize_gen_ai_provider_rename for where the two get reconciled.
+    GEN_AI_PROVIDER_NAME = "gen_ai.provider.name"
     GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
     GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
     GEN_AI_OPERATION_NAME = "gen_ai.operation.name"
@@ -82,6 +87,7 @@ class GenAI:
 
     # System and model
     SYSTEM = GenAIAttributes.GEN_AI_SYSTEM
+    PROVIDER_NAME = GenAIAttributes.GEN_AI_PROVIDER_NAME
     REQUEST_MODEL = GenAIAttributes.GEN_AI_REQUEST_MODEL
     RESPONSE_MODEL = GenAIAttributes.GEN_AI_RESPONSE_MODEL
     OPERATION_NAME = GenAIAttributes.GEN_AI_OPERATION_NAME

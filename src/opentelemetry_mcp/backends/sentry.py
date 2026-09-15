@@ -148,6 +148,14 @@ _SPAN_STRUCTURAL_FIELDS = (
 # unverified assumption - see module docstring point 3.
 _GEN_AI_FIELDS = (
     "gen_ai.system",
+    # OTel semconv v1.37.0 renamed gen_ai.system to gen_ai.provider.name -
+    # requested alongside the old name so an account whose spans only carry
+    # the new one still gets it selected at all (this is the same class of
+    # bug already fixed once on this exact tuple for
+    # gen_ai.conversation.id/prompt.name/prompt.version - a field that isn't
+    # requested here never reaches attributes.py's model-level fallback,
+    # since it never arrives in the row to begin with).
+    "gen_ai.provider.name",
     "gen_ai.request.model",
     "gen_ai.response.model",
     "gen_ai.usage.prompt_tokens",

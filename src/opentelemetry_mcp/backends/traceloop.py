@@ -465,8 +465,12 @@ class TraceloopBackend(BaseBackend):
         # Convert gen_ai.* to llm.* for Traceloop backend
         # Traceloop uses legacy llm.* naming convention instead of gen_ai.*
         if field.startswith("gen_ai."):
-            # Map gen_ai.system -> llm.vendor (special case)
-            if field == GenAI.SYSTEM:
+            # Map gen_ai.system -> llm.vendor (special case). Also map the
+            # OTel semconv v1.37.0 rename gen_ai.provider.name to the same
+            # target field - both names represent the same value, and a
+            # caller filtering by either should reach Traceloop's one
+            # underlying llm.vendor field.
+            if field in (GenAI.SYSTEM, GenAI.PROVIDER_NAME):
                 field = LegacyLLM.VENDOR
             else:
                 # General mapping: gen_ai.* -> llm.*

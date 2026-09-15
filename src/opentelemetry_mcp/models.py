@@ -544,6 +544,15 @@ class TraceQuery(BaseModel):
         # Add tags including Opentelemetry filters
         all_tags = dict(self.tags)
         if self.gen_ai_system:
+            # Known, disclosed gap: Jaeger's tags param is a flat exact-match
+            # dict (AND-only, no OR-across-keys), so a span whose data only
+            # has gen_ai.provider.name (see attributes.py's rename-fallback
+            # for why that name exists at all) won't match a search filtering
+            # by this tag specifically - only gen_ai.system-tagged spans are
+            # found server-side. Any such span that *does* come back from a
+            # broader query still parses its gen_ai_system correctly either
+            # way, since that fallback lives at the attribute-parsing layer,
+            # not here.
             all_tags["gen_ai.system"] = self.gen_ai_system
         if self.gen_ai_request_model:
             all_tags["gen_ai.request.model"] = self.gen_ai_request_model

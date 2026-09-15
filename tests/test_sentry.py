@@ -353,6 +353,14 @@ def test_span_search_fields_requests_conversation_and_prompt_version_columns() -
     assert "gen_ai.prompt.version" in _SPAN_SEARCH_FIELDS
 
 
+def test_span_search_fields_requests_the_gen_ai_provider_name_rename_too() -> None:
+    """Same class of bug, different attribute: an account whose spans only
+    carry gen_ai.provider.name (the OTel semconv v1.37.0 rename of
+    gen_ai.system) needs that column actually requested from the Events API
+    before attributes.py's model-level rename-fallback ever sees it."""
+    assert "gen_ai.provider.name" in _SPAN_SEARCH_FIELDS
+
+
 class TestQueryEscaping:
     """Test that untrusted values can't inject additional query clauses."""
 

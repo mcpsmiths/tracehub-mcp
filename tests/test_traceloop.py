@@ -5,7 +5,8 @@ from datetime import datetime
 import pytest
 
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
-from opentelemetry_mcp.models import TraceQuery
+from opentelemetry_mcp.constants import GenAI
+from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, TraceQuery
 
 
 def test_traceloop_backend_requires_api_key() -> None:
@@ -229,3 +230,39 @@ def test_duration_conversion() -> None:
 
     # Our internal model also uses milliseconds
     assert float(duration_ms) == 3500.0
+
+
+_FAKE_API_KEY = "test" + "_key"
+
+
+class TestFilterToTraceloopGenAiProviderRename:
+    """Both gen_ai.system and its OTel semconv v1.37.0 rename,
+    gen_ai.provider.name, must map to Traceloop's one underlying llm.vendor
+    field - a caller filtering by either name should reach the same data."""
+
+    def _backend(self) -> TraceloopBackend:
+        return TraceloopBackend(url="https://api.traceloop.com/v2", api_key=_FAKE_API_KEY)
+
+    def test_gen_ai_system_maps_to_llm_vendor(self) -> None:
+        backend = self._backend()
+        f = Filter(
+            field=GenAI.SYSTEM,
+            operator=FilterOperator.EQUALS,
+            value="openai",
+            value_type=FilterType.STRING,
+        )
+        converted = backend._filter_to_traceloop(f)
+        assert converted is not None
+        assert converted["field"] == "llm.vendor"
+
+    def test_gen_ai_provider_name_also_maps_to_llm_vendor(self) -> None:
+        backend = self._backend()
+        f = Filter(
+            field=GenAI.PROVIDER_NAME,
+            operator=FilterOperator.EQUALS,
+            value="openai",
+            value_type=FilterType.STRING,
+        )
+        converted = backend._filter_to_traceloop(f)
+        assert converted is not None
+        assert converted["field"] == "llm.vendor"

@@ -3,11 +3,21 @@
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Note: We import constants for documentation but must use string literals for Pydantic aliases
 # due to mypy strict mode requirements
 from .constants import GenAI
+
+# OTel GenAI semantic conventions renamed gen_ai.system to gen_ai.provider.name
+# in semconv v1.37.0 - confirmed against the real release changelog, not
+# assumed. Because SpanAttributes uses extra="allow" (not "ignore"/"forbid"),
+# a span carrying only the new name doesn't raise or get dropped - it
+# silently lands in extra_attributes instead of the typed gen_ai_system
+# field, which is what is_llm_span/LLMSpanAttributes.from_span/FilterEngine's
+# client-side filtering all actually read. _normalize_gen_ai_provider_rename
+# below closes that gap once, at the model level, for every backend.
+_GEN_AI_PROVIDER_NAME_KEY = "gen_ai.provider.name"
 
 
 class SpanAttributes(BaseModel):
@@ -69,6 +79,38 @@ class SpanAttributes(BaseModel):
     service_name: str | None = Field(None, alias="service.name")
     otel_status_code: str | None = Field(None, alias="otel.status_code")
     error: bool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_gen_ai_provider_rename(cls, data: Any) -> Any:
+        """Fall back to gen_ai.provider.name when gen_ai.system is absent.
+
+        A field_validator on gen_ai_system can't see this: it only ever
+        receives the value already routed to that field by its own alias,
+        never a sibling key elsewhere in the input. This is inherently a
+        cross-key concern, so it needs a model-level, before-validation
+        look at the whole input instead - same "never raise, best-effort
+        normalize" spirit as this class's two field-level coercers above,
+        just scoped to the mapping rather than one field.
+
+        gen_ai.system stays canonical (preferred when both are present)
+        since it's what the rest of this codebase already keys off; this
+        only fills the gap when it's missing, and removes the raw
+        gen_ai.provider.name key so the same value doesn't also duplicate
+        into extra_attributes once it has been consumed as the fallback.
+        """
+        if not isinstance(data, dict):
+            return data
+        has_system = data.get("gen_ai.system") is not None or data.get("gen_ai_system") is not None
+        if has_system:
+            return data
+        provider_name = data.get(GenAI.PROVIDER_NAME)
+        if provider_name is None:
+            return data
+        return {
+            **{k: v for k, v in data.items() if k != GenAI.PROVIDER_NAME},
+            "gen_ai.system": provider_name,
+        }
 
     @field_validator("gen_ai_response_finish_reasons", "llm_response_finish_reasons", mode="before")
     @classmethod
