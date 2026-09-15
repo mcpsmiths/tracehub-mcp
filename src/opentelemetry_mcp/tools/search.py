@@ -1,10 +1,9 @@
 """Search traces tool implementation."""
 
-import json
 from typing import Any
 
 from opentelemetry_mcp.backends.base import BaseBackend
-from opentelemetry_mcp.models import Filter, TraceQuery, TraceSummary
+from opentelemetry_mcp.models import Filter, SearchTracesResult, TraceQuery, TraceSummary
 from opentelemetry_mcp.utils import parse_iso_timestamp
 
 
@@ -23,7 +22,7 @@ async def search_traces(
     tags: dict[str, str] | None = None,
     filters: list[dict[str, Any]] | None = None,
     limit: int = 100,
-) -> str:
+) -> SearchTracesResult:
     """Search for OpenTelemetry traces with optional filters.
 
     Supports both simple parameters and the new generic filter system.
@@ -45,7 +44,7 @@ async def search_traces(
         limit: Maximum number of traces to return (1-1000)
 
     Returns:
-        JSON string with trace summaries
+        Trace summaries with a count
 
     Example filter:
         {
@@ -94,10 +93,4 @@ async def search_traces(
     # Convert to summaries
     summaries = [TraceSummary.from_trace(trace) for trace in traces]
 
-    # Return as JSON
-    result = {
-        "count": len(summaries),
-        "traces": [s.model_dump(mode="json") for s in summaries],
-    }
-
-    return json.dumps(result, indent=2, default=str)
+    return SearchTracesResult(count=len(summaries), traces=summaries)

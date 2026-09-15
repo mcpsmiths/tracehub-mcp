@@ -38,6 +38,16 @@ class SessionInfo(BaseModel):
     total_tokens: int
 
 
+class ListSessionsResult(BaseModel):
+    """Structured response shape for the list_sessions tool - a real
+    return type (rather than a bare str) lets FastMCP auto-derive a
+    genuinely useful MCP outputSchema/structuredContent."""
+
+    count: int
+    sessions: list[SessionInfo]
+    message: str | None = None
+
+
 def _span_tokens(span: Any) -> int:
     """Total tokens for a span, reusing LLMSpanAttributes' enhanced
     calculation (explicit total -> sum of gen_ai.usage.* -> prompt+completion).
@@ -53,7 +63,7 @@ async def list_sessions(
     service_name: str | None = None,
     gen_ai_system: str | None = None,
     limit: int = 1000,
-) -> str:
+) -> ListSessionsResult:
     """List conversations/sessions grouped by gen_ai.conversation.id.
 
     Args:
@@ -65,7 +75,7 @@ async def list_sessions(
         limit: Maximum spans to analyze (default: 1000)
 
     Returns:
-        JSON string with list of sessions and their statistics
+        List of sessions with their statistics
     """
     start_dt, error = parse_iso_timestamp(start_time, "start_time")
     if error:
@@ -93,12 +103,10 @@ async def list_sessions(
     spans = await backend.search_spans(query)
 
     if not spans:
-        return json.dumps(
-            {
-                "count": 0,
-                "sessions": [],
-                "message": "No spans with gen_ai.conversation.id found matching the criteria",
-            }
+        return ListSessionsResult(
+            count=0,
+            sessions=[],
+            message="No spans with gen_ai.conversation.id found matching the criteria",
         )
 
     sessions_map: dict[str, dict[str, Any]] = {}
@@ -128,20 +136,14 @@ async def list_sessions(
         if span.start_time > session_data["last_seen"]:
             session_data["last_seen"] = span.start_time
 
-    sessions_list = []
+    sessions_list: list[SessionInfo] = []
     for session_data in sessions_map.values():
         session_data["services"] = sorted(session_data["services"])
-        session_info = SessionInfo(**session_data)
-        sessions_list.append(session_info.model_dump(mode="json"))
+        sessions_list.append(SessionInfo(**session_data))
 
-    sessions_list.sort(key=lambda x: x["span_count"], reverse=True)
+    sessions_list.sort(key=lambda s: s.span_count, reverse=True)
 
-    result = {
-        "count": len(sessions_list),
-        "sessions": sessions_list,
-    }
-
-    return json.dumps(result, indent=2, default=str)
+    return ListSessionsResult(count=len(sessions_list), sessions=sessions_list)
 
 
 async def get_session_stats(

@@ -106,15 +106,26 @@ Each MCP capability is implemented as a separate tool module in [opentelemetry_m
 - [tools/compare.py](opentelemetry_mcp/tools/compare.py) - `compare_time_windows`: diff aggregated usage between two time ranges
 - [tools/prompt_versions.py](opentelemetry_mcp/tools/prompt_versions.py) - `get_prompt_version_stats`: group spans by `gen_ai.prompt.name`/`gen_ai.prompt.version`
 
-**Critical:** All tools MUST return JSON strings (not dicts). This is required by the MCP protocol.
+**Two valid return patterns exist.** Returning a JSON string was never actually an MCP protocol
+requirement - it was this codebase's original convention, from before FastMCP auto-derived
+`outputSchema`/`structuredContent` from a tool function's return-type annotation. Most tools
+still use the original pattern; `search_traces`, `search_spans_tool`, and `list_sessions` were
+converted to the newer pattern (see [models.py](opentelemetry_mcp/models.py)'s
+`SearchTracesResult`/`SearchSpansResult` and [tools/sessions.py](opentelemetry_mcp/tools/sessions.py)'s
+`ListSessionsResult`) so MCP clients get real structured output instead of a JSON string wrapped
+in `{"result": "<json string>"}`.
 
 ```python
-# Correct
+# Pattern A (most tools): return a JSON string
 return json.dumps({"result": data})
 
-# Incorrect - will break MCP protocol
-return {"result": data}
+# Pattern B (search_traces, search_spans_tool, list_sessions): return a typed model
+return SearchTracesResult(count=len(summaries), traces=summaries)
 ```
+
+Whichever pattern a given tool already uses, keep using it - don't mix a `-> str` return
+annotation with a raw dict return (that part of the original rule still holds: `return {"result":
+data}` from a `-> str`-annotated tool breaks the protocol).
 
 ### Key Components
 

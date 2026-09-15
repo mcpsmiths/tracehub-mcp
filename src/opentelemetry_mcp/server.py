@@ -21,6 +21,7 @@ from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.config import ServerConfig
+from opentelemetry_mcp.models import SearchSpansResult, SearchTracesResult
 from opentelemetry_mcp.observability import McpServerTracingMiddleware, configure_tracing
 from opentelemetry_mcp.tools import (
     compare,
@@ -206,7 +207,7 @@ async def search_traces(
     tags: dict[str, str] | None = None,
     filters: list[dict[str, Any]] | None = None,
     limit: int = 100,
-) -> str:
+) -> SearchTracesResult:
     """Search for OpenTelemetry traces with filters.
 
     Supports both simple parameters and advanced generic filter system.
@@ -462,7 +463,7 @@ async def list_sessions(
     service_name: str | None = None,
     gen_ai_system: str | None = None,
     limit: int = 1000,
-) -> str:
+) -> sessions.ListSessionsResult:
     """List conversations/sessions grouped by gen_ai.conversation.id.
 
     Groups spans that carry the gen_ai.conversation.id attribute (a real,
@@ -727,7 +728,7 @@ async def search_spans_tool(
     tags: dict[str, str] | None = None,
     filters: list[dict[str, Any]] | None = None,
     limit: int = 100,
-) -> str:
+) -> SearchSpansResult:
     """Search for individual OpenTelemetry spans with optional filters.
 
     Unlike search_traces, this returns individual spans rather than grouped traces,

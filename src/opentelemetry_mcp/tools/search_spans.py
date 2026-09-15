@@ -1,10 +1,9 @@
 """Search spans tool implementation."""
 
-import json
 from typing import Any
 
 from opentelemetry_mcp.backends.base import BaseBackend
-from opentelemetry_mcp.models import Filter, SpanQuery, SpanSummary
+from opentelemetry_mcp.models import Filter, SearchSpansResult, SpanQuery, SpanSummary
 from opentelemetry_mcp.utils import parse_iso_timestamp
 
 
@@ -23,7 +22,7 @@ async def search_spans(
     tags: dict[str, str] | None = None,
     filters: list[dict[str, Any]] | None = None,
     limit: int = 100,
-) -> str:
+) -> SearchSpansResult:
     """Search for individual OpenTelemetry spans with optional filters.
 
     Unlike search_traces, this returns individual spans rather than grouped traces,
@@ -47,7 +46,7 @@ async def search_spans(
         limit: Maximum number of spans to return (1-1000)
 
     Returns:
-        JSON string with span summaries
+        Span summaries with a count
 
     Example filter to find LLM tool calls:
         {
@@ -96,10 +95,4 @@ async def search_spans(
     # Convert to summaries
     summaries = [SpanSummary.from_span(span) for span in spans]
 
-    # Return as JSON
-    result = {
-        "count": len(summaries),
-        "spans": [s.model_dump(mode="json") for s in summaries],
-    }
-
-    return json.dumps(result, indent=2, default=str)
+    return SearchSpansResult(count=len(summaries), spans=summaries)

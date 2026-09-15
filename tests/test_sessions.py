@@ -73,14 +73,14 @@ class TestListSessionsHappyPath:
             _non_llm_span_with_conversation(span_id="s2"),
         ]
 
-        result = json.loads(await list_sessions(backend))
+        result = await list_sessions(backend)
 
-        assert result["count"] == 1
-        session = result["sessions"][0]
-        assert session["conversation_id"] == "conv-1"
-        assert session["span_count"] == 2
-        assert session["total_tokens"] == 30
-        assert session["services"] == ["svc-a"]
+        assert result.count == 1
+        session = result.sessions[0]
+        assert session.conversation_id == "conv-1"
+        assert session.span_count == 2
+        assert session.total_tokens == 30
+        assert session.services == ["svc-a"]
 
     async def test_span_without_conversation_id_is_excluded(self) -> None:
         """Defensive check: even though the tool asks the backend to filter
@@ -91,10 +91,10 @@ class TestListSessionsHappyPath:
         no_conv_span.attributes = SpanAttributes.model_validate({"gen_ai.system": "openai"})
         backend.search_spans.return_value = [_llm_span(span_id="s1"), no_conv_span]
 
-        result = json.loads(await list_sessions(backend))
+        result = await list_sessions(backend)
 
-        assert result["count"] == 1
-        assert result["sessions"][0]["span_count"] == 1
+        assert result.count == 1
+        assert result.sessions[0].span_count == 1
 
     async def test_multiple_sessions_sorted_by_span_count_descending(self) -> None:
         backend = _fake_backend()
@@ -110,12 +110,12 @@ class TestListSessionsHappyPath:
             _non_llm_span_with_conversation(span_id="b3"),
         ]
 
-        result = json.loads(await list_sessions(backend))
+        result = await list_sessions(backend)
 
-        assert result["count"] == 2
-        assert result["sessions"][0]["conversation_id"] == "conv-1"
-        assert result["sessions"][0]["span_count"] == 3
-        assert result["sessions"][1]["conversation_id"] == "small-conv"
+        assert result.count == 2
+        assert result.sessions[0].conversation_id == "conv-1"
+        assert result.sessions[0].span_count == 3
+        assert result.sessions[1].conversation_id == "small-conv"
 
     async def test_services_are_deduplicated_and_sorted(self) -> None:
         backend = _fake_backend()
@@ -125,9 +125,9 @@ class TestListSessionsHappyPath:
             _llm_span(span_id="s3", service_name="alpha"),
         ]
 
-        result = json.loads(await list_sessions(backend))
+        result = await list_sessions(backend)
 
-        assert result["sessions"][0]["services"] == ["alpha", "zeta"]
+        assert result.sessions[0].services == ["alpha", "zeta"]
 
     async def test_first_seen_and_last_seen_track_min_and_max(self) -> None:
         backend = _fake_backend()
@@ -138,23 +138,21 @@ class TestListSessionsHappyPath:
             _llm_span(span_id="s2", start_time=earliest),
         ]
 
-        result = json.loads(await list_sessions(backend))
+        result = await list_sessions(backend)
 
-        session = result["sessions"][0]
-        assert session["first_seen"] == earliest.isoformat().replace("+00:00", "Z")
-        assert session["last_seen"] == latest.isoformat().replace("+00:00", "Z")
+        session = result.sessions[0]
+        assert session.first_seen == earliest
+        assert session.last_seen == latest
 
     async def test_empty_backend_result_returns_documented_message(self) -> None:
         backend = _fake_backend()
         backend.search_spans.return_value = []
 
-        result = json.loads(await list_sessions(backend))
+        result = await list_sessions(backend)
 
-        assert result == {
-            "count": 0,
-            "sessions": [],
-            "message": "No spans with gen_ai.conversation.id found matching the criteria",
-        }
+        assert result.count == 0
+        assert result.sessions == []
+        assert result.message == "No spans with gen_ai.conversation.id found matching the criteria"
 
 
 class TestListSessionsQueryConstruction:

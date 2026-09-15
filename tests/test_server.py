@@ -28,6 +28,7 @@ from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.config import BackendConfig, ServerConfig
+from opentelemetry_mcp.models import SearchTracesResult
 
 FAKE_API_KEY = "dd-key1"
 FAKE_APP_KEY = "dd-app1"
@@ -253,8 +254,9 @@ class TestToolWrappers:
 
     async def test_search_traces_passes_arguments_through(self) -> None:
         await self._set_backend()
+        sentinel = SearchTracesResult(count=1, traces=[])
         with patch.object(
-            server.search, "search_traces", AsyncMock(return_value='{"ok":1}')
+            server.search, "search_traces", AsyncMock(return_value=sentinel)
         ) as mocked:
             result = await server.search_traces(
                 service_name="svc",
@@ -264,7 +266,7 @@ class TestToolWrappers:
                 limit=42,
             )
 
-        assert result == '{"ok":1}'
+        assert result is sentinel
         _, kwargs = mocked.call_args
         assert kwargs["service_name"] == "svc"
         assert kwargs["operation_name"] == "op"
@@ -515,7 +517,8 @@ class TestToolErrorIsErrorFlag:
         server._config = _config()
         fake_backend = AsyncMock()
         server._backend = fake_backend
-        with patch.object(server.search, "search_traces", AsyncMock(return_value='{"ok":1}')):
+        sentinel = SearchTracesResult(count=0, traces=[])
+        with patch.object(server.search, "search_traces", AsyncMock(return_value=sentinel)):
             async with Client(server.mcp) as client:
                 result = await client.call_tool("search_traces", {"limit": 5}, raise_on_error=False)
 

@@ -1,6 +1,5 @@
 """Tests for the search_traces tool."""
 
-import json
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
@@ -88,29 +87,29 @@ class TestSearchTracesHappyPath:
         )
         backend.search_traces.return_value = [trace]
 
-        result = json.loads(await search_traces(backend))
+        result = await search_traces(backend)
 
-        assert set(result.keys()) == {"count", "traces"}
-        assert result["count"] == 1
-        summary = result["traces"][0]
-        assert summary["trace_id"] == "t1"
-        assert summary["service_name"] == "my-service"
-        assert summary["operation_name"] == "root-op"
-        assert summary["status"] == "OK"
+        assert result.count == 1
+        summary = result.traces[0]
+        assert summary.trace_id == "t1"
+        assert summary.service_name == "my-service"
+        assert summary.operation_name == "root-op"
+        assert summary.status == "OK"
         # Real transform logic: span_count/llm_span_count/total_tokens/has_errors
         # are derived from the trace's spans, not just echoed from input.
-        assert summary["span_count"] == 2
-        assert summary["llm_span_count"] == 1
-        assert summary["total_tokens"] == 300
-        assert summary["has_errors"] is False
+        assert summary.span_count == 2
+        assert summary.llm_span_count == 1
+        assert summary.total_tokens == 300
+        assert summary.has_errors is False
 
     async def test_empty_backend_result_returns_empty_list(self) -> None:
         backend = _fake_backend()
         backend.search_traces.return_value = []
 
-        result = json.loads(await search_traces(backend))
+        result = await search_traces(backend)
 
-        assert result == {"count": 0, "traces": []}
+        assert result.count == 0
+        assert result.traces == []
 
     async def test_error_span_propagates_has_errors_to_summary(self) -> None:
         backend = _fake_backend()
@@ -118,9 +117,9 @@ class TestSearchTracesHappyPath:
         trace = _make_trace(trace_id="t2", spans=[error_span], status="ERROR")
         backend.search_traces.return_value = [trace]
 
-        result = json.loads(await search_traces(backend))
+        result = await search_traces(backend)
 
-        assert result["traces"][0]["has_errors"] is True
+        assert result.traces[0].has_errors is True
 
     async def test_multiple_traces_are_all_included_in_order(self) -> None:
         backend = _fake_backend()
@@ -128,10 +127,10 @@ class TestSearchTracesHappyPath:
         trace_b = _make_trace(trace_id="b")
         backend.search_traces.return_value = [trace_a, trace_b]
 
-        result = json.loads(await search_traces(backend))
+        result = await search_traces(backend)
 
-        assert result["count"] == 2
-        assert [t["trace_id"] for t in result["traces"]] == ["a", "b"]
+        assert result.count == 2
+        assert [t.trace_id for t in result.traces] == ["a", "b"]
 
 
 class TestSearchTracesInputValidation:

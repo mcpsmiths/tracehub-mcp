@@ -599,6 +599,19 @@ class TraceSummary(BaseModel):
         )
 
 
+class SearchTracesResult(BaseModel):
+    """Structured response shape for the search_traces tool.
+
+    A real return type (rather than a bare str) lets FastMCP auto-derive a
+    genuinely useful MCP outputSchema/structuredContent instead of the
+    degenerate {"result": "<json string>"} wrap every str-returning tool
+    produces today - see tools/search.py.
+    """
+
+    count: int
+    traces: list[TraceSummary]
+
+
 class SpanQuery(BaseModel):
     """Query parameters for searching individual spans."""
 
@@ -694,3 +707,12 @@ class SpanSummary(BaseModel):
             total_tokens=llm_attrs.total_tokens if llm_attrs else None,
             extra_attributes=span.attributes.extra_attributes or None,
         )
+
+
+class SearchSpansResult(BaseModel):
+    """Structured response shape for the search_spans tool - see
+    SearchTracesResult's docstring for why this is a real model rather than
+    a bare str."""
+
+    count: int
+    spans: list[SpanSummary]

@@ -1,6 +1,5 @@
 """Tests for the search_spans tool."""
 
-import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -69,38 +68,37 @@ class TestSearchSpansHappyPath:
         backend = _fake_backend()
         backend.search_spans.return_value = [_llm_span(), _plain_span()]
 
-        raw = await search_spans(backend, service_name="test-service")
-        result = json.loads(raw)
+        result = await search_spans(backend, service_name="test-service")
 
-        assert result["count"] == 2
-        assert len(result["spans"]) == 2
+        assert result.count == 2
+        assert len(result.spans) == 2
 
     async def test_llm_span_summary_has_gen_ai_fields_populated(self) -> None:
         backend = _fake_backend()
         backend.search_spans.return_value = [_llm_span()]
 
-        raw = await search_spans(backend, gen_ai_system="openai")
-        span = json.loads(raw)["spans"][0]
+        result = await search_spans(backend, gen_ai_system="openai")
+        span = result.spans[0]
 
         # These fields come from SpanSummary.from_span's LLMSpanAttributes
         # extraction, not a passthrough of the mock - real transform logic.
-        assert span["is_llm_span"] is True
-        assert span["gen_ai_system"] == "openai"
-        assert span["total_tokens"] == 300
-        assert span["trace_id"] == "abc123"
-        assert span["span_id"] == "span1"
+        assert span.is_llm_span is True
+        assert span.gen_ai_system == "openai"
+        assert span.total_tokens == 300
+        assert span.trace_id == "abc123"
+        assert span.span_id == "span1"
 
     async def test_non_llm_span_summary_has_null_gen_ai_fields(self) -> None:
         backend = _fake_backend()
         backend.search_spans.return_value = [_plain_span()]
 
-        raw = await search_spans(backend)
-        span = json.loads(raw)["spans"][0]
+        result = await search_spans(backend)
+        span = result.spans[0]
 
-        assert span["is_llm_span"] is False
-        assert span["gen_ai_system"] is None
-        assert span["total_tokens"] is None
-        assert span["parent_span_id"] == "root0"
+        assert span.is_llm_span is False
+        assert span.gen_ai_system is None
+        assert span.total_tokens is None
+        assert span.parent_span_id == "root0"
 
     async def test_passes_query_object_to_backend(self) -> None:
         """The tool must actually build and forward a SpanQuery reflecting
@@ -297,19 +295,18 @@ class TestSearchSpansEdgeCases:
         backend = _fake_backend()
         backend.search_spans.return_value = []
 
-        raw = await search_spans(backend, service_name="nonexistent")
-        result = json.loads(raw)
+        result = await search_spans(backend, service_name="nonexistent")
 
-        assert result == {"count": 0, "spans": []}
+        assert result.count == 0
+        assert result.spans == []
 
     async def test_span_with_no_parent_has_null_parent_span_id(self) -> None:
         backend = _fake_backend()
         backend.search_spans.return_value = [_llm_span(parent_span_id=None)]
 
-        raw = await search_spans(backend)
-        span = json.loads(raw)["spans"][0]
+        result = await search_spans(backend)
 
-        assert span["parent_span_id"] is None
+        assert result.spans[0].parent_span_id is None
 
     async def test_llm_span_missing_usage_attributes_has_null_total_tokens(self) -> None:
         """gen_ai.system present but no usage.* attributes at all - the
@@ -319,21 +316,20 @@ class TestSearchSpansEdgeCases:
         span = _llm_span(attributes=SpanAttributes.model_validate({"gen_ai.system": "anthropic"}))
         backend.search_spans.return_value = [span]
 
-        raw = await search_spans(backend)
-        summary = json.loads(raw)["spans"][0]
+        result = await search_spans(backend)
+        summary = result.spans[0]
 
-        assert summary["is_llm_span"] is True
-        assert summary["gen_ai_system"] == "anthropic"
-        assert summary["total_tokens"] is None
+        assert summary.is_llm_span is True
+        assert summary.gen_ai_system == "anthropic"
+        assert summary.total_tokens is None
 
     async def test_error_status_span_is_preserved_in_summary(self) -> None:
         backend = _fake_backend()
         backend.search_spans.return_value = [_plain_span(status="ERROR")]
 
-        raw = await search_spans(backend, has_error=True)
-        summary = json.loads(raw)["spans"][0]
+        result = await search_spans(backend, has_error=True)
 
-        assert summary["status"] == "ERROR"
+        assert result.spans[0].status == "ERROR"
 
     async def test_default_limit_is_100_when_unspecified(self) -> None:
         backend = _fake_backend()
@@ -357,16 +353,15 @@ class TestSearchSpansEdgeCases:
         )
         backend.search_spans.return_value = [span]
 
-        raw = await search_spans(backend)
-        summary = json.loads(raw)["spans"][0]
+        result = await search_spans(backend)
+        summary = result.spans[0]
 
-        assert summary["extra_attributes"] == {"score.relevance": 0.75, "evaluation.passed": False}
+        assert summary.extra_attributes == {"score.relevance": 0.75, "evaluation.passed": False}
 
     async def test_extra_attributes_is_null_when_none_present(self) -> None:
         backend = _fake_backend()
         backend.search_spans.return_value = [_plain_span()]
 
-        raw = await search_spans(backend)
-        summary = json.loads(raw)["spans"][0]
+        result = await search_spans(backend)
 
-        assert summary["extra_attributes"] is None
+        assert result.spans[0].extra_attributes is None
