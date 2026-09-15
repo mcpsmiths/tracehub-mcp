@@ -3,10 +3,21 @@
 import logging
 import time
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
-from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    RetryError,
+    retry_any,
+    retry_if_exception_type,
+    retry_if_result,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from opentelemetry_mcp.attributes import HealthCheckResponse
 from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceData, TraceQuery
@@ -14,10 +25,59 @@ from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceD
 logger = logging.getLogger(__name__)
 
 # Only genuine transport-level failures - a connection that never completed
-# or a request that timed out - are worth retrying. An HTTP response with a
-# 4xx/5xx status code is a *successful* transport exchange (a response body
-# still came back), not one of these exceptions, so it is never retried here.
+# or a request that timed out - are worth retrying on their own. An HTTP
+# response with a 4xx/5xx status code is a *successful* transport exchange
+# (a response body still came back), not one of these exceptions, so it is
+# never retried via this mechanism. 429 is retried too, but as a *result*
+# condition (see _is_rate_limited) rather than an exception, since asking to
+# slow down and retry is exactly what 429 means - unlike a genuine 4xx/5xx
+# error, which should reach the caller immediately.
 _RETRYABLE_TRANSPORT_EXCEPTIONS = (httpx.ConnectError, httpx.TimeoutException)
+
+_DEFAULT_RETRY_WAIT = wait_exponential(multiplier=1, max=10)
+
+
+def _is_rate_limited(response: Any) -> bool:
+    """True if a completed (non-exception) attempt was a 429 response."""
+    return isinstance(response, httpx.Response) and response.status_code == 429
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Parse a Retry-After header into seconds to wait, if present/valid.
+
+    Handles both the delta-seconds form ("Retry-After: 30") and the
+    HTTP-date form ("Retry-After: Wed, 21 Oct 2026 07:28:00 GMT"), per
+    RFC 9110 - a backend can send either. Returns None (not 0) when the
+    header is absent or unparseable, so the caller can fall back to
+    exponential backoff instead of retrying immediately.
+    """
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
+    try:
+        retry_time: datetime = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if retry_time.tzinfo is None:
+        retry_time = retry_time.replace(tzinfo=UTC)
+    return max((retry_time - datetime.now(UTC)).total_seconds(), 0.0)
+
+
+def _wait_for_retry(retry_state: RetryCallState) -> float:
+    """Respect a 429 response's Retry-After header when present, otherwise
+    fall back to the same exponential backoff used for connect/timeout
+    retries."""
+    outcome = retry_state.outcome
+    if outcome is not None and not outcome.failed:
+        response = outcome.result()
+        if isinstance(response, httpx.Response):
+            retry_after = _retry_after_seconds(response)
+            if retry_after is not None:
+                return retry_after
+    return _DEFAULT_RETRY_WAIT(retry_state)
 
 
 class _RetryingTransport(httpx.AsyncBaseTransport):
@@ -44,8 +104,9 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         """Delegate to the wrapped transport, retrying up to 3 total attempts
-        (with exponential backoff, capped around 10s) on connect/timeout
-        failures only.
+        (with exponential backoff, capped around 10s, or a 429's own
+        Retry-After header when present) on connect/timeout failures or a
+        429 rate-limit response.
         """
 
         # A plain `async def` closure (rather than passing
@@ -59,13 +120,29 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
             return await self._wrapped.handle_async_request(request)
 
         retrying = AsyncRetrying(
-            retry=retry_if_exception_type(_RETRYABLE_TRANSPORT_EXCEPTIONS),
-            wait=wait_exponential(multiplier=1, max=10),
+            retry=retry_any(
+                retry_if_exception_type(_RETRYABLE_TRANSPORT_EXCEPTIONS),
+                retry_if_result(_is_rate_limited),
+            ),
+            wait=_wait_for_retry,
             stop=stop_after_attempt(3),
             reraise=True,
         )
         start = time.perf_counter()
-        response: httpx.Response = await retrying(_send)
+        try:
+            response: httpx.Response = await retrying(_send)
+        except RetryError as exc:
+            # reraise=True only converts RetryError into the *original*
+            # exception when the last attempt failed with one. A 429 is a
+            # successful (non-failed) attempt that still triggered a retry,
+            # so exhausting all attempts on a persistent 429 raises the bare
+            # RetryError instead - confirmed empirically, not assumed - which
+            # would otherwise discard the real response every caller
+            # downstream expects (backends call response.raise_for_status()
+            # themselves). Unwrap it back to that response here.
+            if exc.last_attempt.failed:
+                raise
+            response = exc.last_attempt.result()
         if self._slow_request_threshold_ms is not None:
             duration_ms = (time.perf_counter() - start) * 1000
             if duration_ms > self._slow_request_threshold_ms:
