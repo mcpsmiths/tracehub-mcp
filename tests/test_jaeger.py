@@ -78,8 +78,8 @@ def test_finish_reasons_tag_resolves_to_a_real_list_on_the_span() -> None:
 
 class TestListServicesNullData:
     """A fresh/empty Jaeger instance can return {"data": null} rather than
-    {"data": []} - dict.get's default only applies when the key is absent,
-    not when it's present with an explicit null value."""
+    {"data": []} - the dict.get default only applies when the key is
+    missing, not when the key is present with an explicit null value."""
 
     async def test_null_data_returns_empty_list_not_a_crash(self) -> None:
         backend = JaegerBackend(url="http://localhost:16686")

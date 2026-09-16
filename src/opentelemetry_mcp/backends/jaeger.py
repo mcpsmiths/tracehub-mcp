@@ -243,9 +243,9 @@ class JaegerBackend(BaseBackend):
 
         data = response.json()
         # A fresh/empty Jaeger instance can return {"data": null} rather than
-        # {"data": []} - dict.get's default only applies when the key is
-        # absent, not when it's present with a null value, so `or []` is
-        # needed to avoid iterating over None.
+        # {"data": []} - the dict.get default only applies when the key is
+        # missing, not when the key is present with a null value, so `or []`
+        # is needed to avoid iterating over None.
         services_raw = data.get("data") or []
         return [str(s) for s in services_raw]
 
