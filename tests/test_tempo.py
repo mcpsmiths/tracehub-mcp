@@ -182,13 +182,9 @@ def _raw_otlp_trace_with_kvlist_array_attribute() -> dict[str, Any]:
 def test_span_with_kvlist_array_attribute_produces_real_dicts_not_empty_strings() -> None:
     """Before this fix, each kvlistValue array element silently became ""
     - gen_ai.input.messages/output.messages/retrieval.documents are all
-    exactly this shape (arrays of objects, not arrays of scalars).
-
-    gen_ai.input.messages has no typed SpanAttributes field yet at this
-    phase (added in a later phase) - it lands in extra_attributes via
-    ConfigDict(extra="allow"), which is exactly where this test checks it,
-    proving the parser itself now hands over real dicts rather than
-    testing through a field that doesn't exist yet."""
+    exactly this shape (arrays of objects, not arrays of scalars). Proves
+    the fix all the way through to SpanAttributes' typed
+    gen_ai_input_messages field, not just the raw parser output."""
     backend = TempoBackend(url="http://localhost:3200")
 
     trace = backend._parse_tempo_trace(
@@ -197,7 +193,7 @@ def test_span_with_kvlist_array_attribute_produces_real_dicts_not_empty_strings(
 
     assert trace is not None
     llm_span = next(s for s in trace.spans if s.operation_name == "llm_summarize_cart")
-    assert llm_span.attributes.extra_attributes["gen_ai.input.messages"] == [
+    assert llm_span.attributes.gen_ai_input_messages == [
         {"role": "user", "content": "Hi"},
         {"role": "assistant", "content": "Hello!"},
     ]

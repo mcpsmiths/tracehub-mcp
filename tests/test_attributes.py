@@ -171,6 +171,118 @@ def test_system_instructions_coercion_never_raises(value: object) -> None:
     )
 
 
+def test_input_messages_accepts_a_real_list_unchanged() -> None:
+    messages = [{"role": "user", "parts": [{"type": "text", "content": "Hi"}]}]
+    attrs = SpanAttributes.model_validate({"gen_ai.input.messages": messages})
+    assert attrs.gen_ai_input_messages == messages
+
+
+def test_input_messages_accepts_none() -> None:
+    attrs = SpanAttributes.model_validate({})
+    assert attrs.gen_ai_input_messages is None
+
+
+def test_input_messages_parses_jaeger_style_json_encoded_string() -> None:
+    attrs = SpanAttributes.model_validate(
+        {"gen_ai.input.messages": '[{"role": "user", "content": "Hi"}]'}
+    )
+    assert attrs.gen_ai_input_messages == [{"role": "user", "content": "Hi"}]
+
+
+def test_input_messages_wraps_json_encoded_list_of_non_dict_items() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.input.messages": '["hi", "there"]'})
+    assert attrs.gen_ai_input_messages == [
+        {"role": "unknown", "content": "hi"},
+        {"role": "unknown", "content": "there"},
+    ]
+
+
+def test_input_messages_wraps_unparseable_string_as_single_message() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.input.messages": "hello there"})
+    assert attrs.gen_ai_input_messages == [{"role": "unknown", "content": "hello there"}]
+
+
+def test_input_messages_wraps_json_scalar_string() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.input.messages": "42"})
+    assert attrs.gen_ai_input_messages == [{"role": "unknown", "content": "42"}]
+
+
+@given(
+    value=st.one_of(
+        st.none(),
+        st.text(),
+        st.lists(st.dictionaries(st.text(), st.text())),
+        st.integers(),
+        st.floats(allow_nan=True, allow_infinity=True),
+        st.booleans(),
+        st.dictionaries(st.text(), st.integers()),
+        st.tuples(st.integers(), st.integers()),
+    )
+)
+def test_input_messages_coercion_never_raises(value: object) -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.input.messages": value})
+    result = attrs.gen_ai_input_messages
+    assert result is None or (
+        isinstance(result, list) and all(isinstance(item, dict) for item in result)
+    )
+
+
+def test_output_messages_accepts_a_real_list_unchanged() -> None:
+    messages = [{"role": "assistant", "parts": [{"type": "text", "content": "Hello!"}]}]
+    attrs = SpanAttributes.model_validate({"gen_ai.output.messages": messages})
+    assert attrs.gen_ai_output_messages == messages
+
+
+def test_output_messages_accepts_none() -> None:
+    attrs = SpanAttributes.model_validate({})
+    assert attrs.gen_ai_output_messages is None
+
+
+def test_output_messages_parses_jaeger_style_json_encoded_string() -> None:
+    attrs = SpanAttributes.model_validate(
+        {"gen_ai.output.messages": '[{"role": "assistant", "content": "Hello!"}]'}
+    )
+    assert attrs.gen_ai_output_messages == [{"role": "assistant", "content": "Hello!"}]
+
+
+def test_output_messages_wraps_json_encoded_list_of_non_dict_items() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.output.messages": '["hi", "there"]'})
+    assert attrs.gen_ai_output_messages == [
+        {"role": "unknown", "content": "hi"},
+        {"role": "unknown", "content": "there"},
+    ]
+
+
+def test_output_messages_wraps_unparseable_string_as_single_message() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.output.messages": "hello there"})
+    assert attrs.gen_ai_output_messages == [{"role": "unknown", "content": "hello there"}]
+
+
+def test_output_messages_wraps_json_scalar_string() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.output.messages": "42"})
+    assert attrs.gen_ai_output_messages == [{"role": "unknown", "content": "42"}]
+
+
+@given(
+    value=st.one_of(
+        st.none(),
+        st.text(),
+        st.lists(st.dictionaries(st.text(), st.text())),
+        st.integers(),
+        st.floats(allow_nan=True, allow_infinity=True),
+        st.booleans(),
+        st.dictionaries(st.text(), st.integers()),
+        st.tuples(st.integers(), st.integers()),
+    )
+)
+def test_output_messages_coercion_never_raises(value: object) -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.output.messages": value})
+    result = attrs.gen_ai_output_messages
+    assert result is None or (
+        isinstance(result, list) and all(isinstance(item, dict) for item in result)
+    )
+
+
 def test_conversation_id_parses_via_alias() -> None:
     attrs = SpanAttributes.model_validate({"gen_ai.conversation.id": "conv-123"})
     assert attrs.gen_ai_conversation_id == "conv-123"

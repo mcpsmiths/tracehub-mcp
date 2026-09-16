@@ -52,6 +52,15 @@ class SpanAttributes(BaseModel):
     gen_ai_system_instructions: list[dict[str, str]] | None = Field(
         None, alias="gen_ai.system_instructions"
     )
+    # dict[str, Any], not dict[str, str] like system_instructions above -
+    # OTel message objects are {"role": ..., "parts": [...]}, where "parts"
+    # is itself a nested list, so a str-only value type would reject real
+    # message data. Explicit Any is fine under mypy strict (it forbids
+    # implicit Any, not this).
+    gen_ai_input_messages: list[dict[str, Any]] | None = Field(None, alias="gen_ai.input.messages")
+    gen_ai_output_messages: list[dict[str, Any]] | None = Field(
+        None, alias="gen_ai.output.messages"
+    )
 
     # Conversation and prompt identity (OTel GenAI semconv, Development status)
     gen_ai_conversation_id: str | None = Field(None, alias="gen_ai.conversation.id")
@@ -184,6 +193,37 @@ class SpanAttributes(BaseModel):
         # field - is a strictly smaller loss than the ValidationError raising
         # here would cause, per this function's own never-raise contract
         # above.
+        return None
+
+    @field_validator("gen_ai_input_messages", "gen_ai_output_messages", mode="before")
+    @classmethod
+    def _coerce_messages(cls, value: Any) -> Any:
+        """Coerce input/output messages into a real list before type
+        validation - same never-raise shape as _coerce_system_instructions
+        above, since Jaeger/Tempo can both hand this field a JSON-encoded
+        string instead of a real list."""
+        if value is None or isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value.strip())
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, list):
+                if all(isinstance(item, dict) for item in parsed):
+                    return parsed
+                # A JSON array of non-dict items doesn't conform to
+                # list[dict[str, Any]] - wrap each element so the data
+                # survives instead of raising.
+                return [{"role": "unknown", "content": str(item)} for item in parsed]
+            # Either not valid JSON at all, or valid JSON that isn't a list
+            # - never drop the underlying string data just because it
+            # didn't arrive as a clean JSON array.
+            return [{"role": "unknown", "content": value}]
+        # Any other type (int, dict, bool, ...) can't be interpreted as a
+        # list of messages. Coercing to None - dropping just this field -
+        # is a strictly smaller loss than the ValidationError raising here
+        # would cause, per this function's own never-raise contract above.
         return None
 
     def to_dict(self) -> dict[str, str | int | float | bool]:

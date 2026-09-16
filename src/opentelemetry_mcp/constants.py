@@ -53,6 +53,11 @@ class GenAIAttributes:
     # Response
     GEN_AI_RESPONSE_FINISH_REASONS = "gen_ai.response.finish_reasons"
 
+    # Content (messages, system instructions, retrieval documents) - all
+    # OTLP arrays of nested key-value objects, not scalars.
+    GEN_AI_INPUT_MESSAGES = "gen_ai.input.messages"
+    GEN_AI_OUTPUT_MESSAGES = "gen_ai.output.messages"
+
     # Conversation and prompt identity
     GEN_AI_CONVERSATION_ID = "gen_ai.conversation.id"
     GEN_AI_PROMPT_NAME = "gen_ai.prompt.name"
@@ -100,6 +105,10 @@ class GenAI:
 
     # Response
     RESPONSE_FINISH_REASONS = GenAIAttributes.GEN_AI_RESPONSE_FINISH_REASONS
+
+    # Content (messages, system instructions, retrieval documents)
+    INPUT_MESSAGES = GenAIAttributes.GEN_AI_INPUT_MESSAGES
+    OUTPUT_MESSAGES = GenAIAttributes.GEN_AI_OUTPUT_MESSAGES
 
     # Conversation and prompt identity
     CONVERSATION_ID = GenAIAttributes.GEN_AI_CONVERSATION_ID
