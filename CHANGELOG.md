@@ -1,3 +1,9 @@
+## v0.8.1 (2026-09-16)
+
+### Fix
+
+- **server**: set destructiveHint explicitly on all 17 read-only tools
+
 ## v0.8.0 (2026-09-16)
 
 ### Feat

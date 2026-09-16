@@ -8,6 +8,7 @@ serializes as a JSON-encoded string, never a native list.
 """
 
 from typing import Any
+from unittest.mock import AsyncMock
 
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
 
@@ -73,3 +74,60 @@ def test_finish_reasons_tag_resolves_to_a_real_list_on_the_span() -> None:
     assert trace is not None
     llm_span = next(s for s in trace.spans if s.operation_name == "llm_summarize_cart")
     assert llm_span.attributes.gen_ai_response_finish_reasons == ["stop"]
+
+
+class TestListServicesNullData:
+    """A fresh/empty Jaeger instance can return {"data": null} rather than
+    {"data": []} - dict.get's default only applies when the key is absent,
+    not when it's present with an explicit null value."""
+
+    async def test_null_data_returns_empty_list_not_a_crash(self) -> None:
+        backend = JaegerBackend(url="http://localhost:16686")
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: {"data": None}
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        assert await backend.list_services() == []
+
+    async def test_populated_data_still_resolves_unchanged(self) -> None:
+        backend = JaegerBackend(url="http://localhost:16686")
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: {"data": ["svc-a", "svc-b"]}
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        assert await backend.list_services() == ["svc-a", "svc-b"]
+
+
+class TestGetServiceOperationsNullData:
+    """Same null-data shape as list_services, for the sibling endpoint."""
+
+    async def test_null_data_returns_empty_list_not_a_crash(self) -> None:
+        backend = JaegerBackend(url="http://localhost:16686")
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: {"data": None}
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        assert await backend.get_service_operations("my-service") == []
+
+    async def test_populated_data_still_resolves_unchanged(self) -> None:
+        backend = JaegerBackend(url="http://localhost:16686")
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: {"data": ["chat_completion", "embedding"]}
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        assert await backend.get_service_operations("my-service") == [
+            "chat_completion",
+            "embedding",
+        ]

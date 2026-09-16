@@ -10,7 +10,7 @@
 [![mcpsmiths/tracehub-mcp MCP server](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp/badges/score.svg)](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp)
 [![M8ven Score](https://m8ven.ai/badge/mcp/mcpsmiths/tracehub-mcp)](https://m8ven.ai/mcp/mcpsmiths/tracehub-mcp)
 
-Also listed on the [official MCP registry](https://registry.modelcontextprotocol.io/v0/servers?search=tracehub) as `io.github.mcpsmiths/tracehub-mcp`.
+Also listed on the [official MCP registry](https://registry.modelcontextprotocol.io/v0/servers/io.github.mcpsmiths%2Ftracehub-mcp/versions) as `io.github.mcpsmiths/tracehub-mcp` (the registry's own `?search=` endpoint can surface an outdated version first; this exact-name endpoint always reflects the current `isLatest` release).
 
 **Give your AI assistant a direct line into your observability backend.** tracehub-mcp is an MCP (Model Context Protocol) server that lets Claude, Cursor, Windsurf, Gemini CLI, or any MCP client query OpenTelemetry traces from your LLM/GenAI application and reason about them — find expensive calls, debug errors, compare model performance, track token usage — without you copy-pasting trace JSON into a chat window.
 
@@ -572,7 +572,7 @@ Parameters: `service_name`, `operation_name`, `start_time`/`end_time` (ISO 8601)
 { "trace_id": "abc123def456" }
 ```
 
-Returns the full trace tree: all spans with attributes, parsed OpenTelemetry `gen_ai.*` data for LLM spans, per-span token usage, and error information.
+Returns the full trace tree: all spans with attributes, parsed OpenTelemetry `gen_ai.*` data for LLM spans, per-span token usage, error information, and each span's raw `events` (e.g. `gen_ai.evaluation.result`, or any other instrumentation-emitted event — not filtered to a fixed set of names).
 
 **`get_llm_usage`**
 
