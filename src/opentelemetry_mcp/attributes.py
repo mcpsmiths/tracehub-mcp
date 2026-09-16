@@ -61,6 +61,9 @@ class SpanAttributes(BaseModel):
     gen_ai_output_messages: list[dict[str, Any]] | None = Field(
         None, alias="gen_ai.output.messages"
     )
+    gen_ai_retrieval_documents: list[dict[str, Any]] | None = Field(
+        None, alias="gen_ai.retrieval.documents"
+    )
 
     # Conversation and prompt identity (OTel GenAI semconv, Development status)
     gen_ai_conversation_id: str | None = Field(None, alias="gen_ai.conversation.id")
@@ -224,6 +227,25 @@ class SpanAttributes(BaseModel):
         # list of messages. Coercing to None - dropping just this field -
         # is a strictly smaller loss than the ValidationError raising here
         # would cause, per this function's own never-raise contract above.
+        return None
+
+    @field_validator("gen_ai_retrieval_documents", mode="before")
+    @classmethod
+    def _coerce_retrieval_documents(cls, value: Any) -> Any:
+        """Coerce retrieval documents into a real list before type
+        validation - same never-raise shape as _coerce_messages above."""
+        if value is None or isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value.strip())
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+            if isinstance(parsed, list):
+                if all(isinstance(item, dict) for item in parsed):
+                    return parsed
+                return [{"content": str(item)} for item in parsed]
+            return [{"content": value}]
         return None
 
     def to_dict(self) -> dict[str, str | int | float | bool]:

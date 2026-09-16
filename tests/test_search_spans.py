@@ -358,6 +358,30 @@ class TestSearchSpansEdgeCases:
 
         assert summary.extra_attributes == {"score.relevance": 0.75, "evaluation.passed": False}
 
+    async def test_openinference_retriever_span_attributes_are_surfaced(self) -> None:
+        """Same non-gap confirmation as above, for OpenInference's
+        RETRIEVER span-kind flat scalar attributes."""
+        backend = _fake_backend()
+        span = _plain_span(
+            attributes=SpanAttributes.model_validate(
+                {
+                    "openinference.span.kind": "RETRIEVER",
+                    "document.id": "doc-42",
+                    "document.score": 0.87,
+                }
+            )
+        )
+        backend.search_spans.return_value = [span]
+
+        result = await search_spans(backend)
+        summary = result.spans[0]
+
+        assert summary.extra_attributes == {
+            "openinference.span.kind": "RETRIEVER",
+            "document.id": "doc-42",
+            "document.score": 0.87,
+        }
+
     async def test_extra_attributes_is_null_when_none_present(self) -> None:
         backend = _fake_backend()
         backend.search_spans.return_value = [_plain_span()]

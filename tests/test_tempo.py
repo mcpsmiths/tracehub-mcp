@@ -10,6 +10,7 @@ elements) - not a Python list handed directly to the parser.
 import base64
 from typing import Any
 
+from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.tempo import TempoBackend
 
 FAKE_API_KEY = "dd-api1"
@@ -291,6 +292,37 @@ def test_event_attribute_containing_kvlist_array_is_json_encoded_not_raising() -
     event = llm_span.events[0]
     assert event.name == "gen_ai.evaluation.result"
     assert event.attributes["gen_ai.evaluation.details"] == '[{"name": "relevance"}]'
+
+
+def test_gen_ai_retrieval_documents_kvlist_array_survives_end_to_end() -> None:
+    """Same kvlist-array shape as gen_ai.input.messages, proving the Phase
+    1 parser fix generalizes to gen_ai.retrieval.documents too, all the
+    way through to its own typed SpanAttributes field."""
+    backend = TempoBackend(url="http://localhost:3200")
+    raw_attrs = [
+        {
+            "key": "gen_ai.retrieval.documents",
+            "value": {
+                "arrayValue": {
+                    "values": [
+                        {
+                            "kvlistValue": {
+                                "values": [
+                                    {"key": "id", "value": {"stringValue": "doc-1"}},
+                                    {"key": "score", "value": {"doubleValue": 0.9}},
+                                ]
+                            }
+                        }
+                    ]
+                }
+            },
+        }
+    ]
+
+    parsed = backend._parse_otlp_attributes(raw_attrs)
+    attrs = SpanAttributes.model_validate(parsed)
+
+    assert attrs.gen_ai_retrieval_documents == [{"id": "doc-1", "score": 0.9}]
 
 
 def test_bearer_auth_used_when_no_instance_id_set() -> None:

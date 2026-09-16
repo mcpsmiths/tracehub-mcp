@@ -57,6 +57,7 @@ class GenAIAttributes:
     # OTLP arrays of nested key-value objects, not scalars.
     GEN_AI_INPUT_MESSAGES = "gen_ai.input.messages"
     GEN_AI_OUTPUT_MESSAGES = "gen_ai.output.messages"
+    GEN_AI_RETRIEVAL_DOCUMENTS = "gen_ai.retrieval.documents"
 
     # Conversation and prompt identity
     GEN_AI_CONVERSATION_ID = "gen_ai.conversation.id"
@@ -109,6 +110,7 @@ class GenAI:
     # Content (messages, system instructions, retrieval documents)
     INPUT_MESSAGES = GenAIAttributes.GEN_AI_INPUT_MESSAGES
     OUTPUT_MESSAGES = GenAIAttributes.GEN_AI_OUTPUT_MESSAGES
+    RETRIEVAL_DOCUMENTS = GenAIAttributes.GEN_AI_RETRIEVAL_DOCUMENTS
 
     # Conversation and prompt identity
     CONVERSATION_ID = GenAIAttributes.GEN_AI_CONVERSATION_ID

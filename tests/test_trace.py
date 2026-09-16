@@ -241,3 +241,26 @@ async def test_get_trace_already_surfaces_score_and_evaluation_attributes() -> N
     attributes = result["spans"][0]["attributes"]
     assert attributes["score.relevance"] == 0.87
     assert attributes["evaluation.passed"] is True
+
+
+async def test_get_trace_already_surfaces_openinference_retriever_span_attributes() -> None:
+    """Same non-gap confirmation as above, for OpenInference's RETRIEVER
+    span-kind attributes - flat scalars, so they already reach get_trace's
+    output via to_dict()'s extra="allow" passthrough with zero new code."""
+    backend = _fake_backend()
+    span = _make_span(
+        span_id="a",
+        attrs={
+            "openinference.span.kind": "RETRIEVER",
+            "document.id": "doc-42",
+            "document.score": 0.87,
+        },
+    )
+    backend.get_trace.return_value = _make_trace([span])
+
+    result = json.loads(await get_trace(backend, "t1"))
+
+    attributes = result["spans"][0]["attributes"]
+    assert attributes["openinference.span.kind"] == "RETRIEVER"
+    assert attributes["document.id"] == "doc-42"
+    assert attributes["document.score"] == 0.87

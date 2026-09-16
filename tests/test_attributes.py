@@ -283,6 +283,82 @@ def test_output_messages_coercion_never_raises(value: object) -> None:
     )
 
 
+def test_retrieval_documents_accepts_a_real_list_unchanged() -> None:
+    documents = [{"id": "doc-1", "score": 0.9}]
+    attrs = SpanAttributes.model_validate({"gen_ai.retrieval.documents": documents})
+    assert attrs.gen_ai_retrieval_documents == documents
+
+
+def test_retrieval_documents_accepts_none() -> None:
+    attrs = SpanAttributes.model_validate({})
+    assert attrs.gen_ai_retrieval_documents is None
+
+
+def test_retrieval_documents_parses_jaeger_style_json_encoded_string() -> None:
+    attrs = SpanAttributes.model_validate(
+        {"gen_ai.retrieval.documents": '[{"id": "doc-1", "score": 0.9}]'}
+    )
+    assert attrs.gen_ai_retrieval_documents == [{"id": "doc-1", "score": 0.9}]
+
+
+def test_retrieval_documents_wraps_json_encoded_list_of_non_dict_items() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.retrieval.documents": '["doc text"]'})
+    assert attrs.gen_ai_retrieval_documents == [{"content": "doc text"}]
+
+
+def test_retrieval_documents_wraps_unparseable_string_as_single_document() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.retrieval.documents": "raw text"})
+    assert attrs.gen_ai_retrieval_documents == [{"content": "raw text"}]
+
+
+def test_retrieval_documents_wraps_json_scalar_string() -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.retrieval.documents": "42"})
+    assert attrs.gen_ai_retrieval_documents == [{"content": "42"}]
+
+
+@given(
+    value=st.one_of(
+        st.none(),
+        st.text(),
+        st.lists(st.dictionaries(st.text(), st.text())),
+        st.integers(),
+        st.floats(allow_nan=True, allow_infinity=True),
+        st.booleans(),
+        st.dictionaries(st.text(), st.integers()),
+        st.tuples(st.integers(), st.integers()),
+    )
+)
+def test_retrieval_documents_coercion_never_raises(value: object) -> None:
+    attrs = SpanAttributes.model_validate({"gen_ai.retrieval.documents": value})
+    result = attrs.gen_ai_retrieval_documents
+    assert result is None or (
+        isinstance(result, list) and all(isinstance(item, dict) for item in result)
+    )
+
+
+def test_extra_attributes_surfaces_openinference_retriever_span_shaped_fields() -> None:
+    """OpenInference (Arize's separate spec) defines its own RETRIEVER span
+    kind with flat scalar attributes - distinct from OTel's own
+    gen_ai.retrieval.documents (a nested list-of-objects attribute, typed
+    above). These are plain scalars, so they already pass through today
+    via extra_attributes with zero new code - this proves that, rather
+    than assuming it."""
+    attrs = SpanAttributes.model_validate(
+        {
+            "openinference.span.kind": "RETRIEVER",
+            "document.id": "doc-42",
+            "document.score": 0.87,
+            "document.content": "Paris is the capital of France.",
+        }
+    )
+    assert attrs.extra_attributes == {
+        "openinference.span.kind": "RETRIEVER",
+        "document.id": "doc-42",
+        "document.score": 0.87,
+        "document.content": "Paris is the capital of France.",
+    }
+
+
 def test_conversation_id_parses_via_alias() -> None:
     attrs = SpanAttributes.model_validate({"gen_ai.conversation.id": "conv-123"})
     assert attrs.gen_ai_conversation_id == "conv-123"
