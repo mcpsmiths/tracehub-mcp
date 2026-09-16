@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery
+from opentelemetry_mcp.pricing.lookup import ModelPriceEntry
 from opentelemetry_mcp.tools.usage import get_llm_usage
 
 
@@ -148,24 +149,28 @@ class TestGetLlmUsageHappyPath:
         result = await get_llm_usage(backend)
         parsed = json.loads(result)
 
-        assert parsed["summary"] == {
-            "total_requests": 2,
-            "total_prompt_tokens": 300,
-            "total_completion_tokens": 150,
-            "total_tokens": 450,
-        }
-        assert parsed["by_model"]["gpt-4"] == {
-            "requests": 1,
-            "prompt_tokens": 100,
-            "completion_tokens": 50,
-            "total_tokens": 150,
-        }
-        assert parsed["by_model"]["claude-3"] == {
-            "requests": 1,
-            "prompt_tokens": 200,
-            "completion_tokens": 100,
-            "total_tokens": 300,
-        }
+        # Cost fields use the real vendored pricing table here (this test
+        # predates cost attribution and isn't about exact dollar amounts -
+        # see TestGetLlmUsageCostAttribution below for hermetic, injected-
+        # fixture cost assertions), so only shape/type is checked, not the
+        # exact resolved price, which would make this test fragile to
+        # future pricing-table refreshes.
+        summary = parsed["summary"]
+        assert summary["total_requests"] == 2
+        assert summary["total_prompt_tokens"] == 300
+        assert summary["total_completion_tokens"] == 150
+        assert summary["total_tokens"] == 450
+        assert isinstance(summary["total_cost_usd"], float)
+        assert isinstance(summary["cost_usd_is_partial"], bool)
+
+        assert parsed["by_model"]["gpt-4"]["requests"] == 1
+        assert parsed["by_model"]["gpt-4"]["prompt_tokens"] == 100
+        assert parsed["by_model"]["gpt-4"]["completion_tokens"] == 50
+        assert parsed["by_model"]["gpt-4"]["total_tokens"] == 150
+        assert parsed["by_model"]["claude-3"]["requests"] == 1
+        assert parsed["by_model"]["claude-3"]["prompt_tokens"] == 200
+        assert parsed["by_model"]["claude-3"]["completion_tokens"] == 100
+        assert parsed["by_model"]["claude-3"]["total_tokens"] == 300
         assert parsed["by_service"]["svc-a"]["requests"] == 1
         assert parsed["by_service"]["svc-b"]["requests"] == 1
 
@@ -198,6 +203,8 @@ class TestGetLlmUsageHappyPath:
             "total_prompt_tokens": 0,
             "total_completion_tokens": 0,
             "total_tokens": 0,
+            "total_cost_usd": 0.0,
+            "cost_usd_is_partial": False,
         }
         assert parsed["by_model"] == {}
         assert parsed["by_service"] == {}
@@ -314,6 +321,8 @@ class TestGetLlmUsageEdgeCases:
             "total_prompt_tokens": 0,
             "total_completion_tokens": 0,
             "total_tokens": 0,
+            "total_cost_usd": 0.0,
+            "cost_usd_is_partial": False,
         }
 
     async def test_span_with_no_model_name_falls_back_to_unknown_bucket(self) -> None:
@@ -345,6 +354,126 @@ class TestGetLlmUsageEdgeCases:
 
         assert set(parsed["by_model"].keys()) == {"gpt-4", "gpt-3.5"}
         assert parsed["by_service"]["svc-a"]["requests"] == 2
+
+
+def _fixture_prices() -> dict[str, ModelPriceEntry]:
+    return {
+        "gpt-4": ModelPriceEntry(
+            input_cost_per_token=0.00003, output_cost_per_token=0.00006, litellm_provider="openai"
+        ),
+        "claude-3": ModelPriceEntry(
+            input_cost_per_token=0.000015,
+            output_cost_per_token=0.000075,
+            litellm_provider="anthropic",
+        ),
+    }
+
+
+class TestGetLlmUsageCostAttribution:
+    """Cost attribution end-to-end through get_llm_usage. Patches the
+    pricing loader with an injected fixture table, so these assertions
+    stay hermetic and immune to future pricing-table refreshes."""
+
+    async def test_total_cost_usd_reflects_priced_models(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "opentelemetry_mcp.pricing.lookup._load_prices", lambda: _fixture_prices()
+        )
+        backend = _mock_backend()
+        span = _llm_span(
+            trace_id="t1",
+            span_id="s1",
+            service_name="svc-a",
+            request_model="gpt-4",
+            prompt_tokens=1000,
+            completion_tokens=500,
+        )
+        backend.search_traces.return_value = [_trace("t1", "svc-a", [span])]
+
+        result = await get_llm_usage(backend)
+        parsed = json.loads(result)
+
+        expected = round(1000 * 0.00003 + 500 * 0.00006, 6)
+        assert parsed["summary"]["total_cost_usd"] == expected
+        assert parsed["summary"]["cost_usd_is_partial"] is False
+        assert parsed["by_model"]["gpt-4"]["cost_usd"] == expected
+        assert parsed["by_service"]["svc-a"]["cost_usd"] == expected
+
+    async def test_unpriced_model_flips_partial_flag_but_keeps_priced_total(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "opentelemetry_mcp.pricing.lookup._load_prices", lambda: _fixture_prices()
+        )
+        backend = _mock_backend()
+        priced_span = _llm_span(
+            trace_id="t1",
+            span_id="s1",
+            service_name="svc-a",
+            request_model="gpt-4",
+            prompt_tokens=1000,
+            completion_tokens=500,
+        )
+        unpriced_span = _llm_span(
+            trace_id="t2",
+            span_id="s2",
+            service_name="svc-a",
+            request_model="some-brand-new-model",
+            prompt_tokens=100,
+            completion_tokens=50,
+        )
+        backend.search_traces.return_value = [
+            _trace("t1", "svc-a", [priced_span]),
+            _trace("t2", "svc-a", [unpriced_span]),
+        ]
+
+        result = await get_llm_usage(backend)
+        parsed = json.loads(result)
+
+        expected = round(1000 * 0.00003 + 500 * 0.00006, 6)
+        assert parsed["summary"]["total_cost_usd"] == expected
+        assert parsed["summary"]["cost_usd_is_partial"] is True
+        assert parsed["by_model"]["gpt-4"]["cost_usd_is_partial"] is False
+        assert parsed["by_model"]["some-brand-new-model"]["cost_usd_is_partial"] is True
+
+    async def test_multiple_models_get_independent_costs_in_by_model_breakdown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "opentelemetry_mcp.pricing.lookup._load_prices", lambda: _fixture_prices()
+        )
+        backend = _mock_backend()
+        gpt4_span = _llm_span(
+            trace_id="t1",
+            span_id="s1",
+            service_name="svc-a",
+            request_model="gpt-4",
+            prompt_tokens=1000,
+            completion_tokens=500,
+        )
+        claude_span = _llm_span(
+            trace_id="t2",
+            span_id="s2",
+            service_name="svc-a",
+            gen_ai_system="anthropic",
+            request_model="claude-3",
+            prompt_tokens=1000,
+            completion_tokens=500,
+        )
+        backend.search_traces.return_value = [
+            _trace("t1", "svc-a", [gpt4_span]),
+            _trace("t2", "svc-a", [claude_span]),
+        ]
+
+        result = await get_llm_usage(backend)
+        parsed = json.loads(result)
+
+        gpt4_cost = round(1000 * 0.00003 + 500 * 0.00006, 6)
+        claude_cost = round(1000 * 0.000015 + 500 * 0.000075, 6)
+        assert parsed["by_model"]["gpt-4"]["cost_usd"] == gpt4_cost
+        assert parsed["by_model"]["claude-3"]["cost_usd"] == claude_cost
+        assert parsed["summary"]["total_cost_usd"] == round(gpt4_cost + claude_cost, 6)
 
 
 class TestGetLlmUsageLimitBoundary:

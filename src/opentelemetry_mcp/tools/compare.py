@@ -19,7 +19,20 @@ _SUMMARY_FIELDS = (
     "total_prompt_tokens",
     "total_completion_tokens",
     "total_tokens",
+    "total_cost_usd",
 )
+
+
+def compute_delta(value_a: float, value_b: float) -> dict[str, Any]:
+    """(value_b - value_a) plus percent change relative to value_a.
+
+    Exported so other composition-over-get_llm_usage tools (e.g.
+    investigate_cost_spike) can reuse the same delta math instead of
+    re-deriving this formula.
+    """
+    change = value_b - value_a
+    percent_change = round((change / value_a) * 100, 2) if value_a else None
+    return {"change": change, "percent_change": percent_change}
 
 
 def _diff_summary(summary_a: dict[str, Any], summary_b: dict[str, Any]) -> dict[str, Any]:
@@ -28,9 +41,7 @@ def _diff_summary(summary_a: dict[str, Any], summary_b: dict[str, Any]) -> dict[
     for field in _SUMMARY_FIELDS:
         value_a = summary_a.get(field, 0) or 0
         value_b = summary_b.get(field, 0) or 0
-        change = value_b - value_a
-        percent_change = round((change / value_a) * 100, 2) if value_a else None
-        delta[field] = {"change": change, "percent_change": percent_change}
+        delta[field] = compute_delta(value_a, value_b)
     return delta
 
 

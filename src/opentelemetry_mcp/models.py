@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .attributes import SpanAttributes, SpanEvent
 from .constants import Fields, GenAI, Service
+from .pricing.lookup import compute_cost_usd
 
 
 class FilterOperator(StrEnum):
@@ -276,6 +277,8 @@ class LLMSpanAttributes(BaseModel):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
 
     # Prompts and completions (abbreviated in summary)
     prompt_preview: str | None = None
@@ -367,6 +370,12 @@ class LLMSpanAttributes(BaseModel):
         if not system:
             return None
 
+        # Anthropic prompt-caching token counts (not typed SpanAttributes
+        # fields - read generically like finish_reasons above, since these
+        # only matter to cost calculation, not to is_llm_span/filtering).
+        cache_creation_tokens = attrs.get(GenAI.USAGE_CACHE_CREATION_INPUT_TOKENS)
+        cache_read_tokens = attrs.get(GenAI.USAGE_CACHE_READ_INPUT_TOKENS)
+
         return cls(
             system=system,
             request_model=attrs.gen_ai_request_model,
@@ -380,6 +389,12 @@ class LLMSpanAttributes(BaseModel):
             prompt_tokens=prompt_tokens if prompt_tokens else None,
             completion_tokens=completion_tokens if completion_tokens else None,
             total_tokens=total_tokens if total_tokens else None,
+            cache_creation_input_tokens=(
+                cache_creation_tokens if isinstance(cache_creation_tokens, int) else None
+            ),
+            cache_read_input_tokens=(
+                cache_read_tokens if isinstance(cache_read_tokens, int) else None
+            ),
             prompt_preview=prompt_preview,
             completion_preview=completion_preview,
         )
@@ -392,6 +407,12 @@ class UsageMetrics(BaseModel):
     completion_tokens: int = 0
     total_tokens: int = 0
     request_count: int = 0
+    cost_usd: float = 0.0
+    # True once any span's model price could not be resolved - the pricing
+    # table is a best-effort vendored approximation (see pricing/lookup.py),
+    # so cost_usd is always an honest floor when this is set, never silently
+    # presented as an exact total.
+    cost_usd_is_partial: bool = False
 
     # Breakdown by model
     by_model: dict[str, "UsageMetrics"] = Field(default_factory=dict)
@@ -400,29 +421,53 @@ class UsageMetrics(BaseModel):
     by_service: dict[str, "UsageMetrics"] = Field(default_factory=dict)
 
     def add_span(self, span: SpanData, llm_attrs: LLMSpanAttributes) -> None:
-        """Add token usage from a span."""
-        self.prompt_tokens += llm_attrs.prompt_tokens or 0
-        self.completion_tokens += llm_attrs.completion_tokens or 0
-        self.total_tokens += llm_attrs.total_tokens or 0
+        """Add token usage (and, when resolvable, cost) from a span."""
+        prompt_tokens = llm_attrs.prompt_tokens or 0
+        completion_tokens = llm_attrs.completion_tokens or 0
+        total_tokens = llm_attrs.total_tokens or 0
+        model = llm_attrs.response_model or llm_attrs.request_model or "unknown"
+        span_cost = compute_cost_usd(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            model=model if model != "unknown" else None,
+            provider=llm_attrs.system,
+            cache_read_tokens=llm_attrs.cache_read_input_tokens or 0,
+            cache_creation_tokens=llm_attrs.cache_creation_input_tokens or 0,
+        )
+
+        self.prompt_tokens += prompt_tokens
+        self.completion_tokens += completion_tokens
+        self.total_tokens += total_tokens
         self.request_count += 1
+        if span_cost is None:
+            self.cost_usd_is_partial = True
+        else:
+            self.cost_usd += span_cost
 
         # Add to model breakdown
-        model = llm_attrs.response_model or llm_attrs.request_model or "unknown"
         if model not in self.by_model:
             self.by_model[model] = UsageMetrics()
-        self.by_model[model].prompt_tokens += llm_attrs.prompt_tokens or 0
-        self.by_model[model].completion_tokens += llm_attrs.completion_tokens or 0
-        self.by_model[model].total_tokens += llm_attrs.total_tokens or 0
+        self.by_model[model].prompt_tokens += prompt_tokens
+        self.by_model[model].completion_tokens += completion_tokens
+        self.by_model[model].total_tokens += total_tokens
         self.by_model[model].request_count += 1
+        if span_cost is None:
+            self.by_model[model].cost_usd_is_partial = True
+        else:
+            self.by_model[model].cost_usd += span_cost
 
         # Add to service breakdown
         service = span.service_name
         if service not in self.by_service:
             self.by_service[service] = UsageMetrics()
-        self.by_service[service].prompt_tokens += llm_attrs.prompt_tokens or 0
-        self.by_service[service].completion_tokens += llm_attrs.completion_tokens or 0
-        self.by_service[service].total_tokens += llm_attrs.total_tokens or 0
+        self.by_service[service].prompt_tokens += prompt_tokens
+        self.by_service[service].completion_tokens += completion_tokens
+        self.by_service[service].total_tokens += total_tokens
         self.by_service[service].request_count += 1
+        if span_cost is None:
+            self.by_service[service].cost_usd_is_partial = True
+        else:
+            self.by_service[service].cost_usd += span_cost
 
 
 class TraceData(BaseModel):

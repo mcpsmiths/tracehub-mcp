@@ -9,3 +9,9 @@ not by copying files into a fresh repository).
 Substantial modifications and additions — including a Datadog backend, and
 additional observability backends and capabilities planned beyond the
 original Jaeger/Tempo/Traceloop support — are Copyright (c) 2026 sairam0424.
+
+src/opentelemetry_mcp/pricing/model_prices.json is a vendored copy of
+model_prices_and_context_window.json from litellm
+(https://github.com/BerriAI/litellm), licensed under the MIT License.
+Copyright (c) BerriAI. See src/opentelemetry_mcp/pricing/README.md for the
+refresh process.

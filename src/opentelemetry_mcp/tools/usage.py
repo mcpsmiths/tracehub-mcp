@@ -82,6 +82,8 @@ async def get_llm_usage(
             "total_prompt_tokens": metrics.prompt_tokens,
             "total_completion_tokens": metrics.completion_tokens,
             "total_tokens": metrics.total_tokens,
+            "total_cost_usd": round(metrics.cost_usd, 6),
+            "cost_usd_is_partial": metrics.cost_usd_is_partial,
         },
         "by_model": {},
         "by_service": {},
@@ -95,6 +97,8 @@ async def get_llm_usage(
             "prompt_tokens": model_metrics.prompt_tokens,
             "completion_tokens": model_metrics.completion_tokens,
             "total_tokens": model_metrics.total_tokens,
+            "cost_usd": round(model_metrics.cost_usd, 6),
+            "cost_usd_is_partial": model_metrics.cost_usd_is_partial,
         }
 
     # Add service breakdown
@@ -105,6 +109,8 @@ async def get_llm_usage(
             "prompt_tokens": service_metrics.prompt_tokens,
             "completion_tokens": service_metrics.completion_tokens,
             "total_tokens": service_metrics.total_tokens,
+            "cost_usd": round(service_metrics.cost_usd, 6),
+            "cost_usd_is_partial": service_metrics.cost_usd_is_partial,
         }
 
     return json.dumps(result, indent=2, default=str)
