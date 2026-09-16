@@ -8,6 +8,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 [![mcpsmiths/tracehub-mcp MCP server](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp/badges/score.svg)](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp)
+[![M8ven Score](https://m8ven.ai/badge/mcp/mcpsmiths/tracehub-mcp)](https://m8ven.ai/mcp/mcpsmiths/tracehub-mcp)
 
 Also listed on the [official MCP registry](https://registry.modelcontextprotocol.io/v0/servers?search=tracehub) as `io.github.mcpsmiths/tracehub-mcp`.
 
