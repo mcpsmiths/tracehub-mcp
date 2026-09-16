@@ -486,6 +486,69 @@ class TestToolWrappers:
         ):
             await server.list_llm_tools_tool()
 
+    async def test_investigate_cost_spike_passes_arguments_through(self) -> None:
+        await self._set_backend()
+        with patch.object(
+            server.investigate, "investigate_cost_spike", AsyncMock(return_value="{}")
+        ) as mocked:
+            await server.investigate_cost_spike(
+                recent_start="2024-01-08T00:00:00Z",
+                recent_end="2024-01-15T00:00:00Z",
+                service_name="svc",
+                top_n=10,
+            )
+
+        _, kwargs = mocked.call_args
+        assert kwargs["recent_start"] == "2024-01-08T00:00:00Z"
+        assert kwargs["recent_end"] == "2024-01-15T00:00:00Z"
+        assert kwargs["service_name"] == "svc"
+        assert kwargs["top_n"] == 10
+
+    async def test_investigate_cost_spike_exception_propagates(self) -> None:
+        await self._set_backend()
+        with (
+            patch.object(
+                server.investigate,
+                "investigate_cost_spike",
+                AsyncMock(side_effect=ValueError("bad window")),
+            ),
+            pytest.raises(ValueError, match="bad window"),
+        ):
+            await server.investigate_cost_spike(
+                recent_start="2024-01-08T00:00:00Z", recent_end="2024-01-15T00:00:00Z"
+            )
+
+    async def test_investigate_error_spike_passes_arguments_through(self) -> None:
+        await self._set_backend()
+        with patch.object(
+            server.investigate, "investigate_error_spike", AsyncMock(return_value="{}")
+        ) as mocked:
+            await server.investigate_error_spike(
+                recent_start="2024-01-08T00:00:00Z",
+                recent_end="2024-01-15T00:00:00Z",
+                min_error_count_increase=5,
+                rate_multiplier_threshold=3.0,
+            )
+
+        _, kwargs = mocked.call_args
+        assert kwargs["recent_start"] == "2024-01-08T00:00:00Z"
+        assert kwargs["min_error_count_increase"] == 5
+        assert kwargs["rate_multiplier_threshold"] == 3.0
+
+    async def test_investigate_error_spike_exception_propagates(self) -> None:
+        await self._set_backend()
+        with (
+            patch.object(
+                server.investigate,
+                "investigate_error_spike",
+                AsyncMock(side_effect=Exception("boom")),
+            ),
+            pytest.raises(Exception, match="boom"),
+        ):
+            await server.investigate_error_spike(
+                recent_start="2024-01-08T00:00:00Z", recent_end="2024-01-15T00:00:00Z"
+            )
+
     async def test_get_backend_failure_propagates(self) -> None:
         """If _get_backend itself raises (e.g. config not set), the wrapper
         must let it propagate through _handle_tool_error (logged, then

@@ -27,6 +27,7 @@ from opentelemetry_mcp.tools import (
     compare,
     errors,
     expensive_traces,
+    investigate,
     list_llm_tools,
     list_models,
     model_stats,
@@ -587,6 +588,121 @@ async def compare_time_windows(
 
 
 @mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def investigate_cost_spike(
+    recent_start: str,
+    recent_end: str,
+    baseline_start: str | None = None,
+    baseline_end: str | None = None,
+    service_name: str | None = None,
+    gen_ai_system: str | None = None,
+    gen_ai_request_model: str | None = None,
+    gen_ai_response_model: str | None = None,
+    limit: int = 1000,
+    top_n: int = 5,
+) -> str:
+    """Investigate an LLM cost spike: compare a recent window against a
+    baseline and rank which models/services contributed most to the change.
+
+    On-request/pull-based analysis, not a push alert - mirrors SigNoz's own
+    "investigate telemetry cost" skill. Call this when you suspect (or want
+    to check for) a cost increase, rather than polling get_llm_usage by hand.
+
+    Args:
+        recent_start: Recent window start time in ISO 8601 format
+        recent_end: Recent window end time in ISO 8601 format
+        baseline_start: Baseline window start (ISO 8601). If omitted along
+            with baseline_end, auto-computed as the same duration
+            immediately preceding recent_start.
+        baseline_end: Baseline window end (ISO 8601)
+        service_name: Filter by service name (applied to both windows)
+        gen_ai_system: Filter by LLM provider (applied to both windows)
+        gen_ai_request_model: Filter by requested model name (applied to both windows)
+        gen_ai_response_model: Filter by actual model used (applied to both windows)
+        limit: Maximum number of traces to analyze per window (default: 1000)
+        top_n: Maximum ranked contributors to return per breakdown (default: 5, max: 50)
+
+    Returns:
+        JSON string with recent/baseline usage, a summary_delta, and
+        top_model_contributors/top_service_contributors ranked by cost change
+    """
+    try:
+        backend = await _get_backend()
+        result = await investigate.investigate_cost_spike(
+            backend,
+            recent_start=recent_start,
+            recent_end=recent_end,
+            baseline_start=baseline_start,
+            baseline_end=baseline_end,
+            service_name=service_name,
+            gen_ai_system=gen_ai_system,
+            gen_ai_request_model=gen_ai_request_model,
+            gen_ai_response_model=gen_ai_response_model,
+            limit=_clamp_limit(limit),
+            top_n=top_n,
+        )
+        return result
+    except Exception as e:
+        return _handle_tool_error("investigate_cost_spike", e)
+
+
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def investigate_error_spike(
+    recent_start: str,
+    recent_end: str,
+    baseline_start: str | None = None,
+    baseline_end: str | None = None,
+    service_name: str | None = None,
+    limit: int = 1000,
+    top_n: int = 5,
+    min_error_count_increase: int = 3,
+    rate_multiplier_threshold: float = 2.0,
+) -> str:
+    """Investigate an error-rate spike: compare a recent window against a
+    baseline and rank which services/models/error types contributed most.
+
+    is_spike requires both an absolute error-count floor and a relative
+    rate-multiplier to hold, so a tiny sample (e.g. 1 error becoming 2)
+    doesn't read as a spike.
+
+    Args:
+        recent_start: Recent window start time in ISO 8601 format
+        recent_end: Recent window end time in ISO 8601 format
+        baseline_start: Baseline window start (ISO 8601). If omitted along
+            with baseline_end, auto-computed as the same duration
+            immediately preceding recent_start.
+        baseline_end: Baseline window end (ISO 8601)
+        service_name: Filter by service name (applied to both windows)
+        limit: Maximum number of traces to analyze per window (default: 1000)
+        top_n: Maximum ranked contributors to return per breakdown (default: 5, max: 50)
+        min_error_count_increase: Minimum absolute error-count increase to
+            count as a spike (default: 3)
+        rate_multiplier_threshold: Minimum error-rate multiplier (recent /
+            baseline) to count as a spike (default: 2.0)
+
+    Returns:
+        JSON string with recent/baseline error stats, is_spike, and ranked
+        top_service_contributors/top_model_contributors/top_error_type_contributors
+    """
+    try:
+        backend = await _get_backend()
+        result = await investigate.investigate_error_spike(
+            backend,
+            recent_start=recent_start,
+            recent_end=recent_end,
+            baseline_start=baseline_start,
+            baseline_end=baseline_end,
+            service_name=service_name,
+            limit=_clamp_limit(limit),
+            top_n=top_n,
+            min_error_count_increase=min_error_count_increase,
+            rate_multiplier_threshold=rate_multiplier_threshold,
+        )
+        return result
+    except Exception as e:
+        return _handle_tool_error("investigate_error_spike", e)
+
+
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_prompt_version_stats(
     start_time: str | None = None,
     end_time: str | None = None,
@@ -837,6 +953,8 @@ _ALL_TOOL_NAMES = frozenset(
         "list_sessions",
         "get_session_stats",
         "compare_time_windows",
+        "investigate_cost_spike",
+        "investigate_error_spike",
         "get_prompt_version_stats",
         "get_llm_expensive_traces",
         "get_llm_slow_traces",

@@ -477,7 +477,7 @@ gemini "Analyze token usage for gpt-4 requests today"
 
 ## Tools Reference
 
-tracehub-mcp exposes **15 MCP tools**:
+tracehub-mcp exposes **17 MCP tools**:
 
 | Tool                       | Description                                       | Use Case                           |
 | --------------------------- | -------------------------------------------------- | ----------------------------------- |
@@ -495,6 +495,8 @@ tracehub-mcp exposes **15 MCP tools**:
 | `list_sessions`            | Group spans by `gen_ai.conversation.id`           | Understand multi-turn conversation activity |
 | `get_session_stats`        | Detailed stats for one conversation ID            | Drill into a single conversation   |
 | `compare_time_windows`     | Diff aggregated usage between two time ranges     | "This week vs last week" comparisons |
+| `investigate_cost_spike`   | Compare cost between a recent window and a baseline, ranked by model/service | "Why did our LLM bill spike?" |
+| `investigate_error_spike`  | Compare error rate between a recent window and a baseline, ranked by service/model/error type | "Is this error increase a real spike?" |
 | `get_prompt_version_stats` | Group spans by `gen_ai.prompt.name`/`.version`    | Compare prompt versions before promoting one |
 
 ### Backend Support Matrix
@@ -567,7 +569,7 @@ Returns aggregated prompt/completion/total tokens, broken down by model and by s
 
 Returns error messages, error types, truncated stack traces, and LLM-specific error info.
 
-**`list_llm_models` / `get_llm_model_stats` / `get_llm_expensive_traces` / `get_llm_slow_traces` / `list_llm_tools_tool` / `search_spans_tool` / `list_sessions` / `get_session_stats` / `compare_time_windows` / `get_prompt_version_stats`** are documented in detail, with worked examples, in [CLAUDE.md](CLAUDE.md) — this README covers the shape every tool shares; CLAUDE.md is the fuller reference for exact parameters and response fields on the LLM-analysis tools.
+**`list_llm_models` / `get_llm_model_stats` / `get_llm_expensive_traces` / `get_llm_slow_traces` / `list_llm_tools_tool` / `search_spans_tool` / `list_sessions` / `get_session_stats` / `compare_time_windows` / `investigate_cost_spike` / `investigate_error_spike` / `get_prompt_version_stats`** are documented in detail, with worked examples, in [CLAUDE.md](CLAUDE.md) — this README covers the shape every tool shares; CLAUDE.md is the fuller reference for exact parameters and response fields on the LLM-analysis tools.
 
 ---
 

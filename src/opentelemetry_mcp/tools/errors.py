@@ -4,8 +4,52 @@ import json
 from typing import Any
 
 from opentelemetry_mcp.backends.base import BaseBackend
-from opentelemetry_mcp.models import LLMSpanAttributes, TraceQuery, TraceSummary
+from opentelemetry_mcp.models import LLMSpanAttributes, SpanData, TraceQuery, TraceSummary
 from opentelemetry_mcp.utils import parse_iso_timestamp
+
+
+def extract_error_details(span: SpanData) -> dict[str, Any]:
+    """Build the per-error-span detail dict find_errors returns, extracted
+    so investigate_error_spike (tools/investigate.py) can reuse the exact
+    same extraction logic instead of duplicating it."""
+    error_info: dict[str, Any] = {
+        "span_id": span.span_id,
+        "operation_name": span.operation_name,
+        "service_name": span.service_name,
+        "status": span.status,
+    }
+
+    # Extract error message using typed attribute access
+    error_message_val = (
+        span.attributes.get("error.message")
+        or span.attributes.get("exception.message")
+        or "Unknown error"
+    )
+    error_info["error_message"] = str(error_message_val)
+
+    # Extract error type
+    error_type_val = span.attributes.get("error.type") or span.attributes.get("exception.type")
+    if error_type_val:
+        error_info["error_type"] = str(error_type_val)
+
+    # Extract stack trace (truncated)
+    stack_trace_val = span.attributes.get("exception.stacktrace")
+    if stack_trace_val:
+        # Truncate long stack traces
+        stack_trace_str = str(stack_trace_val)
+        if len(stack_trace_str) > 500:
+            error_info["stack_trace"] = stack_trace_str[:500] + "..."
+        else:
+            error_info["stack_trace"] = stack_trace_str
+
+    # Check if it's an LLM-related error
+    llm_attrs = LLMSpanAttributes.from_span(span)
+    if llm_attrs:
+        error_info["is_llm_error"] = True
+        error_info["llm_provider"] = llm_attrs.system
+        error_info["llm_model"] = llm_attrs.response_model or llm_attrs.request_model
+
+    return error_info
 
 
 async def find_errors(
@@ -58,49 +102,7 @@ async def find_errors(
         trace_info: dict[str, Any] = TraceSummary.from_trace(trace).model_dump(mode="json")
 
         # Add error details
-        trace_info["error_spans"] = []
-        error_spans_list: list[Any] = trace_info["error_spans"]
-        for span in error_spans:
-            error_info: dict[str, Any] = {
-                "span_id": span.span_id,
-                "operation_name": span.operation_name,
-                "service_name": span.service_name,
-                "status": span.status,
-            }
-
-            # Extract error message using typed attribute access
-            error_message_val = (
-                span.attributes.get("error.message")
-                or span.attributes.get("exception.message")
-                or "Unknown error"
-            )
-            error_info["error_message"] = str(error_message_val)
-
-            # Extract error type
-            error_type_val = span.attributes.get("error.type") or span.attributes.get(
-                "exception.type"
-            )
-            if error_type_val:
-                error_info["error_type"] = str(error_type_val)
-
-            # Extract stack trace (truncated)
-            stack_trace_val = span.attributes.get("exception.stacktrace")
-            if stack_trace_val:
-                # Truncate long stack traces
-                stack_trace_str = str(stack_trace_val)
-                if len(stack_trace_str) > 500:
-                    error_info["stack_trace"] = stack_trace_str[:500] + "..."
-                else:
-                    error_info["stack_trace"] = stack_trace_str
-
-            # Check if it's an LLM-related error
-            llm_attrs = LLMSpanAttributes.from_span(span)
-            if llm_attrs:
-                error_info["is_llm_error"] = True
-                error_info["llm_provider"] = llm_attrs.system
-                error_info["llm_model"] = llm_attrs.response_model or llm_attrs.request_model
-
-            error_spans_list.append(error_info)
+        trace_info["error_spans"] = [extract_error_details(span) for span in error_spans]
 
         error_traces.append(trace_info)
 

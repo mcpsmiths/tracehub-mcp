@@ -9,7 +9,8 @@ tracehub-mcp is an MCP (Model Context Protocol) server that enables AI agents to
 **Key Features:**
 
 - Multi-backend support: Jaeger, Grafana Tempo, Traceloop, Datadog, and Sentry
-- 15 MCP tools: Core tools + LLM-oriented discovery and analysis tools + session/prompt-version/time-window aggregation
+- 17 MCP tools: Core tools + LLM-oriented discovery and analysis tools + session/prompt-version/time-window aggregation + cost/error spike investigation
+- Cost attribution (`cost_usd`) via a vendored litellm pricing table, with an honest `cost_usd_is_partial` flag when a model's price can't be resolved
 - Token usage tracking and aggregation across models/services
 - Finish reasons tracking for debugging truncated/filtered responses
 - Enhanced token calculation supporting all `gen_ai.usage.*` attributes
@@ -104,6 +105,7 @@ Each MCP capability is implemented as a separate tool module in [opentelemetry_m
 - [tools/list_llm_tools.py](opentelemetry_mcp/tools/list_llm_tools.py) - List LLM tools used (via traceloop.span.kind == tool)
 - [tools/sessions.py](opentelemetry_mcp/tools/sessions.py) - `list_sessions`/`get_session_stats`: group spans by `gen_ai.conversation.id`
 - [tools/compare.py](opentelemetry_mcp/tools/compare.py) - `compare_time_windows`: diff aggregated usage between two time ranges
+- [tools/investigate.py](opentelemetry_mcp/tools/investigate.py) - `investigate_cost_spike`/`investigate_error_spike`: compare a recent window against a baseline and rank which models/services/error types contributed most to the change
 - [tools/prompt_versions.py](opentelemetry_mcp/tools/prompt_versions.py) - `get_prompt_version_stats`: group spans by `gen_ai.prompt.name`/`gen_ai.prompt.version`
 
 **Two valid return patterns exist.** Returning a JSON string was never actually an MCP protocol
@@ -373,6 +375,28 @@ composition over `get_llm_usage`, not new aggregation logic.
 **Returns:** `range_a` and `range_b` (each the full `get_llm_usage` shape) plus a `delta` with `change`/`percent_change` per metric (`percent_change` is `null`, not an error, when the range A value is 0).
 
 **Example:** "Compare this week's token usage to last week's"
+
+### `investigate_cost_spike` / `investigate_error_spike` - On-Demand Anomaly Investigation
+
+Agent-invoked, on-request analysis (not a push alert) - mirrors SigNoz's
+shipped "investigate telemetry cost" skill. Compares a recent window against
+a baseline (auto-computed as the same duration immediately preceding the
+recent window if not given explicitly) and ranks which models/services/error
+types contributed most to the change, instead of just diffing top-line
+totals like `compare_time_windows`.
+
+**Use Cases:**
+
+- "Why did our LLM bill spike this week?" - ranks which model/service is responsible
+- "Is this error rate increase a real spike?" - `investigate_error_spike`'s `is_spike` requires both an absolute count floor and a relative rate multiplier, so a tiny sample (1 error becoming 2) doesn't false-positive
+
+**Parameters (`investigate_cost_spike`):** `recent_start`/`recent_end` (required), `baseline_start`/`baseline_end` (optional), `service_name`, `gen_ai_system`, `gen_ai_request_model`, `gen_ai_response_model`, `limit`, `top_n` (default 5, max 50).
+
+**Parameters (`investigate_error_spike`):** `recent_start`/`recent_end` (required), `baseline_start`/`baseline_end` (optional), `service_name`, `limit`, `top_n`, `min_error_count_increase` (default 3), `rate_multiplier_threshold` (default 2.0).
+
+**Returns:** `recent`/`baseline` stats, a delta, and ranked `top_model_contributors`/`top_service_contributors` (`investigate_cost_spike`) or `top_service_contributors`/`top_model_contributors`/`top_error_type_contributors` with sample messages (`investigate_error_spike`).
+
+**Example:** "Did our OpenAI costs spike in the last hour?"
 
 ### `get_prompt_version_stats` - Prompt Version Performance
 

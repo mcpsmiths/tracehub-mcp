@@ -11,7 +11,7 @@ from pydantic import ValidationError
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData
-from opentelemetry_mcp.tools.errors import find_errors
+from opentelemetry_mcp.tools.errors import extract_error_details, find_errors
 
 
 def _span(
@@ -342,6 +342,28 @@ class TestInputValidation:
 
         assert "error" not in result
         backend.search_traces.assert_called_once()
+
+
+class TestExtractErrorDetails:
+    """extract_error_details was pulled out of find_errors's inline loop so
+    investigate_error_spike (tools/investigate.py) can reuse it - this locks
+    in that find_errors's own output is unchanged (every TestHappyPath
+    assertion above already re-proves that byte-for-byte) while also
+    covering the function directly as a standalone public contract."""
+
+    def test_returns_the_same_shape_find_errors_embeds_per_span(self) -> None:
+        span = _span(attributes={"error.message": "boom", "error.type": "ValueError"})
+
+        details = extract_error_details(span)
+
+        assert details == {
+            "span_id": "span1",
+            "operation_name": "op",
+            "service_name": "svc",
+            "status": "ERROR",
+            "error_message": "boom",
+            "error_type": "ValueError",
+        }
 
 
 class TestBackendExceptionHandling:
