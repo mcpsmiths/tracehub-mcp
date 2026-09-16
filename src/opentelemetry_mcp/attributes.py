@@ -49,6 +49,8 @@ class SpanAttributes(BaseModel):
     gen_ai_response_finish_reasons: list[str] | None = Field(
         None, alias="gen_ai.response.finish_reasons"
     )
+    # Alias must stay a literal (mypy strict forbids a non-literal Field
+    # alias) - see constants.GenAI.SYSTEM_INSTRUCTIONS for the same string.
     gen_ai_system_instructions: list[dict[str, str]] | None = Field(
         None, alias="gen_ai.system_instructions"
     )

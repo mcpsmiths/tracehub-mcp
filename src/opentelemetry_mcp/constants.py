@@ -55,6 +55,7 @@ class GenAIAttributes:
 
     # Content (messages, system instructions, retrieval documents) - all
     # OTLP arrays of nested key-value objects, not scalars.
+    GEN_AI_SYSTEM_INSTRUCTIONS = "gen_ai.system_instructions"
     GEN_AI_INPUT_MESSAGES = "gen_ai.input.messages"
     GEN_AI_OUTPUT_MESSAGES = "gen_ai.output.messages"
     GEN_AI_RETRIEVAL_DOCUMENTS = "gen_ai.retrieval.documents"
@@ -108,6 +109,7 @@ class GenAI:
     RESPONSE_FINISH_REASONS = GenAIAttributes.GEN_AI_RESPONSE_FINISH_REASONS
 
     # Content (messages, system instructions, retrieval documents)
+    SYSTEM_INSTRUCTIONS = GenAIAttributes.GEN_AI_SYSTEM_INSTRUCTIONS
     INPUT_MESSAGES = GenAIAttributes.GEN_AI_INPUT_MESSAGES
     OUTPUT_MESSAGES = GenAIAttributes.GEN_AI_OUTPUT_MESSAGES
     RETRIEVAL_DOCUMENTS = GenAIAttributes.GEN_AI_RETRIEVAL_DOCUMENTS

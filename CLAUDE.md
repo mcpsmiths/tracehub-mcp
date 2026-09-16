@@ -233,6 +233,11 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
 2. Extend `BaseBackend` class
 3. Implement all abstract methods
 4. Add to backend factory in [config.py](opentelemetry_mcp/config.py)
+5. Add the new backend name to all 4 hardcoded backend-name literal sites (must update in
+   lockstep): [config.py](opentelemetry_mcp/config.py)'s `BackendConfig.type` `Literal` (and its
+   `from_env`/`apply_cli_overrides` validation), [attributes.py](opentelemetry_mcp/attributes.py)'s
+   `HealthCheckResponse.backend` `Literal`, and [server.py](opentelemetry_mcp/server.py)'s
+   `click.Choice` for the `--backend` CLI flag
 
 ### 6. Adding New Tools
 
@@ -574,6 +579,8 @@ The server uses a hybrid filtering strategy:
 | ------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------- |
 | **Tempo (TraceQL)** | equals, not_equals, gt, lt, gte, lte, contains (regex), in (OR logic), exists, not_exists | -                                   |
 | **Traceloop**       | equals, not_equals, gt, lt, gte, lte                                                      | -                                   |
+| **Datadog**         | Most operators via span-search syntax                                                     | Field names validated against an allowlist before being spliced into the query |
+| **Sentry**          | Most operators via Discover search syntax                                                 | Same field-name allowlisting as Datadog |
 | **Jaeger**          | equals (via tags only)                                                                    | **Requires service_name parameter** |
 
 ### Combining Filters
