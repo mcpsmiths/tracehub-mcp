@@ -1,3 +1,12 @@
+## v0.7.0 (2026-09-16)
+
+### Feat
+
+- **cli**: add doctor subcommand and --print-config flag
+- **tools**: add investigate_cost_spike and investigate_error_spike
+- **usage**: add cost_usd attribution to get_llm_usage
+- **security**: block SSRF to cloud metadata endpoints on BACKEND_URL
+
 ## v0.6.0 (2026-09-15)
 
 ### Feat
