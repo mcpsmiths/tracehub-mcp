@@ -7,6 +7,8 @@ from typing import Literal
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, field_validator
 
+from opentelemetry_mcp.security import is_cloud_metadata_host, is_loopback_host
+
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -43,10 +45,25 @@ class BackendConfig(BaseModel):
     @field_validator("url")
     @classmethod
     def validate_url(cls, v: HttpUrl) -> HttpUrl:
-        """Validate URL scheme."""
+        """Validate URL scheme and reject cloud metadata endpoints.
+
+        A private/loopback address (e.g. a self-hosted Jaeger on a VPC or
+        Docker Compose network) is a completely normal, intended deployment
+        and stays allowed - only cloud instance-metadata endpoints are
+        blocked outright, since those are never a legitimate trace-backend
+        location and exist purely as an SSRF-driven credential-theft target
+        (the vulnerability class behind GHSA-65h7/GHSA-v6ph in similar MCP
+        adapter tooling).
+        """
         if v.scheme not in ["http", "https"]:
             raise ValueError("URL must use http or https scheme")
-        if v.scheme == "http" and v.host not in ("localhost", "127.0.0.1", "::1"):
+        if is_cloud_metadata_host(v.host):
+            raise ValueError(
+                f"BACKEND_URL '{v}' points at a cloud instance-metadata endpoint. "
+                "This is never a legitimate trace-backend location and is blocked "
+                "to prevent SSRF-based credential theft."
+            )
+        if v.scheme == "http" and not is_loopback_host(v.host):
             logger.warning(
                 f"BACKEND_URL '{v}' uses plain HTTP to a non-local host. "
                 "This is vulnerable to network interception (see CVE-2025-6514). "
@@ -184,7 +201,13 @@ class ServerConfig(BaseModel):
             self.backend.type = backend_type  # type: ignore
 
         if backend_url:
-            self.backend.url = TypeAdapter(HttpUrl).validate_python(backend_url)
+            # Route through the same validator BackendConfig construction
+            # uses - a bare TypeAdapter validates the HttpUrl *type* only,
+            # bypassing validate_url's scheme/metadata/CVE-2025-6514 checks
+            # entirely, since direct attribute assignment on an already
+            # constructed model does not re-run field validators here.
+            parsed = TypeAdapter(HttpUrl).validate_python(backend_url)
+            self.backend.url = BackendConfig.validate_url(parsed)
 
         if api_key:
             self.backend.api_key = api_key

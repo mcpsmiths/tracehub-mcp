@@ -21,8 +21,17 @@ from tenacity import (
 
 from opentelemetry_mcp.attributes import HealthCheckResponse
 from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceData, TraceQuery
+from opentelemetry_mcp.security import is_cloud_metadata_host
 
 logger = logging.getLogger(__name__)
+
+
+class MetadataEndpointBlockedError(httpx.TransportError):
+    """Raised when a request (initial or mid-redirect) targets a cloud
+    instance-metadata endpoint. Deliberately not one of the retryable
+    exceptions below - this must propagate immediately, never be retried.
+    """
+
 
 # Only genuine transport-level failures - a connection that never completed
 # or a request that timed out - are worth retrying on their own. An HTTP
@@ -108,6 +117,16 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         Retry-After header when present) on connect/timeout failures or a
         429 rate-limit response.
         """
+        # httpx re-invokes handle_async_request on every redirect hop when
+        # follow_redirects=True, so this single check - run before every
+        # attempt, including redirect targets - blocks a compromised or
+        # misbehaving backend from redirecting a request toward a cloud
+        # metadata endpoint, for all five backends, regardless of each
+        # backend's own follow_redirects setting.
+        if is_cloud_metadata_host(request.url.host):
+            raise MetadataEndpointBlockedError(
+                f"Refusing to connect to cloud metadata endpoint: {request.url.host}"
+            )
 
         # A plain `async def` closure (rather than passing
         # self._wrapped.handle_async_request straight to tenacity) ensures

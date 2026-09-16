@@ -15,7 +15,7 @@ import time
 import httpx
 import pytest
 
-from opentelemetry_mcp.backends.base import _RetryingTransport
+from opentelemetry_mcp.backends.base import MetadataEndpointBlockedError, _RetryingTransport
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
 
 
@@ -233,6 +233,66 @@ class TestSlowRequestLogging:
         assert "/search" in messages[0]
         assert "super-secret-value" not in messages[0]
         assert "api_key" not in messages[0]
+
+
+class TestMetadataEndpointBlocking:
+    """A compromised or misconfigured backend must never be able to steer a
+    request (initial or mid-redirect) toward a cloud instance-metadata
+    endpoint - see security.py."""
+
+    async def test_request_to_metadata_ip_raises_without_retrying(self) -> None:
+        handler_calls = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal handler_calls
+            handler_calls += 1
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(MetadataEndpointBlockedError):
+                await client.get("http://169.254.169.254/latest/meta-data/")
+
+        assert handler_calls == 0
+
+    async def test_redirect_to_metadata_ip_is_blocked(self) -> None:
+        """A backend that 302-redirects toward a metadata address must be
+        blocked mid-chain, not just on the initial request - this needs a
+        real AsyncClient with follow_redirects=True, not just the bare
+        transport, to actually exercise the redirect-hop code path."""
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if str(request.url) == "http://backend.test/search":
+                return httpx.Response(
+                    302, headers={"Location": "http://169.254.169.254/latest/meta-data/"}
+                )
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            with pytest.raises(MetadataEndpointBlockedError):
+                await client.get("/search")
+
+        assert call_count == 1
+
+    async def test_normal_request_to_non_metadata_host_is_unaffected(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"ok": True})
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/search")
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
 
 
 class TestRetryOn429:

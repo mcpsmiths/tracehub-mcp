@@ -15,8 +15,10 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
+from opentelemetry_mcp.backends.base import MetadataEndpointBlockedError, _RetryingTransport
 from opentelemetry_mcp.backends.sentry import _MAX_SEARCH_PAGES, _SPAN_SEARCH_FIELDS, SentryBackend
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType
 
@@ -48,6 +50,38 @@ def test_sentry_client_does_not_disable_redirects() -> None:
     must not override the base class's follow_redirects=True."""
     backend = SentryBackend(url="https://sentry.io", api_key=FAKE_AUTH, org_slug=FAKE_ORG)
     assert backend.client.follow_redirects is True
+
+
+async def test_sentry_redirect_to_metadata_ip_is_blocked() -> None:
+    """Unlike Datadog (which disables follow_redirects outright - see
+    test_datadog_client_disables_redirects in test_datadog.py), Sentry keeps
+    follow_redirects=True by design (see
+    test_sentry_client_does_not_disable_redirects above), so a backend
+    redirecting toward a metadata address here would actually be followed by
+    httpx if not for _RetryingTransport's own mid-redirect metadata-host
+    check (see TestMetadataEndpointBlocking in test_base_backend.py)."""
+    call_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if str(request.url) == "https://sentry.io/search":
+            return httpx.Response(
+                302, headers={"Location": "http://169.254.169.254/latest/meta-data/"}
+            )
+        return httpx.Response(200)
+
+    backend = SentryBackend(url="https://sentry.io", api_key=FAKE_AUTH, org_slug=FAKE_ORG)
+    backend._client = httpx.AsyncClient(
+        base_url="https://sentry.io",
+        follow_redirects=True,
+        transport=_RetryingTransport(wrapped=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(MetadataEndpointBlockedError):
+        await backend.client.get("/search")
+
+    assert call_count == 1
 
 
 def test_sentry_backend_initialization() -> None:

@@ -15,9 +15,10 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
-from opentelemetry_mcp.backends.base import _RetryingTransport
+from opentelemetry_mcp.backends.base import MetadataEndpointBlockedError, _RetryingTransport
 from opentelemetry_mcp.backends.datadog import _MAX_SEARCH_PAGES, DatadogBackend
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType
 
@@ -60,6 +61,38 @@ def test_datadog_client_still_uses_the_retrying_transport() -> None:
         url="https://api.datadoghq.com", api_key=FAKE_API_KEY, app_key=FAKE_APP_KEY
     )
     assert isinstance(backend.client._transport, _RetryingTransport)
+
+
+async def test_datadog_request_to_metadata_ip_is_blocked_even_with_redirects_disabled() -> None:
+    """Datadog's client disables follow_redirects entirely (see
+    test_datadog_client_disables_redirects above), so a redirect-to-metadata
+    scenario can never even reach httpx's redirect-following logic for this
+    backend - there is nothing to follow. The genuinely meaningful
+    defense-in-depth case is that _RetryingTransport's metadata-host check
+    (see TestMetadataEndpointBlocking in test_base_backend.py) runs on every
+    request, including the *initial* one, independent of a client's
+    follow_redirects setting - so a request aimed directly at a metadata
+    address is still blocked even through Datadog's redirect-disabled
+    client."""
+    handler_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal handler_calls
+        handler_calls += 1
+        return httpx.Response(200)
+
+    backend = DatadogBackend(
+        url="https://api.datadoghq.com", api_key=FAKE_API_KEY, app_key=FAKE_APP_KEY
+    )
+    backend._client = httpx.AsyncClient(
+        follow_redirects=False,
+        transport=_RetryingTransport(wrapped=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(MetadataEndpointBlockedError):
+        await backend.client.get("http://169.254.169.254/latest/meta-data/")
+
+    assert handler_calls == 0
 
 
 def test_datadog_backend_initialization() -> None:

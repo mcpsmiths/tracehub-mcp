@@ -99,6 +99,43 @@ class TestApplyCliOverridesMaxTracesPerQuery:
         assert config.max_traces_per_query == 1000
 
 
+class TestApplyCliOverridesUrl:
+    def test_valid_url_override_is_applied(self) -> None:
+        config = _server_config()
+
+        config.apply_cli_overrides(backend_url="https://jaeger.internal:16686")
+
+        assert str(config.backend.url) == "https://jaeger.internal:16686/"
+
+    def test_cli_url_override_also_rejects_metadata_ip(self) -> None:
+        """Regression for a real bypass: a bare TypeAdapter(HttpUrl) sets the
+        attribute directly, skipping BackendConfig.validate_url entirely -
+        the CVE-2025-6514 warning and the metadata-endpoint block must both
+        still apply when the URL comes from a CLI/env override, not just at
+        initial BackendConfig construction."""
+        config = _server_config()
+
+        with pytest.raises(ValueError, match="metadata"):
+            config.apply_cli_overrides(backend_url="http://169.254.169.254/latest/meta-data/")
+
+    def test_cli_url_override_still_warns_on_plain_http_non_local(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        config = _server_config()
+
+        with caplog.at_level(logging.WARNING):
+            config.apply_cli_overrides(backend_url="http://example.com:16686")
+
+        assert any("example.com" in r.message for r in caplog.records)
+
+    def test_none_leaves_existing_url_unchanged(self) -> None:
+        config = _server_config()
+
+        config.apply_cli_overrides(backend_url=None)
+
+        assert str(config.backend.url) == "http://localhost:16686/"
+
+
 class TestApplyCliOverridesSlowRequestThreshold:
     def test_valid_value_is_applied(self) -> None:
         config = _server_config()
