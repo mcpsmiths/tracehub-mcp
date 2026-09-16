@@ -589,6 +589,25 @@ class TestToolErrorIsErrorFlag:
         assert result.is_error is False
 
 
+class TestToolAnnotationsComplete:
+    """MCP directories (e.g. OpenAI's ChatGPT Apps submission pipeline) can
+    reject tools whose annotations are missing rather than explicit
+    booleans - every tool here is read-only, so all four hints must be
+    real booleans, not just the three previously set."""
+
+    async def test_every_tool_has_all_four_hints_as_explicit_booleans(self) -> None:
+        async with Client(server.mcp) as client:
+            tools = await client.list_tools()
+
+        assert len(tools) == 17
+        for t in tools:
+            assert t.annotations is not None, f"{t.name} has no annotations at all"
+            assert t.annotations.readOnlyHint is True, t.name
+            assert t.annotations.destructiveHint is False, t.name
+            assert t.annotations.idempotentHint is True, t.name
+            assert t.annotations.openWorldHint is True, t.name
+
+
 class TestClampLimit:
     """_clamp_limit enforces --max-traces-per-query/MAX_TRACES_PER_QUERY as
     a real server-wide ceiling. Found by a production-audit pass: the

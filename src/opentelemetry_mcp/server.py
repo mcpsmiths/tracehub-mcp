@@ -49,11 +49,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# All 11 tools below only ever query trace/span backends and never mutate
-# backend state, so the same read-only/idempotent/open-world annotations
-# apply to every one of them.
+# All 17 tools below only ever query trace/span backends and never mutate
+# backend state, so the same read-only/destructive/idempotent/open-world
+# annotations apply to every one of them. destructiveHint is meaningful
+# only when readOnlyHint is false per the MCP spec, so it carries no
+# functional weight here - it's set explicitly (rather than left to its
+# true-by-default value) because some MCP directories (e.g. OpenAI's
+# ChatGPT Apps submission pipeline) require all applicable hints to be
+# present as explicit booleans.
 _READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
-    readOnlyHint=True, idempotentHint=True, openWorldHint=True
+    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
 )
 
 
