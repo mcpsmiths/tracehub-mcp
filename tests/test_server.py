@@ -12,6 +12,7 @@ CLI entrypoint.
 # server.py import-style nuance that is out of scope for this test file.
 # mypy: disable-error-code="attr-defined"
 
+import json
 from collections.abc import Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -821,3 +822,257 @@ class TestMainCli:
             result = runner.invoke(server.main, [])
 
         assert result.exit_code == 1
+
+    def test_bare_invocation_still_works_after_group_conversion(self) -> None:
+        """main() converted from a flat @click.command() to a
+        @click.group(invoke_without_command=True) to add the doctor
+        subcommand - every existing bare invocation (no subcommand token)
+        must keep working exactly as before. This re-runs the flags test
+        above verbatim as an explicit regression guard for that conversion."""
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            patch.object(ServerConfig, "apply_cli_overrides") as mock_overrides,
+        ):
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(
+                server.main, ["--backend", "datadog", "--url", "https://api.datadoghq.com"]
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_overrides.assert_called_once()
+        mock_mcp.run.assert_called_once()
+
+    def test_help_lists_doctor_subcommand(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(server.main, ["--help"])
+
+        assert result.exit_code == 0
+        assert "doctor" in result.output
+
+
+class TestPrintConfigFlag:
+    """--print-config prints the resolved config as JSON and exits without
+    starting the server."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", "http://localhost:16686")
+        monkeypatch.delenv("BACKEND_API_KEY", raising=False)
+        monkeypatch.delenv("BACKEND_APP_KEY", raising=False)
+        monkeypatch.delenv("BACKEND_SENTRY_ORG", raising=False)
+        monkeypatch.delenv("BACKEND_SENTRY_PROJECT", raising=False)
+        monkeypatch.delenv("BACKEND_ENVIRONMENTS", raising=False)
+
+    def test_outputs_valid_json_and_never_starts_the_server(self) -> None:
+        runner = CliRunner()
+        with patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(server.main, ["--print-config"])
+
+        assert result.exit_code == 0, result.output
+        resolved = json.loads(result.output)
+        assert resolved["backend"]["type"] == "jaeger"
+        mock_mcp.run.assert_not_called()
+
+    def test_redacts_api_key_and_app_key_to_boolean_presence(self) -> None:
+        runner = CliRunner()
+        with patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(
+                server.main,
+                [
+                    "--print-config",
+                    "--backend",
+                    "datadog",
+                    "--url",
+                    "https://api.datadoghq.com",
+                    "--api-key",
+                    FAKE_API_KEY,
+                    "--app-key",
+                    FAKE_APP_KEY,
+                ],
+            )
+
+        assert FAKE_API_KEY not in result.output
+        assert FAKE_APP_KEY not in result.output
+        resolved = json.loads(result.output)
+        assert resolved["backend"]["api_key_set"] is True
+        assert resolved["backend"]["app_key_set"] is True
+
+    def test_includes_non_secret_identifiers_with_real_values(self) -> None:
+        runner = CliRunner()
+        with patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(
+                server.main,
+                [
+                    "--print-config",
+                    "--backend",
+                    "sentry",
+                    "--url",
+                    "https://sentry.io",
+                    "--sentry-org",
+                    FAKE_SENTRY_ORG,
+                    "--sentry-project",
+                    FAKE_SENTRY_PROJECT,
+                ],
+            )
+
+        resolved = json.loads(result.output)
+        assert resolved["backend"]["sentry_org"] == FAKE_SENTRY_ORG
+        assert resolved["backend"]["sentry_project"] == FAKE_SENTRY_PROJECT
+
+    def test_includes_cli_only_fields_not_stored_on_the_config_model(self) -> None:
+        """transport/host/port/tool-gating are never stored on ServerConfig/
+        BackendConfig - they must come from this invocation's own CLI args."""
+        runner = CliRunner()
+        with patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(
+                server.main,
+                [
+                    "--print-config",
+                    "--transport",
+                    "http",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "9001",
+                    "--disable-tools",
+                    "get_trace",
+                    "--enabled-tools",
+                    "search_traces,get_trace",
+                ],
+            )
+
+        resolved = json.loads(result.output)
+        assert resolved["transport"] == "http"
+        assert resolved["host"] == "127.0.0.1"
+        assert resolved["port"] == 9001
+        assert resolved["disable_tools"] == "get_trace"
+        assert resolved["enabled_tools"] == "search_traces,get_trace"
+
+
+class TestDoctorCli:
+    """doctor runs config load -> backend construction -> health_check ->
+    a real read-only connectivity probe (list_services), printing [OK]/
+    [FAIL] per step and exiting non-zero on any failure - unlike
+    _get_backend, which deliberately swallows a failed health check."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", "http://localhost:16686")
+        monkeypatch.delenv("BACKEND_API_KEY", raising=False)
+        monkeypatch.delenv("BACKEND_APP_KEY", raising=False)
+        monkeypatch.delenv("BACKEND_SENTRY_ORG", raising=False)
+        monkeypatch.delenv("BACKEND_SENTRY_PROJECT", raising=False)
+        monkeypatch.delenv("BACKEND_ENVIRONMENTS", raising=False)
+
+    def _healthy_backend(self) -> AsyncMock:
+        from opentelemetry_mcp.attributes import HealthCheckResponse
+
+        fake_backend = AsyncMock()
+        fake_backend.health_check = AsyncMock(
+            return_value=HealthCheckResponse(status="healthy", backend="jaeger", url="http://x")
+        )
+        fake_backend.list_services = AsyncMock(return_value=["svc-a", "svc-b"])
+        fake_backend.close = AsyncMock()
+        return fake_backend
+
+    def test_all_checks_pass_exits_zero(self) -> None:
+        runner = CliRunner()
+        with patch.object(server, "_create_backend", return_value=self._healthy_backend()):
+            result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 0, result.output
+        assert result.output.count("[OK]") == 4
+        assert "[FAIL]" not in result.output
+
+    def test_config_load_failure_exits_one(self) -> None:
+        runner = CliRunner()
+        with patch.object(ServerConfig, "from_env", side_effect=ValueError("bad config")):
+            result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Configuration" in result.output
+
+    def test_backend_construction_failure_exits_one(self) -> None:
+        runner = CliRunner()
+        with patch.object(server, "_create_backend", side_effect=ValueError("unsupported backend")):
+            result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Backend construction" in result.output
+
+    def test_health_check_unhealthy_status_exits_one(self) -> None:
+        from opentelemetry_mcp.attributes import HealthCheckResponse
+
+        fake_backend = self._healthy_backend()
+        fake_backend.health_check = AsyncMock(
+            return_value=HealthCheckResponse(
+                status="unhealthy", backend="jaeger", url="http://x", error="connection refused"
+            )
+        )
+        runner = CliRunner()
+        with patch.object(server, "_create_backend", return_value=fake_backend):
+            result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Health check" in result.output
+        assert "connection refused" in result.output
+
+    def test_health_check_raises_exits_one(self) -> None:
+        """health_check() can raise instead of returning status=unhealthy
+        (per its own abstract docstring) - doctor must catch this too."""
+        fake_backend = self._healthy_backend()
+        fake_backend.health_check = AsyncMock(side_effect=RuntimeError("unreachable"))
+        runner = CliRunner()
+        with patch.object(server, "_create_backend", return_value=fake_backend):
+            result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Health check raised" in result.output
+
+    def test_connectivity_probe_failure_exits_one(self) -> None:
+        fake_backend = self._healthy_backend()
+        fake_backend.list_services = AsyncMock(side_effect=RuntimeError("timeout"))
+        runner = CliRunner()
+        with patch.object(server, "_create_backend", return_value=fake_backend):
+            result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Connectivity probe" in result.output
+
+    def test_accepts_backend_override_flags(self) -> None:
+        runner = CliRunner()
+        with patch.object(
+            server, "_create_backend", return_value=self._healthy_backend()
+        ) as mocked:
+            result = runner.invoke(
+                server.main,
+                ["doctor", "--backend", "datadog", "--url", "https://api.datadoghq.com"],
+            )
+
+        assert result.exit_code == 0, result.output
+        config = mocked.call_args.args[0]
+        assert config.backend.type == "datadog"
+
+    def test_closes_backend_client_on_completion(self) -> None:
+        fake_backend = self._healthy_backend()
+        runner = CliRunner()
+        with patch.object(server, "_create_backend", return_value=fake_backend):
+            runner.invoke(server.main, ["doctor"])
+
+        fake_backend.close.assert_awaited_once()
+
+    def test_closes_backend_client_even_when_connectivity_probe_fails(self) -> None:
+        fake_backend = self._healthy_backend()
+        fake_backend.list_services = AsyncMock(side_effect=RuntimeError("timeout"))
+        runner = CliRunner()
+        with patch.object(server, "_create_backend", return_value=fake_backend):
+            runner.invoke(server.main, ["doctor"])
+
+        fake_backend.close.assert_awaited_once()

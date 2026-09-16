@@ -164,6 +164,9 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `--enabled-tools <name1,name2,...>` - Allowlist: every tool not named here is removed from this server instance
 - `--slow-request-threshold-ms <float>` - Overrides `SLOW_REQUEST_THRESHOLD_MS`
 - `--include-args-in-spans` - Overrides `MCP_INCLUDE_ARGS_IN_SPANS`
+- `--print-config` - Print the resolved configuration as JSON and exit without starting the server (secrets reported as `*_set` booleans, never their actual value)
+
+**`tracehub-mcp doctor`** - Subcommand (not a flag) that runs startup diagnostics against the resolved backend config: config load, backend construction, `health_check()`, and a real read-only connectivity probe (`list_services`). Prints `[OK]`/`[FAIL]` per step and exits non-zero on any failure - unlike the server's own lazy backend initialization, which deliberately swallows a failed health check and keeps running. Accepts the same `--backend`/`--url`/etc. override flags as the main command, so a candidate config can be validated before committing to it.
 
 **Configuration Precedence:** CLI args > environment variables > defaults
 

@@ -26,6 +26,7 @@ tracehub-mcp started as a fork of [traceloop/opentelemetry-mcp-server](https://g
 - [What's Different From Upstream](#whats-different-from-upstream)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Diagnostics](#diagnostics)
 - [Security Considerations](#security-considerations)
 - [MCP Client Setup](#mcp-client-setup)
 - [Tools Reference](#tools-reference)
@@ -285,6 +286,33 @@ uv run tracehub-mcp --transport http --host 0.0.0.0 --port 8000       # from-sou
 ```
 
 With HTTP transport, clients connect to `http://<host>:<port>/mcp` (streamable-HTTP, for compatibility across MCP clients).
+
+---
+
+## Diagnostics
+
+Validate a config before wiring it into a real MCP client:
+
+```bash
+tracehub-mcp doctor --backend jaeger --url http://localhost:16686
+```
+
+```
+[OK] Configuration loaded and validated
+[OK] Backend constructed: jaeger @ http://localhost:16686/
+[OK] Health check: healthy
+[OK] Connectivity probe (list_services): 2 service(s)
+```
+
+`doctor` accepts the same `--backend`/`--url`/etc. flags as the main command and exits non-zero if any step fails - unlike normal server startup, which lazily initializes the backend and deliberately keeps running even if the initial health check fails.
+
+To see the fully-resolved configuration (env vars + CLI overrides merged) without starting the server:
+
+```bash
+tracehub-mcp --print-config --backend jaeger --url http://localhost:16686
+```
+
+Secrets (`--api-key`/`--app-key`) are reported as `api_key_set`/`app_key_set` booleans, never their actual value.
 
 ---
 

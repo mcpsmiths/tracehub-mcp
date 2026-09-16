@@ -1,5 +1,7 @@
 """Opentelemetry MCP Server - Main entry point."""
 
+import asyncio
+import json
 import logging
 import re
 import sys
@@ -1026,52 +1028,70 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-@click.command()
+def _backend_config_options(f: Any) -> Any:
+    """Shared backend-override flags, applied to both main (serve) and
+    doctor, so an operator can validate a candidate config with doctor
+    before committing to it via the same flags main accepts."""
+    f = click.option(
+        "--backend",
+        type=click.Choice(["jaeger", "tempo", "traceloop", "datadog", "sentry"]),
+        help="Backend type (overrides BACKEND_TYPE env var)",
+    )(f)
+    f = click.option(
+        "--url",
+        type=str,
+        help="Backend URL (overrides BACKEND_URL env var)",
+    )(f)
+    f = click.option(
+        "--api-key",
+        type=str,
+        help="API key for backend authentication (overrides BACKEND_API_KEY env var)",
+    )(f)
+    f = click.option(
+        "--app-key",
+        type=str,
+        help="Application key, required by the Datadog backend in addition to "
+        "--api-key (overrides BACKEND_APP_KEY env var)",
+    )(f)
+    f = click.option(
+        "--tempo-instance-id",
+        type=str,
+        help="Grafana Cloud stack/instance ID, used for Basic Auth with --api-key "
+        "instead of Bearer auth (Tempo backend only, required for Grafana "
+        "Cloud-hosted Tempo, not needed for self-hosted Tempo; overrides "
+        "BACKEND_TEMPO_INSTANCE_ID env var)",
+    )(f)
+    f = click.option(
+        "--sentry-org",
+        type=str,
+        help="Sentry organization slug, required by the Sentry backend "
+        "(overrides BACKEND_SENTRY_ORG env var)",
+    )(f)
+    f = click.option(
+        "--sentry-project",
+        type=str,
+        help="Sentry project slug, optional for the Sentry backend "
+        "(overrides BACKEND_SENTRY_PROJECT env var)",
+    )(f)
+    f = click.option(
+        "--environments",
+        type=str,
+        help="Comma-separated list of environments for Traceloop backend "
+        "(overrides BACKEND_ENVIRONMENTS env var)",
+    )(f)
+    return f
+
+
+@click.group(invoke_without_command=True)
+@click.pass_context
+@_backend_config_options
 @click.option(
-    "--backend",
-    type=click.Choice(["jaeger", "tempo", "traceloop", "datadog", "sentry"]),
-    help="Backend type (overrides BACKEND_TYPE env var)",
-)
-@click.option(
-    "--url",
-    type=str,
-    help="Backend URL (overrides BACKEND_URL env var)",
-)
-@click.option(
-    "--api-key",
-    type=str,
-    help="API key for backend authentication (overrides BACKEND_API_KEY env var)",
-)
-@click.option(
-    "--app-key",
-    type=str,
-    help="Application key, required by the Datadog backend in addition to "
-    "--api-key (overrides BACKEND_APP_KEY env var)",
-)
-@click.option(
-    "--tempo-instance-id",
-    type=str,
-    help="Grafana Cloud stack/instance ID, used for Basic Auth with --api-key "
-    "instead of Bearer auth (Tempo backend only, required for Grafana "
-    "Cloud-hosted Tempo, not needed for self-hosted Tempo; overrides "
-    "BACKEND_TEMPO_INSTANCE_ID env var)",
-)
-@click.option(
-    "--sentry-org",
-    type=str,
-    help="Sentry organization slug, required by the Sentry backend "
-    "(overrides BACKEND_SENTRY_ORG env var)",
-)
-@click.option(
-    "--sentry-project",
-    type=str,
-    help="Sentry project slug, optional for the Sentry backend "
-    "(overrides BACKEND_SENTRY_PROJECT env var)",
-)
-@click.option(
-    "--environments",
-    type=str,
-    help="Comma-separated list of environments for Traceloop backend (overrides BACKEND_ENVIRONMENTS env var)",
+    "--print-config",
+    is_flag=True,
+    default=False,
+    help="Print the resolved configuration as JSON and exit without starting "
+    "the server. Secrets (api_key/app_key) are reported as booleans "
+    "(*_set), never their actual value.",
 )
 @click.option(
     "--transport",
@@ -1142,6 +1162,7 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     "milliseconds, independent of --log-level (unset: disabled)",
 )
 def main(
+    ctx: click.Context,
     backend: str | None,
     url: str | None,
     api_key: str | None,
@@ -1150,6 +1171,7 @@ def main(
     sentry_org: str | None,
     sentry_project: str | None,
     environments: str | None,
+    print_config: bool,
     transport: str,
     host: str,
     port: int,
@@ -1178,7 +1200,16 @@ def main(
 
       # Run with HTTP on specific host/port
       tracehub-mcp --transport http --host 127.0.0.1 --port 9000
+
+      # Validate a candidate config without starting the server
+      tracehub-mcp doctor --backend jaeger --url http://localhost:16686
+
+      # Print the resolved config as JSON (secrets redacted to booleans)
+      tracehub-mcp --print-config
     """
+    if ctx.invoked_subcommand is not None:
+        return
+
     global _config
 
     try:
@@ -1217,6 +1248,38 @@ def main(
             )
             logging.getLogger().setLevel(_config.log_level)
 
+        if print_config:
+            # Built by hand, not model_dump(): sentry_org/sentry_project/
+            # tempo_instance_id are marked exclude=True on BackendConfig
+            # even though they are not secrets (only api_key/app_key are),
+            # and transport/host/port/tool-gating are never stored on the
+            # config model at all - they only ever exist as this
+            # invocation's own CLI args.
+            resolved = {
+                "backend": {
+                    "type": _config.backend.type,
+                    "url": str(_config.backend.url),
+                    "environments": _config.backend.environments,
+                    "timeout": _config.backend.timeout,
+                    "sentry_org": _config.backend.sentry_org,
+                    "sentry_project": _config.backend.sentry_project,
+                    "tempo_instance_id": _config.backend.tempo_instance_id,
+                    "api_key_set": _config.backend.api_key is not None,
+                    "app_key_set": _config.backend.app_key is not None,
+                },
+                "log_level": _config.log_level,
+                "max_traces_per_query": _config.max_traces_per_query,
+                "slow_request_threshold_ms": _config.slow_request_threshold_ms,
+                "transport": transport,
+                "host": host,
+                "port": port,
+                "include_args_in_spans": include_args_in_spans,
+                "disable_tools": disable_tools,
+                "enabled_tools": enabled_tools,
+            }
+            click.echo(json.dumps(resolved, indent=2))
+            return
+
         # Backend will be lazily initialized on first tool call
         # This ensures it's created in FastMCP's event loop, not a separate one
 
@@ -1253,6 +1316,91 @@ def main(
     except Exception as e:
         logger.error(f"Server error: {e}", exc_info=True)
         sys.exit(1)
+
+
+@main.command("doctor")
+@_backend_config_options
+def doctor(
+    backend: str | None,
+    url: str | None,
+    api_key: str | None,
+    app_key: str | None,
+    tempo_instance_id: str | None,
+    sentry_org: str | None,
+    sentry_project: str | None,
+    environments: str | None,
+) -> None:
+    """Run startup diagnostics against the resolved backend config: config
+    load, backend construction, health check, and a live read-only
+    connectivity probe (list_services). Exits non-zero if any step fails.
+
+    Unlike the server's own lazy backend initialization (which deliberately
+    swallows a failed health check and keeps running so requests may still
+    work later), doctor surfaces every failure explicitly.
+    """
+    try:
+        config = ServerConfig.from_env()
+        if (
+            backend
+            or url
+            or api_key
+            or app_key
+            or tempo_instance_id
+            or sentry_org
+            or sentry_project
+            or environments
+        ):
+            config.apply_cli_overrides(
+                backend_type=backend,
+                backend_url=url,
+                api_key=api_key,
+                app_key=app_key,
+                sentry_org=sentry_org,
+                sentry_project=sentry_project,
+                tempo_instance_id=tempo_instance_id,
+                environments=environments,
+            )
+        click.secho("[OK] Configuration loaded and validated", fg="green")
+    except Exception as e:
+        click.secho(f"[FAIL] Configuration: {e}", fg="red")
+        sys.exit(1)
+
+    try:
+        backend_instance = _create_backend(config)
+        click.secho(
+            f"[OK] Backend constructed: {config.backend.type} @ {config.backend.url}", fg="green"
+        )
+    except Exception as e:
+        click.secho(f"[FAIL] Backend construction: {e}", fg="red")
+        sys.exit(1)
+
+    async def _run_checks() -> int:
+        code = 0
+        try:
+            health = await backend_instance.health_check()
+            if health.status == "healthy":
+                click.secho(f"[OK] Health check: {health.status}", fg="green")
+            else:
+                click.secho(f"[FAIL] Health check: {health.status} ({health.error})", fg="red")
+                code = 1
+        except Exception as e:
+            click.secho(f"[FAIL] Health check raised: {e}", fg="red")
+            code = 1
+
+        try:
+            found = await backend_instance.list_services()
+            click.secho(
+                f"[OK] Connectivity probe (list_services): {len(found)} service(s)", fg="green"
+            )
+        except Exception as e:
+            click.secho(f"[FAIL] Connectivity probe (list_services): {e}", fg="red")
+            code = 1
+        finally:
+            await backend_instance.close()
+
+        return code
+
+    sys.exit(asyncio.run(_run_checks()))
 
 
 if __name__ == "__main__":
