@@ -1,3 +1,15 @@
+## v0.8.0 (2026-09-16)
+
+### Feat
+
+- **trace**: expose span events generically in get_trace output
+- **attributes**: add typed field for gen_ai.retrieval.documents
+- **attributes**: add typed fields for gen_ai.input.messages/output.messages
+
+### Fix
+
+- **tempo**: parse OTLP array-of-objects attributes correctly
+
 ## v0.7.0 (2026-09-16)
 
 ### Feat
