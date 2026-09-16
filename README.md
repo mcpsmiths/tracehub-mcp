@@ -287,6 +287,10 @@ uv run tracehub-mcp --transport http --host 0.0.0.0 --port 8000       # from-sou
 
 With HTTP transport, clients connect to `http://<host>:<port>/mcp` (streamable-HTTP, for compatibility across MCP clients).
 
+> **Fly.io:** the one-click `fly mcp launch` command only supports stdio-transport servers — it
+> can't deploy this server's `--transport http` mode. Running tracehub-mcp on Fly.io with HTTP
+> transport needs the manual `fly.toml` + `fly deploy` path instead.
+
 ---
 
 ## Diagnostics
