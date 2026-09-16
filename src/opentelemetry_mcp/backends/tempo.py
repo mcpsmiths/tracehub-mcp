@@ -1,6 +1,7 @@
 """Grafana Tempo backend implementation with TraceQL support."""
 
 import base64
+import json
 import logging
 from datetime import datetime
 from typing import Any, Literal
@@ -670,8 +671,19 @@ class TempoBackend(BaseBackend):
             # Parse events with strong typing
             events: list[SpanEvent] = []
             for event_data in span_data.get("events", []):
+                # SpanEvent.attributes is scalar-only (dict[str, str | int |
+                # float | bool]) - a list value must be flattened. A list of
+                # dicts (e.g. a kvlist-array attribute on the event itself)
+                # can't be ", ".join()-ed like a list of strings can, so it
+                # is JSON-encoded instead; never raises either way.
                 event_attrs: dict[str, str | int | float | bool] = {
-                    k: (", ".join(v) if isinstance(v, list) else v)
+                    k: (
+                        json.dumps(v)
+                        if isinstance(v, list) and any(isinstance(item, dict) for item in v)
+                        else ", ".join(str(item) for item in v)
+                        if isinstance(v, list)
+                        else v
+                    )
                     for k, v in self._parse_otlp_attributes(
                         event_data.get("attributes", [])
                     ).items()
@@ -703,7 +715,7 @@ class TempoBackend(BaseBackend):
 
     def _parse_otlp_attributes(
         self, attributes: list[dict[str, Any]]
-    ) -> dict[str, str | int | float | bool | list[str]]:
+    ) -> dict[str, str | int | float | bool | list[str | dict[str, str | int | float | bool]]]:
         """Parse OTLP attribute format.
 
         OTLP attributes have structure: {"key": "name", "value": {"stringValue": "..."}}
@@ -714,7 +726,9 @@ class TempoBackend(BaseBackend):
         Returns:
             Dictionary of parsed attributes with typed values
         """
-        result: dict[str, str | int | float | bool | list[str]] = {}
+        result: dict[
+            str, str | int | float | bool | list[str | dict[str, str | int | float | bool]]
+        ] = {}
         for attr in attributes:
             key = attr.get("key")
             if not key:
@@ -732,13 +746,20 @@ class TempoBackend(BaseBackend):
             elif "boolValue" in value_obj:
                 result[key] = value_obj["boolValue"]
             elif "arrayValue" in value_obj:
-                # Extract each element's own scalar value rather than
-                # stringifying the raw OTLP structure, which produced an
-                # unparseable Python-repr string and silently dropped the
-                # whole span on any field typed as list[str] (e.g.
-                # gen_ai.response.finish_reasons).
+                # Extract each element's own value rather than stringifying
+                # the raw OTLP structure, which produced an unparseable
+                # Python-repr string and silently dropped the whole span on
+                # any field typed as list[str] (e.g.
+                # gen_ai.response.finish_reasons). Array elements shaped as
+                # kvlistValue (a nested key-value object - e.g. one
+                # gen_ai.input.messages message, or one
+                # gen_ai.retrieval.documents entry) become a real dict
+                # rather than the empty string every scalar-only branch
+                # used to silently produce for them.
                 result[key] = [
-                    self._otlp_array_item_to_str(item)
+                    self._otlp_kvlist_item_to_dict(item)
+                    if "kvlistValue" in item
+                    else self._otlp_array_item_to_str(item)
                     for item in value_obj["arrayValue"].get("values", [])
                 ]
 
@@ -758,3 +779,30 @@ class TempoBackend(BaseBackend):
         if "boolValue" in item:
             return str(item["boolValue"])
         return ""
+
+    @staticmethod
+    def _otlp_kvlist_item_to_dict(item: dict[str, Any]) -> dict[str, str | int | float | bool]:
+        """Convert one OTLP AnyValue array element whose value is a
+        kvlistValue (a nested key-value object) into a flat dict,
+        extracting each leaf's own typed scalar value rather than
+        stringifying it - never raises; an unexpected/nested value for one
+        key is simply omitted from the result, not the whole item."""
+        result: dict[str, str | int | float | bool] = {}
+        for entry in item.get("kvlistValue", {}).get("values", []):
+            key = entry.get("key")
+            if not key:
+                continue
+            value_obj = entry.get("value", {})
+            if "stringValue" in value_obj:
+                result[key] = value_obj["stringValue"]
+            elif "intValue" in value_obj:
+                result[key] = int(value_obj["intValue"])
+            elif "doubleValue" in value_obj:
+                result[key] = float(value_obj["doubleValue"])
+            elif "boolValue" in value_obj:
+                result[key] = value_obj["boolValue"]
+            # Any other/nested type (another arrayValue or kvlistValue) is
+            # skipped rather than guessed at - one level of nesting is
+            # enough for gen_ai.input.messages/output.messages/
+            # retrieval.documents' real shapes.
+        return result

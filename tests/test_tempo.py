@@ -99,6 +99,204 @@ def test_otlp_array_item_to_str_checks_key_presence_not_truthiness() -> None:
     assert TempoBackend._otlp_array_item_to_str({}) == ""
 
 
+def _raw_otlp_trace_with_kvlist_array_attribute() -> dict[str, Any]:
+    """Real OTLP wire encoding of gen_ai.input.messages: an arrayValue whose
+    elements are kvlistValue objects (role/content pairs), not scalars -
+    the shape gen_ai.input.messages/output.messages/retrieval.documents
+    all actually use."""
+    return {
+        "batches": [
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": "e2e-checkout-service"}}
+                    ]
+                },
+                "scopeSpans": [
+                    {
+                        "spans": [
+                            {
+                                "traceId": "abc123",
+                                "spanId": "llm1",
+                                "name": "llm_summarize_cart",
+                                "startTimeUnixNano": "1010000000",
+                                "endTimeUnixNano": "1030000000",
+                                "attributes": [
+                                    {
+                                        "key": "gen_ai.system",
+                                        "value": {"stringValue": "openai"},
+                                    },
+                                    {
+                                        "key": "gen_ai.input.messages",
+                                        "value": {
+                                            "arrayValue": {
+                                                "values": [
+                                                    {
+                                                        "kvlistValue": {
+                                                            "values": [
+                                                                {
+                                                                    "key": "role",
+                                                                    "value": {
+                                                                        "stringValue": "user"
+                                                                    },
+                                                                },
+                                                                {
+                                                                    "key": "content",
+                                                                    "value": {"stringValue": "Hi"},
+                                                                },
+                                                            ]
+                                                        }
+                                                    },
+                                                    {
+                                                        "kvlistValue": {
+                                                            "values": [
+                                                                {
+                                                                    "key": "role",
+                                                                    "value": {
+                                                                        "stringValue": "assistant"
+                                                                    },
+                                                                },
+                                                                {
+                                                                    "key": "content",
+                                                                    "value": {
+                                                                        "stringValue": "Hello!"
+                                                                    },
+                                                                },
+                                                            ]
+                                                        }
+                                                    },
+                                                ]
+                                            }
+                                        },
+                                    },
+                                ],
+                            },
+                        ]
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def test_span_with_kvlist_array_attribute_produces_real_dicts_not_empty_strings() -> None:
+    """Before this fix, each kvlistValue array element silently became ""
+    - gen_ai.input.messages/output.messages/retrieval.documents are all
+    exactly this shape (arrays of objects, not arrays of scalars).
+
+    gen_ai.input.messages has no typed SpanAttributes field yet at this
+    phase (added in a later phase) - it lands in extra_attributes via
+    ConfigDict(extra="allow"), which is exactly where this test checks it,
+    proving the parser itself now hands over real dicts rather than
+    testing through a field that doesn't exist yet."""
+    backend = TempoBackend(url="http://localhost:3200")
+
+    trace = backend._parse_tempo_trace(
+        _raw_otlp_trace_with_kvlist_array_attribute(), trace_id_hex="abc123"
+    )
+
+    assert trace is not None
+    llm_span = next(s for s in trace.spans if s.operation_name == "llm_summarize_cart")
+    assert llm_span.attributes.extra_attributes["gen_ai.input.messages"] == [
+        {"role": "user", "content": "Hi"},
+        {"role": "assistant", "content": "Hello!"},
+    ]
+
+
+def test_otlp_kvlist_item_to_dict_checks_key_presence_not_truthiness() -> None:
+    """A real 0 or False leaf value must not be mistaken for an absent
+    field, mirroring the scalar-array equivalent test above."""
+    item = {
+        "kvlistValue": {
+            "values": [
+                {"key": "count", "value": {"intValue": 0}},
+                {"key": "verified", "value": {"boolValue": False}},
+            ]
+        }
+    }
+
+    assert TempoBackend._otlp_kvlist_item_to_dict(item) == {"count": 0, "verified": False}
+    assert TempoBackend._otlp_kvlist_item_to_dict({}) == {}
+
+
+def test_scalar_array_attributes_still_resolve_unchanged() -> None:
+    """Regression guard: the kvlist dispatch branch must not change
+    behavior for the pre-existing pure-scalar-array case."""
+    backend = TempoBackend(url="http://localhost:3200")
+
+    trace = backend._parse_tempo_trace(_raw_otlp_trace_with_finish_reasons(), trace_id_hex="abc123")
+
+    assert trace is not None
+    llm_span = next(s for s in trace.spans if s.operation_name == "llm_summarize_cart")
+    assert llm_span.attributes.gen_ai_response_finish_reasons == ["stop"]
+
+
+def test_event_attribute_containing_kvlist_array_is_json_encoded_not_raising() -> None:
+    """SpanEvent.attributes is scalar-only - a list-of-dicts value on an
+    event (not just a span) must be JSON-encoded rather than crashing the
+    old ", ".join(v) path, which assumed every list was list[str]."""
+    backend = TempoBackend(url="http://localhost:3200")
+    raw_trace = {
+        "batches": [
+            {
+                "resource": {"attributes": []},
+                "scopeSpans": [
+                    {
+                        "spans": [
+                            {
+                                "traceId": "abc123",
+                                "spanId": "llm1",
+                                "name": "llm_call",
+                                "startTimeUnixNano": "1010000000",
+                                "endTimeUnixNano": "1030000000",
+                                "attributes": [],
+                                "events": [
+                                    {
+                                        "name": "gen_ai.evaluation.result",
+                                        "timeUnixNano": "1020000000",
+                                        "attributes": [
+                                            {
+                                                "key": "gen_ai.evaluation.details",
+                                                "value": {
+                                                    "arrayValue": {
+                                                        "values": [
+                                                            {
+                                                                "kvlistValue": {
+                                                                    "values": [
+                                                                        {
+                                                                            "key": "name",
+                                                                            "value": {
+                                                                                "stringValue": "relevance"
+                                                                            },
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            }
+                                                        ]
+                                                    }
+                                                },
+                                            }
+                                        ],
+                                    }
+                                ],
+                            },
+                        ]
+                    }
+                ],
+            }
+        ]
+    }
+
+    trace = backend._parse_tempo_trace(raw_trace, trace_id_hex="abc123")
+
+    assert trace is not None
+    llm_span = next(s for s in trace.spans if s.operation_name == "llm_call")
+    assert len(llm_span.events) == 1
+    event = llm_span.events[0]
+    assert event.name == "gen_ai.evaluation.result"
+    assert event.attributes["gen_ai.evaluation.details"] == '[{"name": "relevance"}]'
+
+
 def test_bearer_auth_used_when_no_instance_id_set() -> None:
     """Self-hosted Tempo's existing Bearer-token auth must be unchanged
     when tempo_instance_id is not configured."""
