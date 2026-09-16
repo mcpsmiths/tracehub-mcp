@@ -7,8 +7,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from opentelemetry_mcp.attributes import SpanAttributes
+from opentelemetry_mcp.attributes import SpanAttributes, SpanEvent
 from opentelemetry_mcp.backends.base import BaseBackend
+from opentelemetry_mcp.constants import GenAI
 from opentelemetry_mcp.models import SpanData, TraceData
 from opentelemetry_mcp.tools.trace import get_trace
 
@@ -22,6 +23,7 @@ def _make_span(
     duration_ms: float = 100.0,
     status: str = "OK",
     attrs: dict[str, Any] | None = None,
+    events: list[SpanEvent] | None = None,
 ) -> SpanData:
     """Build a SpanData instance for a test, defaulting to no gen_ai attributes."""
     return SpanData(
@@ -34,6 +36,7 @@ def _make_span(
         duration_ms=duration_ms,
         status=status,  # type: ignore[arg-type]
         attributes=SpanAttributes.model_validate(attrs or {}),
+        events=events or [],
     )
 
 
@@ -111,6 +114,71 @@ async def test_get_trace_empty_spans_list() -> None:
     assert result["span_count"] == 0
     assert result["has_errors"] is False
     assert "llm_summary" not in result
+
+
+async def test_get_trace_exposes_span_events_generically() -> None:
+    """Every backend's parser already populates SpanData.events, but no
+    tool ever serialized it into output until now - this is a new,
+    generic capability, not evaluation-specific, so the events used here
+    are deliberately NOT the legacy gen_ai.content.prompt/completion event
+    names, to prove any arbitrarily-named event round-trips."""
+    backend = _fake_backend()
+    span = _make_span(
+        events=[
+            SpanEvent(name="custom.debug.checkpoint", timestamp=1000, attributes={"step": 1}),
+            SpanEvent(name="custom.retry.attempted", timestamp=2000, attributes={"count": 2}),
+        ]
+    )
+    backend.get_trace.return_value = _make_trace([span])
+
+    result = json.loads(await get_trace(backend, "t1"))
+
+    events = result["spans"][0]["events"]
+    assert len(events) == 2
+    assert events[0]["name"] == "custom.debug.checkpoint"
+    assert events[0]["attributes"] == {"step": 1}
+    assert events[1]["name"] == "custom.retry.attempted"
+    assert events[1]["attributes"] == {"count": 2}
+
+
+async def test_get_trace_exposes_gen_ai_evaluation_result_event() -> None:
+    """The concrete motivating case: OTel's own gen_ai.evaluation.result is
+    a span EVENT, not an attribute - extra_attributes passthrough does
+    nothing for it, so this generic events exposure is what's actually
+    needed to surface it."""
+    backend = _fake_backend()
+    span = _make_span(
+        events=[
+            SpanEvent(
+                name=GenAI.EVENT_EVALUATION_RESULT,
+                timestamp=1000,
+                attributes={
+                    "gen_ai.evaluation.name": "relevance",
+                    "gen_ai.evaluation.score.value": 0.92,
+                    "gen_ai.evaluation.score.label": "good",
+                },
+            )
+        ]
+    )
+    backend.get_trace.return_value = _make_trace([span])
+
+    result = json.loads(await get_trace(backend, "t1"))
+
+    event = result["spans"][0]["events"][0]
+    assert event["name"] == "gen_ai.evaluation.result"
+    assert event["attributes"]["gen_ai.evaluation.name"] == "relevance"
+    assert event["attributes"]["gen_ai.evaluation.score.value"] == 0.92
+    assert event["attributes"]["gen_ai.evaluation.score.label"] == "good"
+
+
+async def test_get_trace_span_with_no_events_gets_empty_events_list() -> None:
+    backend = _fake_backend()
+    span = _make_span()
+    backend.get_trace.return_value = _make_trace([span])
+
+    result = json.loads(await get_trace(backend, "t1"))
+
+    assert result["spans"][0]["events"] == []
 
 
 async def test_get_trace_backend_exception_propagates() -> None:

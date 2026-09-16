@@ -132,6 +132,7 @@ class GenAI:
     # Event names
     EVENT_CONTENT_PROMPT = "gen_ai.content.prompt"
     EVENT_CONTENT_COMPLETION = "gen_ai.content.completion"
+    EVENT_EVALUATION_RESULT = "gen_ai.evaluation.result"
 
     # Event attribute names
     EVENT_PROMPT_CONTENT = "gen_ai.prompt.0.content"

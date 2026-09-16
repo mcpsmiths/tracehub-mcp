@@ -45,6 +45,7 @@ async def get_trace(backend: BaseBackend, trace_id: str) -> str:
             "duration_ms": span.duration_ms,
             "status": span.status,
             "attributes": span.attributes.to_dict(),
+            "events": [event.model_dump(mode="json") for event in span.events],
         }
 
         # If it's an LLM span, parse Opentelemetry attributes
