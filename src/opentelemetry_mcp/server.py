@@ -13,7 +13,7 @@ from mcp.types import ToolAnnotations
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from opentelemetry_mcp import __version__
 from opentelemetry_mcp.backends.base import BaseBackend
@@ -198,6 +198,61 @@ async def _get_backend() -> BaseBackend:
             logger.warning("Continuing anyway, requests may fail...")
 
     return _backend
+
+
+async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any]]:
+    """Run health_check + list_services against an already-constructed
+    backend. Returns (all_ok, details). The caller owns the backend's
+    lifecycle (construct/close) - this never closes it, so it is safe to
+    call against the server's own cached _get_backend() instance without
+    disrupting subsequent real tool calls that share it.
+    """
+    all_ok = True
+    details: dict[str, Any] = {}
+
+    try:
+        health = await backend.health_check()
+        details["health_check"] = {"status": health.status, "error": health.error}
+        if health.status != "healthy":
+            all_ok = False
+    except Exception as e:
+        details["health_check"] = {"status": "error", "error": str(e)}
+        all_ok = False
+
+    try:
+        services_found = await backend.list_services()
+        details["list_services"] = {"count": len(services_found)}
+    except Exception as e:
+        details["list_services"] = {"error": str(e)}
+        all_ok = False
+
+    return all_ok, details
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_route(request: Request) -> Response:
+    """Liveness only - deliberately does no backend I/O, so this reflects
+    whether the process itself is up, independent of backend reachability.
+    Only reachable over the streamable-http transport; stdio mode has no
+    HTTP server for this route to attach to."""
+    return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/ready", methods=["GET"])
+async def ready_route(request: Request) -> Response:
+    """Readiness - reuses the server's own cached _get_backend() instance
+    (never constructs or closes a separate one, unlike `doctor`), so this
+    can never break a real tool call that shares the same backend."""
+    try:
+        backend = await _get_backend()
+    except Exception as e:
+        return JSONResponse({"status": "not_ready", "error": str(e)}, status_code=503)
+
+    all_ok, details = await _run_backend_checks(backend)
+    return JSONResponse(
+        {"status": "ready" if all_ok else "not_ready", **details},
+        status_code=200 if all_ok else 503,
+    )
 
 
 @mcp.tool(title="Search Traces", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
@@ -1388,30 +1443,36 @@ def doctor(
         sys.exit(1)
 
     async def _run_checks() -> int:
-        code = 0
         try:
-            health = await backend_instance.health_check()
-            if health.status == "healthy":
-                click.secho(f"[OK] Health check: {health.status}", fg="green")
-            else:
-                click.secho(f"[FAIL] Health check: {health.status} ({health.error})", fg="red")
-                code = 1
-        except Exception as e:
-            click.secho(f"[FAIL] Health check raised: {e}", fg="red")
-            code = 1
+            all_ok, details = await _run_backend_checks(backend_instance)
 
-        try:
-            found = await backend_instance.list_services()
-            click.secho(
-                f"[OK] Connectivity probe (list_services): {len(found)} service(s)", fg="green"
-            )
-        except Exception as e:
-            click.secho(f"[FAIL] Connectivity probe (list_services): {e}", fg="red")
-            code = 1
+            health = details["health_check"]
+            if health.get("status") == "healthy":
+                click.secho(f"[OK] Health check: {health['status']}", fg="green")
+            elif health.get("status") == "error":
+                click.secho(f"[FAIL] Health check raised: {health['error']}", fg="red")
+            else:
+                click.secho(
+                    f"[FAIL] Health check: {health.get('status')} ({health.get('error')})",
+                    fg="red",
+                )
+
+            list_services_info = details["list_services"]
+            if "error" in list_services_info:
+                click.secho(
+                    f"[FAIL] Connectivity probe (list_services): {list_services_info['error']}",
+                    fg="red",
+                )
+            else:
+                click.secho(
+                    f"[OK] Connectivity probe (list_services): "
+                    f"{list_services_info['count']} service(s)",
+                    fg="green",
+                )
+
+            return 0 if all_ok else 1
         finally:
             await backend_instance.close()
-
-        return code
 
     sys.exit(asyncio.run(_run_checks()))
 
