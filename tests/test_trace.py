@@ -1,6 +1,5 @@
 """Tests for the get_trace tool."""
 
-import json
 from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock
@@ -63,30 +62,32 @@ async def test_get_trace_happy_path_returns_full_shape(sample_trace_data: TraceD
     backend = _fake_backend()
     backend.get_trace.return_value = sample_trace_data
 
-    raw = await get_trace(backend, "abc123")
-    result = json.loads(raw)
+    result = await get_trace(backend, "abc123")
 
     backend.get_trace.assert_awaited_once_with("abc123")
 
-    assert result["trace_id"] == "abc123"
-    assert result["service_name"] == "test-service"
-    assert result["root_operation"] == "test_operation"
-    assert result["duration_ms"] == 5000
-    assert result["status"] == "OK"
-    assert result["span_count"] == 1
-    assert result["has_errors"] is False
+    assert result.trace_id == "abc123"
+    assert result.service_name == "test-service"
+    assert result.root_operation == "test_operation"
+    assert result.duration_ms == 5000
+    assert result.status == "OK"
+    assert result.span_count == 1
+    assert result.has_errors is False
+    assert result.detail_level == "full"
 
-    span_data = result["spans"][0]
-    assert span_data["span_id"] == "span1"
-    assert span_data["parent_span_id"] is None
-    assert span_data["attributes"]["gen_ai.system"] == "openai"
-    assert span_data["llm_attributes"]["system"] == "openai"
-    assert span_data["llm_attributes"]["request_model"] == "gpt-4"
-    assert span_data["llm_attributes"]["total_tokens"] == 300
+    span_data = result.spans[0]
+    assert span_data.span_id == "span1"
+    assert span_data.parent_span_id is None
+    assert span_data.attributes["gen_ai.system"] == "openai"
+    assert span_data.llm_attributes is not None
+    assert span_data.llm_attributes["system"] == "openai"
+    assert span_data.llm_attributes["request_model"] == "gpt-4"
+    assert span_data.llm_attributes["total_tokens"] == 300
 
-    assert result["llm_summary"]["llm_span_count"] == 1
-    assert result["llm_summary"]["total_tokens"] == 300
-    assert result["llm_summary"]["models_used"] == ["gpt-4"]
+    assert result.llm_summary is not None
+    assert result.llm_summary["llm_span_count"] == 1
+    assert result.llm_summary["total_tokens"] == 300
+    assert result.llm_summary["models_used"] == ["gpt-4"]
 
 
 async def test_get_trace_non_llm_span_omits_llm_attributes_and_summary() -> None:
@@ -96,10 +97,10 @@ async def test_get_trace_non_llm_span_omits_llm_attributes_and_summary() -> None
     span = _make_span(attrs=None)
     backend.get_trace.return_value = _make_trace([span])
 
-    result = json.loads(await get_trace(backend, "t1"))
+    result = await get_trace(backend, "t1")
 
-    assert "llm_attributes" not in result["spans"][0]
-    assert "llm_summary" not in result
+    assert result.spans[0].llm_attributes is None
+    assert result.llm_summary is None
 
 
 async def test_get_trace_empty_spans_list() -> None:
@@ -108,12 +109,12 @@ async def test_get_trace_empty_spans_list() -> None:
     backend = _fake_backend()
     backend.get_trace.return_value = _make_trace([])
 
-    result = json.loads(await get_trace(backend, "t1"))
+    result = await get_trace(backend, "t1")
 
-    assert result["spans"] == []
-    assert result["span_count"] == 0
-    assert result["has_errors"] is False
-    assert "llm_summary" not in result
+    assert result.spans == []
+    assert result.span_count == 0
+    assert result.has_errors is False
+    assert result.llm_summary is None
 
 
 async def test_get_trace_exposes_span_events_generically() -> None:
@@ -131,9 +132,9 @@ async def test_get_trace_exposes_span_events_generically() -> None:
     )
     backend.get_trace.return_value = _make_trace([span])
 
-    result = json.loads(await get_trace(backend, "t1"))
+    result = await get_trace(backend, "t1")
 
-    events = result["spans"][0]["events"]
+    events = result.spans[0].events
     assert len(events) == 2
     assert events[0]["name"] == "custom.debug.checkpoint"
     assert events[0]["attributes"] == {"step": 1}
@@ -162,9 +163,9 @@ async def test_get_trace_exposes_gen_ai_evaluation_result_event() -> None:
     )
     backend.get_trace.return_value = _make_trace([span])
 
-    result = json.loads(await get_trace(backend, "t1"))
+    result = await get_trace(backend, "t1")
 
-    event = result["spans"][0]["events"][0]
+    event = result.spans[0].events[0]
     assert event["name"] == "gen_ai.evaluation.result"
     assert event["attributes"]["gen_ai.evaluation.name"] == "relevance"
     assert event["attributes"]["gen_ai.evaluation.score.value"] == 0.92
@@ -176,15 +177,15 @@ async def test_get_trace_span_with_no_events_gets_empty_events_list() -> None:
     span = _make_span()
     backend.get_trace.return_value = _make_trace([span])
 
-    result = json.loads(await get_trace(backend, "t1"))
+    result = await get_trace(backend, "t1")
 
-    assert result["spans"][0]["events"] == []
+    assert result.spans[0].events == []
 
 
 async def test_get_trace_backend_exception_propagates() -> None:
     """When the backend raises (e.g. trace not found), get_trace must let it
     propagate so the MCP server reports CallToolResult(isError=True) per
-    SEP-2140, rather than swallowing it into a fake-success JSON payload."""
+    SEP-2140, rather than swallowing it into a fake-success payload."""
     backend = _fake_backend()
     backend.get_trace.side_effect = ValueError("no spans found for trace_id")
 
@@ -199,10 +200,10 @@ async def test_get_trace_error_status_span_propagates_has_errors() -> None:
     error_span = _make_span(span_id="s2", status="ERROR")
     backend.get_trace.return_value = _make_trace([ok_span, error_span], status="ERROR")
 
-    result = json.loads(await get_trace(backend, "t1"))
+    result = await get_trace(backend, "t1")
 
-    assert result["has_errors"] is True
-    statuses = {s["span_id"]: s["status"] for s in result["spans"]}
+    assert result.has_errors is True
+    statuses = {s.span_id: s.status for s in result.spans}
     assert statuses == {"s1": "OK", "s2": "ERROR"}
 
 
@@ -222,10 +223,11 @@ class TestModelsUsedDedup:
         )
         backend.get_trace.return_value = _make_trace([span_a, span_b])
 
-        result = json.loads(await get_trace(backend, "t1"))
+        result = await get_trace(backend, "t1")
 
-        assert result["llm_summary"]["llm_span_count"] == 2
-        assert result["llm_summary"]["models_used"] == ["gpt-4"]
+        assert result.llm_summary is not None
+        assert result.llm_summary["llm_span_count"] == 2
+        assert result.llm_summary["models_used"] == ["gpt-4"]
 
     async def test_keeps_distinct_models_separate(self) -> None:
         backend = _fake_backend()
@@ -239,9 +241,10 @@ class TestModelsUsedDedup:
         )
         backend.get_trace.return_value = _make_trace([span_a, span_b])
 
-        result = json.loads(await get_trace(backend, "t1"))
+        result = await get_trace(backend, "t1")
 
-        assert sorted(result["llm_summary"]["models_used"]) == ["claude-3-opus", "gpt-4"]
+        assert result.llm_summary is not None
+        assert sorted(result.llm_summary["models_used"]) == ["claude-3-opus", "gpt-4"]
 
 
 async def test_get_trace_sums_tokens_across_multiple_llm_spans() -> None:
@@ -266,10 +269,11 @@ async def test_get_trace_sums_tokens_across_multiple_llm_spans() -> None:
     )
     backend.get_trace.return_value = _make_trace([span_a, span_b])
 
-    result = json.loads(await get_trace(backend, "t1"))
+    result = await get_trace(backend, "t1")
 
-    assert result["llm_summary"]["total_tokens"] == 350
-    assert result["llm_summary"]["llm_span_count"] == 2
+    assert result.llm_summary is not None
+    assert result.llm_summary["total_tokens"] == 350
+    assert result.llm_summary["llm_span_count"] == 2
 
 
 async def test_get_trace_empty_gen_ai_system_is_not_counted_as_llm_span() -> None:
@@ -286,10 +290,10 @@ async def test_get_trace_empty_gen_ai_system_is_not_counted_as_llm_span() -> Non
     )
     backend.get_trace.return_value = _make_trace([span])
 
-    result = json.loads(await get_trace(backend, "t1"))
+    result = await get_trace(backend, "t1")
 
-    assert "llm_attributes" not in result["spans"][0]
-    assert "llm_summary" not in result
+    assert result.spans[0].llm_attributes is None
+    assert result.llm_summary is None
 
 
 async def test_get_trace_already_surfaces_score_and_evaluation_attributes() -> None:
@@ -304,9 +308,9 @@ async def test_get_trace_already_surfaces_score_and_evaluation_attributes() -> N
     )
     backend.get_trace.return_value = _make_trace([span])
 
-    result = json.loads(await get_trace(backend, "t1"))
+    result = await get_trace(backend, "t1")
 
-    attributes = result["spans"][0]["attributes"]
+    attributes = result.spans[0].attributes
     assert attributes["score.relevance"] == 0.87
     assert attributes["evaluation.passed"] is True
 
@@ -326,9 +330,93 @@ async def test_get_trace_already_surfaces_openinference_retriever_span_attribute
     )
     backend.get_trace.return_value = _make_trace([span])
 
-    result = json.loads(await get_trace(backend, "t1"))
+    result = await get_trace(backend, "t1")
 
-    attributes = result["spans"][0]["attributes"]
+    attributes = result.spans[0].attributes
     assert attributes["openinference.span.kind"] == "RETRIEVER"
     assert attributes["document.id"] == "doc-42"
     assert attributes["document.score"] == 0.87
+
+
+async def test_get_trace_echoes_requested_detail_level() -> None:
+    backend = _fake_backend()
+    span = _make_span()
+    backend.get_trace.return_value = _make_trace([span])
+
+    full_result = await get_trace(backend, "t1", detail_level="full")
+    summary_result = await get_trace(backend, "t1", detail_level="summary")
+
+    assert full_result.detail_level == "full"
+    assert summary_result.detail_level == "summary"
+
+
+async def test_get_trace_summary_elides_large_attribute_fields() -> None:
+    """detail_level="summary" replaces known-large gen_ai.* fields with an
+    omission marker, leaving other attributes untouched."""
+    backend = _fake_backend()
+    span = _make_span(
+        attrs={
+            "gen_ai.system": "openai",
+            "gen_ai.input.messages": [{"role": "user", "content": "hi"}],
+            "gen_ai.output.messages": [{"role": "assistant", "content": "hello"}],
+        }
+    )
+    backend.get_trace.return_value = _make_trace([span])
+
+    result = await get_trace(backend, "t1", detail_level="summary")
+
+    attributes = result.spans[0].attributes
+    assert attributes["gen_ai.system"] == "openai"
+    assert (
+        attributes["gen_ai.input.messages"]
+        == "<omitted 1 item(s) - pass detail_level='full' to include>"
+    )
+    assert (
+        attributes["gen_ai.output.messages"]
+        == "<omitted 1 item(s) - pass detail_level='full' to include>"
+    )
+
+
+async def test_get_trace_full_preserves_large_attribute_fields() -> None:
+    """detail_level="full" (the default) must reproduce this tool's
+    original, unbounded behavior exactly - locks in backward compat."""
+    backend = _fake_backend()
+    span = _make_span(
+        attrs={
+            "gen_ai.input.messages": [{"role": "user", "content": "hi"}],
+        }
+    )
+    backend.get_trace.return_value = _make_trace([span])
+
+    result = await get_trace(backend, "t1", detail_level="full")
+
+    assert result.spans[0].attributes["gen_ai.input.messages"] == [
+        {"role": "user", "content": "hi"}
+    ]
+
+
+async def test_get_trace_summary_truncates_long_event_attribute_values() -> None:
+    backend = _fake_backend()
+    long_value = "x" * 600
+    span = _make_span(
+        events=[SpanEvent(name="custom.event", timestamp=1000, attributes={"payload": long_value})]
+    )
+    backend.get_trace.return_value = _make_trace([span])
+
+    result = await get_trace(backend, "t1", detail_level="summary")
+
+    truncated = result.spans[0].events[0]["attributes"]["payload"]
+    assert truncated == "x" * 500 + "..."
+
+
+async def test_get_trace_summary_leaves_short_event_attributes_untouched() -> None:
+    """Guards against over-truncating normal small event data."""
+    backend = _fake_backend()
+    span = _make_span(
+        events=[SpanEvent(name="custom.debug.checkpoint", timestamp=1000, attributes={"step": 1})]
+    )
+    backend.get_trace.return_value = _make_trace([span])
+
+    result = await get_trace(backend, "t1", detail_level="summary")
+
+    assert result.spans[0].events[0]["attributes"] == {"step": 1}

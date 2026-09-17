@@ -14,6 +14,7 @@ CLI entrypoint.
 
 import json
 from collections.abc import Generator
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,7 +30,7 @@ from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.config import BackendConfig, ServerConfig
-from opentelemetry_mcp.models import SearchTracesResult
+from opentelemetry_mcp.models import SearchTracesResult, TraceDetail
 
 FAKE_API_KEY = "dd-key1"
 FAKE_APP_KEY = "dd-app1"
@@ -287,14 +288,25 @@ class TestToolWrappers:
 
     async def test_get_trace_passes_trace_id(self) -> None:
         await self._set_backend()
-        with patch.object(
-            server.trace, "get_trace", AsyncMock(return_value='{"trace":1}')
-        ) as mocked:
+        sentinel = TraceDetail(
+            trace_id="abc123",
+            service_name="svc",
+            root_operation="op",
+            start_time=datetime(2024, 1, 1),
+            duration_ms=1.0,
+            status="OK",
+            span_count=0,
+            has_errors=False,
+            spans=[],
+            detail_level="full",
+        )
+        with patch.object(server.trace, "get_trace", AsyncMock(return_value=sentinel)) as mocked:
             result = await server.get_trace(trace_id="abc123")
 
-        assert result == '{"trace":1}'
+        assert result is sentinel
         _, kwargs = mocked.call_args
         assert kwargs["trace_id"] == "abc123"
+        assert kwargs["detail_level"] == "full"
 
     async def test_get_trace_exception_propagates(self) -> None:
         await self._set_backend()

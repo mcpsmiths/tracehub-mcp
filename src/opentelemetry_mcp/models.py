@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -761,3 +761,44 @@ class SearchSpansResult(BaseModel):
 
     count: int
     spans: list[SpanSummary]
+
+
+class SpanDetail(BaseModel):
+    """Full per-span detail for the get_trace tool - see TraceDetail's
+    docstring for why this is a real model rather than a bare str."""
+
+    span_id: str
+    parent_span_id: str | None
+    operation_name: str
+    service_name: str
+    start_time: datetime
+    duration_ms: float
+    status: Literal["OK", "ERROR", "UNSET"]
+    attributes: dict[str, Any]
+    events: list[dict[str, Any]]
+    llm_attributes: dict[str, Any] | None = None
+
+
+class TraceDetail(BaseModel):
+    """Structured response shape for the get_trace tool - see
+    SearchTracesResult's docstring for why this is a real model rather than
+    a bare str.
+
+    detail_level echoes back what was actually applied: "full" reproduces
+    this tool's original byte-for-byte behavior; "summary" elides/truncates
+    the same known-large gen_ai.* fields that LLMSpanAttributes.prompt_preview/
+    completion_preview already only ever preview (e.g. gen_ai.input.messages,
+    gen_ai.output.messages) instead of dumping them in full.
+    """
+
+    trace_id: str
+    service_name: str
+    root_operation: str
+    start_time: datetime
+    duration_ms: float
+    status: Literal["OK", "ERROR", "UNSET"]
+    span_count: int
+    has_errors: bool
+    spans: list[SpanDetail]
+    llm_summary: dict[str, Any] | None = None
+    detail_level: Literal["summary", "full"]

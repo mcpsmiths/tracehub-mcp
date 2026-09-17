@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import sys
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 import click
 from fastmcp import FastMCP
@@ -23,7 +23,7 @@ from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.config import ServerConfig
-from opentelemetry_mcp.models import SearchSpansResult, SearchTracesResult
+from opentelemetry_mcp.models import SearchSpansResult, SearchTracesResult, TraceDetail
 from opentelemetry_mcp.observability import McpServerTracingMiddleware, configure_tracing
 from opentelemetry_mcp.tools import (
     compare,
@@ -281,20 +281,28 @@ async def search_traces(
 
 
 @mcp.tool(title="Get Trace", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
-async def get_trace(trace_id: str) -> str:
+async def get_trace(
+    trace_id: str, detail_level: Literal["summary", "full"] = "full"
+) -> TraceDetail:
     """Get complete trace details by trace ID.
 
     Returns all spans with attributes, including parsed Opentelemetry data for LLM operations.
 
     Args:
         trace_id: Trace identifier
+        detail_level: "full" (default) returns every attribute/event value
+            in full, unchanged from this tool's original behavior. "summary"
+            elides known-large gen_ai.* fields (input/output messages, system
+            instructions, retrieval documents) and truncates long
+            event-attribute values, for callers that don't need full
+            prompt/completion bodies.
 
     Returns:
-        JSON string with trace details
+        TraceDetail with complete trace data
     """
     try:
         backend = await _get_backend()
-        result = await trace.get_trace(backend, trace_id=trace_id)
+        result = await trace.get_trace(backend, trace_id=trace_id, detail_level=detail_level)
         return result
     except Exception as e:
         return _handle_tool_error("get_trace", e)
