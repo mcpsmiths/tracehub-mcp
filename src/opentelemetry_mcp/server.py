@@ -200,7 +200,7 @@ async def _get_backend() -> BaseBackend:
     return _backend
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Search Traces", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def search_traces(
     service_name: str | None = None,
     operation_name: str | None = None,
@@ -280,7 +280,7 @@ async def search_traces(
         return _handle_tool_error("search_traces", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Get Trace", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_trace(trace_id: str) -> str:
     """Get complete trace details by trace ID.
 
@@ -300,7 +300,7 @@ async def get_trace(trace_id: str) -> str:
         return _handle_tool_error("get_trace", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Get LLM Usage", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_llm_usage(
     start_time: str | None = None,
     end_time: str | None = None,
@@ -343,7 +343,7 @@ async def get_llm_usage(
         return _handle_tool_error("get_llm_usage", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="List Services", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def list_services() -> str:
     """List all available services in the OpenTelemetry backend.
 
@@ -358,7 +358,7 @@ async def list_services() -> str:
         return _handle_tool_error("list_services", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Find Errors", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def find_errors(
     start_time: str | None = None,
     end_time: str | None = None,
@@ -392,7 +392,7 @@ async def find_errors(
         return _handle_tool_error("find_errors", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="List LLM Models", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def list_llm_models(
     start_time: str | None = None,
     end_time: str | None = None,
@@ -429,7 +429,7 @@ async def list_llm_models(
         return _handle_tool_error("list_llm_models", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Get LLM Model Stats", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_llm_model_stats(
     model_name: str,
     start_time: str | None = None,
@@ -464,7 +464,7 @@ async def get_llm_model_stats(
         return _handle_tool_error("get_llm_model_stats", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="List Sessions", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def list_sessions(
     start_time: str | None = None,
     end_time: str | None = None,
@@ -504,7 +504,7 @@ async def list_sessions(
         return _handle_tool_error("list_sessions", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Get Session Stats", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_session_stats(
     conversation_id: str,
     start_time: str | None = None,
@@ -543,7 +543,7 @@ async def get_session_stats(
         return _handle_tool_error("get_session_stats", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Compare Time Windows", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def compare_time_windows(
     range_a_start: str | None = None,
     range_a_end: str | None = None,
@@ -594,7 +594,7 @@ async def compare_time_windows(
         return _handle_tool_error("compare_time_windows", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Investigate Cost Spike", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def investigate_cost_spike(
     recent_start: str,
     recent_end: str,
@@ -652,7 +652,7 @@ async def investigate_cost_spike(
         return _handle_tool_error("investigate_cost_spike", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Investigate Error Spike", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def investigate_error_spike(
     recent_start: str,
     recent_end: str,
@@ -709,7 +709,7 @@ async def investigate_error_spike(
         return _handle_tool_error("investigate_error_spike", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Get Prompt Version Stats", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_prompt_version_stats(
     start_time: str | None = None,
     end_time: str | None = None,
@@ -750,7 +750,7 @@ async def get_prompt_version_stats(
         return _handle_tool_error("get_prompt_version_stats", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Get LLM Expensive Traces", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_llm_expensive_traces(
     limit: int = 10,
     start_time: str | None = None,
@@ -793,7 +793,7 @@ async def get_llm_expensive_traces(
         return _handle_tool_error("get_llm_expensive_traces", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Get LLM Slow Traces", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def get_llm_slow_traces(
     limit: int = 10,
     start_time: str | None = None,
@@ -836,7 +836,7 @@ async def get_llm_slow_traces(
         return _handle_tool_error("get_llm_slow_traces", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="Search Spans", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def search_spans_tool(
     service_name: str | None = None,
     operation_name: str | None = None,
@@ -907,7 +907,7 @@ async def search_spans_tool(
         return _handle_tool_error("search_spans_tool", e)
 
 
-@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+@mcp.tool(title="List LLM Tools", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def list_llm_tools_tool(
     start_time: str | None = None,
     end_time: str | None = None,

@@ -607,6 +607,18 @@ class TestToolAnnotationsComplete:
             assert t.annotations.idempotentHint is True, t.name
             assert t.annotations.openWorldHint is True, t.name
 
+    async def test_every_tool_has_a_distinct_human_readable_title(self) -> None:
+        """Anthropic's Software Directory Policy requires readOnlyHint,
+        destructiveHint, and title on every tool - title lives on Tool
+        itself (FastMCP's title= kwarg), not inside ToolAnnotations."""
+        async with Client(server.mcp) as client:
+            tools = await client.list_tools()
+
+        assert len(tools) == 17
+        titles = [t.title for t in tools]
+        assert all(isinstance(title, str) and title for title in titles), titles
+        assert len(set(titles)) == 17, "titles must be distinct per tool"
+
 
 class TestClampLimit:
     """_clamp_limit enforces --max-traces-per-query/MAX_TRACES_PER_QUERY as
