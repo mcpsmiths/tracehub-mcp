@@ -28,6 +28,8 @@ jobs:
               run: uv sync --dev
             - name: Lint with Ruff
               run: uv run ruff check --output-format=github
+            - name: Format check with Ruff
+              run: uv run ruff format --check .
             - name: Lint with Mypy
               run: uv run mypy .
             - name: Audit dependencies for known vulnerabilities

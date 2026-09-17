@@ -2,6 +2,18 @@
 # Run `pre-commit install` once to enable, or `pre-commit run --all-files` ad hoc.
 # Hook versions are pinned to the exact ruff/mypy versions this project resolves
 # in pyproject.toml/uv.lock, so local pre-commit results match CI.
+#
+# mypy is skipped on pre-commit.ci specifically (not locally, not in real CI):
+# it's a `language: system` hook that shells out to `uv run mypy .`, and
+# pre-commit.ci's hosted sandbox has no `uv` on PATH - it provisions
+# `language: python`/`language: node` hooks itself but does zero setup for
+# `language: system` ones. That makes the hook fail with "Executable `uv`
+# not found" on every PR to this repo regardless of what changed (confirmed
+# on #20 and #21, neither of which touch Python). Real type-checking still
+# happens via the project's own `uv run mypy .` step in GitHub Actions CI.
+ci:
+  skip: [mypy]
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0

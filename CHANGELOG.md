@@ -1,3 +1,14 @@
+## v0.8.2 (2026-09-17)
+
+### Feat
+
+- **server**: add distinct human-readable title to all 17 tools
+
+### Fix
+
+- **jaeger**: fix typo in null-data comments flagged by codespell
+- **jaeger**: handle explicit null data field from list_services/get_service_operations
+
 ## v0.8.1 (2026-09-16)
 
 ### Fix
