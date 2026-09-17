@@ -12,6 +12,8 @@
 
 Also listed on the [official MCP registry](https://registry.modelcontextprotocol.io/v0/servers/io.github.mcpsmiths%2Ftracehub-mcp/versions) as `io.github.mcpsmiths/tracehub-mcp` (the registry's own `?search=` endpoint can surface an outdated version first; this exact-name endpoint always reflects the current `isLatest` release).
 
+[![tracehub-mcp MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp/badges/card.svg)](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp)
+
 **Give your AI assistant a direct line into your observability backend.** tracehub-mcp is an MCP (Model Context Protocol) server that lets Claude, Cursor, Windsurf, Gemini CLI, or any MCP client query OpenTelemetry traces from your LLM/GenAI application and reason about them — find expensive calls, debug errors, compare model performance, track token usage — without you copy-pasting trace JSON into a chat window.
 
 It speaks OpenTelemetry's `gen_ai.*` semantic conventions natively, so it understands prompts, completions, token usage, and finish reasons as first-class concepts, not just generic span attributes.
