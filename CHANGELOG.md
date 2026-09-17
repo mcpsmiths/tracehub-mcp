@@ -1,3 +1,10 @@
+## v0.9.0 (2026-09-17)
+
+### Feat
+
+- **server**: add /health and /ready HTTP endpoints
+- **trace**: add detail_level to get_trace, convert to typed output
+
 ## v0.8.2 (2026-09-17)
 
 ### Feat
