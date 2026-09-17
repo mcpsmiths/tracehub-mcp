@@ -51,7 +51,7 @@ jobs:
             - name: Test with pytest
               run: uv run pytest --cov-report=xml
             - name: Upload coverage to Codecov
-              uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+              uses: codecov/codecov-action@0b35c9ecc4f0529d0eb674914510c22f85b196b4 # v7.1.0
               with:
                 token: ${{ secrets.CODECOV_TOKEN }}
                 files: ./coverage.xml
@@ -141,7 +141,7 @@ jobs:
                   restore-keys: |
                       trivy-${{ runner.os }}-
             - name: Trivy scan (JSON)
-              uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1  # v0.35.0
+              uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
               with:
                   image-ref: tracehub-mcp-server:${{ github.sha }}-${{ matrix.platform }}
                   scanners: secret,vuln
