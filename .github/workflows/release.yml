@@ -2,6 +2,15 @@ name: Release
 
 on:
   workflow_dispatch:  # Manual trigger via GitHub Actions UI
+    inputs:
+      increment:
+        description: >-
+          Override the auto-detected bump (MAJOR/MINOR/PATCH). Leave empty to
+          let Commitizen infer it from conventional-commit prefixes as usual.
+        required: false
+        type: choice
+        default: ""
+        options: ["", "MAJOR", "MINOR", "PATCH"]
 
 permissions:
   contents: write      # Required for pushing commits, tags, and creating releases
@@ -43,6 +52,7 @@ jobs:
           # actual `git push` of the bump commit, which needs a token the
           # main-protection ruleset's bypass covers.
           github_token: ${{ secrets.RELEASE_PAT }}
+          increment: ${{ github.event.inputs.increment }}
           changelog_increment_filename: body.md
           # The action's own entrypoint runs `git config --local user.name/email`
           # unconditionally using these inputs (default: github-actions[bot]) --
