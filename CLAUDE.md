@@ -91,7 +91,7 @@ Each MCP capability is implemented as a separate tool module in [opentelemetry_m
 
 - [tools/search.py](opentelemetry_mcp/tools/search.py) - Search traces with filters
 - [tools/search_spans.py](opentelemetry_mcp/tools/search_spans.py) - Search individual spans with filters
-- [tools/trace.py](opentelemetry_mcp/tools/trace.py) - Get detailed trace by ID
+- [tools/trace.py](opentelemetry_mcp/tools/trace.py) - Get detailed trace by ID (`detail_level`: `"full"` default returns everything unbounded; `"summary"` elides large gen_ai.\* message/document fields and truncates long event attributes)
 - [tools/usage.py](opentelemetry_mcp/tools/usage.py) - Aggregate token usage metrics
 - [tools/services.py](opentelemetry_mcp/tools/services.py) - List available services
 - [tools/errors.py](opentelemetry_mcp/tools/errors.py) - Find traces with errors
@@ -167,6 +167,8 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `--print-config` - Print the resolved configuration as JSON and exit without starting the server (secrets reported as `*_set` booleans, never their actual value)
 
 **`tracehub-mcp doctor`** - Subcommand (not a flag) that runs startup diagnostics against the resolved backend config: config load, backend construction, `health_check()`, and a real read-only connectivity probe (`list_services`). Prints `[OK]`/`[FAIL]` per step and exits non-zero on any failure - unlike the server's own lazy backend initialization, which deliberately swallows a failed health check and keeps running. Accepts the same `--backend`/`--url`/etc. override flags as the main command, so a candidate config can be validated before committing to it.
+
+**HTTP Endpoints** (streamable-http transport only, registered via `FastMCP.custom_route` - not applicable to stdio): `GET /health` - liveness only, always `200 {"status": "ok"}`, no backend I/O. `GET /ready` - readiness, reuses the server's own cached backend (never closes it), `200` when `health_check`/`list_services` both succeed, `503` with details otherwise.
 
 **Configuration Precedence:** CLI args > environment variables > defaults
 
