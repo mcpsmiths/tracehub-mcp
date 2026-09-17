@@ -242,7 +242,11 @@ class JaegerBackend(BaseBackend):
         response.raise_for_status()
 
         data = response.json()
-        services_raw = data.get("data", [])
+        # A fresh/empty Jaeger instance can return {"data": null} rather than
+        # {"data": []} - the dict.get default only applies when the key is
+        # missing, not when the key is present with a null value, so `or []`
+        # is needed to avoid iterating over None.
+        services_raw = data.get("data") or []
         return [str(s) for s in services_raw]
 
     async def get_service_operations(self, service_name: str) -> list[str]:
@@ -263,7 +267,7 @@ class JaegerBackend(BaseBackend):
         response.raise_for_status()
 
         data = response.json()
-        return [str(op) for op in data.get("data", [])]
+        return [str(op) for op in (data.get("data") or [])]
 
     async def health_check(self) -> HealthCheckResponse:
         """Check Jaeger backend health.

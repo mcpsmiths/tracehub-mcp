@@ -8,6 +8,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 [![mcpsmiths/tracehub-mcp MCP server](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp/badges/score.svg)](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp)
+[![M8ven Score](https://m8ven.ai/badge/mcp/mcpsmiths/tracehub-mcp)](https://m8ven.ai/mcp/mcpsmiths/tracehub-mcp)
 
 Also listed on the [official MCP registry](https://registry.modelcontextprotocol.io/v0/servers/io.github.mcpsmiths%2Ftracehub-mcp/versions) as `io.github.mcpsmiths/tracehub-mcp` (the registry's own `?search=` endpoint can surface an outdated version first; this exact-name endpoint always reflects the current `isLatest` release).
 
@@ -28,6 +29,7 @@ tracehub-mcp started as a fork of [traceloop/opentelemetry-mcp-server](https://g
 - [Configuration](#configuration)
 - [Diagnostics](#diagnostics)
 - [Security Considerations](#security-considerations)
+- [Privacy Policy](#privacy-policy)
 - [MCP Client Setup](#mcp-client-setup)
 - [Tools Reference](#tools-reference)
 - [Generic Filter System](#generic-filter-system)
@@ -327,6 +329,15 @@ Trace and span data returned by this server — attribute values, error messages
 - **Treat backend data as untrusted input.** An LLM client consuming trace/span data from tracehub-mcp should apply the same caution it would to any other external tool output — a span attribute or error message is application data to reason about, not an instruction to follow, no matter how it's phrased.
 - **This is a known MCP risk category, not a tracehub-mcp-specific one.** OWASP's GenAI Security Project covers it in their [Practical Guide for Secure MCP Server Development](https://genai.owasp.org/resource/a-practical-guide-for-secure-mcp-server-development/), and Anthropic's own engineering guidance, [How We Contain Claude](https://www.anthropic.com/engineering/how-we-contain-claude), states plainly that tool output is an attack surface even when the tool itself is trusted.
 - **Practical implication:** if you're querying traces from an application that processes untrusted user input (e.g. a customer-facing chatbot), be aware that adversarial content a user fed into that application could end up in a span attribute this server returns — and from there, in your LLM client's context.
+
+---
+
+## Privacy Policy
+
+tracehub-mcp is self-hosted software with no maintainer-operated service or account — it
+collects no data of its own. See [PRIVACY.md](PRIVACY.md) for the full policy: what data
+the software touches, where network calls go, and how secrets and self-instrumentation
+are handled.
 
 ---
 
