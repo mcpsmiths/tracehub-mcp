@@ -1,0 +1,74 @@
+name: Pricing Drift Check
+
+on:
+  workflow_dispatch: # Manual trigger
+  schedule:
+    - cron: "0 6 * * 1" # Weekly, Monday 06:00 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-drift:
+    name: Check for litellm pricing drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Setup UV
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Refresh vendored pricing table
+        # Runs the existing, unmodified refresh script - see
+        # src/opentelemetry_mcp/pricing/README.md for why this project
+        # deliberately does not auto-fetch pricing at runtime (litellm's
+        # own automated pricing-updater has failed silently before).
+        # This job only automates *noticing* drift; a human still reviews
+        # and merges the resulting PR.
+        run: uv run python scripts/sync_model_prices.py
+
+      - name: Sanity-check the fetched payload before proceeding
+        run: |
+          uv run python -c "
+          import json
+          data = json.loads(open('src/opentelemetry_mcp/pricing/model_prices.json').read())
+          assert isinstance(data, dict), 'expected a JSON object'
+          assert len(data) > 10, f'suspiciously few entries: {len(data)}'
+          print(f'Sanity check passed: {len(data)} entries')
+          "
+
+      - name: Check for drift
+        id: diff
+        run: |
+          if git diff --quiet -- src/opentelemetry_mcp/pricing/model_prices.json src/opentelemetry_mcp/pricing/metadata.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open PR on drift
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
+        with:
+          commit-message: "chore(pricing): sync vendored litellm pricing table"
+          title: "chore(pricing): vendored pricing table drift detected"
+          body: |
+            Automated weekly sync detected drift between the vendored
+            `model_prices.json`/`metadata.json` and litellm's upstream
+            `model_prices_and_context_window.json`. Review the diff before
+            merging - see `src/opentelemetry_mcp/pricing/README.md`.
+          branch: chore/pricing-sync-drift
+          delete-branch: true
+          labels: automated,pricing
