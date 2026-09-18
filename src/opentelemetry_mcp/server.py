@@ -28,6 +28,7 @@ from opentelemetry_mcp.backends.jaeger import JaegerBackend
 from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
+from opentelemetry_mcp.backends.xray import XRayBackend
 from opentelemetry_mcp.config import ServerConfig
 from opentelemetry_mcp.models import SearchSpansResult, SearchTracesResult, TraceDetail
 from opentelemetry_mcp.observability import (
@@ -164,6 +165,14 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
             api_key=backend_config.api_key,
             org_slug=backend_config.sentry_org,
             project_slug=backend_config.sentry_project,
+            timeout=backend_config.timeout,
+        )
+    elif backend_config.type == "xray":
+        logger.info(f"Initializing X-Ray backend: region {backend_config.aws_region}")
+        backend = XRayBackend(
+            url=str(backend_config.url),
+            api_key=backend_config.api_key,
+            aws_region=backend_config.aws_region,
             timeout=backend_config.timeout,
         )
     else:
@@ -1258,7 +1267,7 @@ def _backend_config_options(f: Any) -> Any:
     before committing to it via the same flags main accepts."""
     f = click.option(
         "--backend",
-        type=click.Choice(["jaeger", "tempo", "traceloop", "datadog", "sentry"]),
+        type=click.Choice(["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"]),
         help="Backend type (overrides BACKEND_TYPE env var)",
     )(f)
     f = click.option(
@@ -1302,6 +1311,11 @@ def _backend_config_options(f: Any) -> Any:
         type=str,
         help="Comma-separated list of environments for Traceloop backend "
         "(overrides BACKEND_ENVIRONMENTS env var)",
+    )(f)
+    f = click.option(
+        "--aws-region",
+        type=str,
+        help="AWS region, required by the X-Ray backend (overrides BACKEND_AWS_REGION env var)",
     )(f)
     return f
 
@@ -1433,6 +1447,7 @@ def main(
     sentry_org: str | None,
     sentry_project: str | None,
     environments: str | None,
+    aws_region: str | None,
     print_config: bool,
     transport: str,
     host: str,
@@ -1450,7 +1465,7 @@ def main(
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
-    Supports multiple backends: Jaeger, Tempo, Traceloop, Datadog, and Sentry.
+    Supports multiple backends: Jaeger, Tempo, Traceloop, Datadog, Sentry, and AWS X-Ray.
     Configuration can be provided via environment variables or CLI arguments.
 
     Transport options:
@@ -1495,6 +1510,7 @@ def main(
             or sentry_org
             or sentry_project
             or environments
+            or aws_region
             or log_level
             or max_traces_per_query is not None
             or slow_request_threshold_ms is not None
@@ -1508,6 +1524,7 @@ def main(
                 sentry_org=sentry_org,
                 sentry_project=sentry_project,
                 tempo_instance_id=tempo_instance_id,
+                aws_region=aws_region,
                 environments=environments,
                 log_level=log_level,
                 max_traces_per_query=max_traces_per_query,
@@ -1532,6 +1549,7 @@ def main(
                     "sentry_org": _config.backend.sentry_org,
                     "sentry_project": _config.backend.sentry_project,
                     "tempo_instance_id": _config.backend.tempo_instance_id,
+                    "aws_region": _config.backend.aws_region,
                     "api_key_set": _config.backend.api_key is not None,
                     "app_key_set": _config.backend.app_key is not None,
                 },
@@ -1623,6 +1641,7 @@ def doctor(
     sentry_org: str | None,
     sentry_project: str | None,
     environments: str | None,
+    aws_region: str | None,
 ) -> None:
     """Run startup diagnostics against the resolved backend config: config
     load, backend construction, health check, and a live read-only
@@ -1643,6 +1662,7 @@ def doctor(
             or sentry_org
             or sentry_project
             or environments
+            or aws_region
         ):
             config.apply_cli_overrides(
                 backend_type=backend,
@@ -1652,6 +1672,7 @@ def doctor(
                 sentry_org=sentry_org,
                 sentry_project=sentry_project,
                 tempo_instance_id=tempo_instance_id,
+                aws_region=aws_region,
                 environments=environments,
             )
         click.secho("[OK] Configuration loaded and validated", fg="green")

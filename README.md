@@ -84,8 +84,9 @@ See [MCP Client Setup](#mcp-client-setup) for Cursor, Windsurf, VS Code, and Gem
 - **[Traceloop](https://www.traceloop.com/)** — cloud LLM observability platform, API-key auth.
 - **[Datadog](https://www.datadoghq.com/)** — cloud APM, requires an API key *and* an Application key.
 - **[Sentry](https://sentry.io/)** — cloud or self-hosted, requires an auth token and an organization slug.
+- **[AWS X-Ray](https://aws.amazon.com/xray/)** — SigV4-signed via `boto3`, requires an AWS region and standard AWS credentials (not an API key). Because OTel span attributes land in unindexed X-Ray segment *metadata* by default (only *annotations* are queryable), native server-side filtering is narrower here than for the other backends — see the [Backend Support Matrix](#backend-support-matrix).
 
-All five implement the same `BaseBackend` interface, so every MCP tool works identically regardless of which one you point the server at. See [Configuration](#configuration) for per-backend setup.
+All six implement the same `BaseBackend` interface, so every MCP tool works identically regardless of which one you point the server at. See [Configuration](#configuration) for per-backend setup.
 
 ---
 
@@ -169,13 +170,14 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 
 | Variable                 | Type    | Default  | Description                                                          |
 | ------------------------ | ------- | -------- | ---------------------------------------------------------------------|
-| `BACKEND_TYPE`           | string  | `jaeger` | Backend type: `jaeger`, `tempo`, `traceloop`, `datadog`, or `sentry`  |
-| `BACKEND_URL`            | URL     | -        | Backend API endpoint (required)                                     |
-| `BACKEND_API_KEY`        | string  | -        | API key/auth token (required for Traceloop, Datadog, and Sentry)     |
+| `BACKEND_TYPE`           | string  | `jaeger` | Backend type: `jaeger`, `tempo`, `traceloop`, `datadog`, `sentry`, or `xray` |
+| `BACKEND_URL`            | URL     | -        | Backend API endpoint (required; decorative-only placeholder for X-Ray) |
+| `BACKEND_API_KEY`        | string  | -        | API key/auth token (required for Traceloop, Datadog, and Sentry; unused by X-Ray) |
 | `BACKEND_APP_KEY`        | string  | -        | Application key (Datadog only, in addition to `BACKEND_API_KEY`)     |
 | `BACKEND_TEMPO_INSTANCE_ID` | string | -     | Grafana Cloud stack/instance ID (Tempo only, enables Basic Auth in addition to `BACKEND_API_KEY`) |
 | `BACKEND_SENTRY_ORG`     | string  | -        | Organization slug (required for Sentry)                             |
 | `BACKEND_SENTRY_PROJECT` | string  | -        | Project slug (optional for Sentry, narrows queries to one project)   |
+| `BACKEND_AWS_REGION`     | string  | -        | AWS region, e.g. `us-east-1` (required for X-Ray)                    |
 | `BACKEND_ENVIRONMENTS`   | string  | `prd`    | Comma-separated environments (Traceloop only)                        |
 | `BACKEND_TIMEOUT`        | float   | `30`     | Request timeout in seconds                                           |
 | `LOG_LEVEL`              | string  | `INFO`   | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (`--log-level`)    |
@@ -186,7 +188,7 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | unset | Enables opt-in OTel self-instrumentation of tool calls when set; unset means zero overhead (no TracerProvider configured, no middleware registered) |
 | `OTEL_SERVICE_NAME`      | string  | `tracehub-mcp` | Service name reported in self-instrumentation spans                |
 
-Every backend-related CLI flag has a matching env var (`--backend`/`BACKEND_TYPE`, `--url`/`BACKEND_URL`, `--api-key`/`BACKEND_API_KEY`, `--app-key`/`BACKEND_APP_KEY`, `--tempo-instance-id`/`BACKEND_TEMPO_INSTANCE_ID`, `--sentry-org`/`BACKEND_SENTRY_ORG`, `--sentry-project`/`BACKEND_SENTRY_PROJECT`, `--environments`/`BACKEND_ENVIRONMENTS`). `--disable-tools <name1,name2,...>` / `--enabled-tools <name1,name2,...>` (CLI-only, no env var) remove/allowlist tools for reduced-trust deployments - `--enabled-tools` is applied first, `--disable-tools` on top of whatever it kept. Run `tracehub-mcp --help` for the full list.
+Every backend-related CLI flag has a matching env var (`--backend`/`BACKEND_TYPE`, `--url`/`BACKEND_URL`, `--api-key`/`BACKEND_API_KEY`, `--app-key`/`BACKEND_APP_KEY`, `--tempo-instance-id`/`BACKEND_TEMPO_INSTANCE_ID`, `--sentry-org`/`BACKEND_SENTRY_ORG`, `--sentry-project`/`BACKEND_SENTRY_PROJECT`, `--aws-region`/`BACKEND_AWS_REGION`, `--environments`/`BACKEND_ENVIRONMENTS`). `--disable-tools <name1,name2,...>` / `--enabled-tools <name1,name2,...>` (CLI-only, no env var) remove/allowlist tools for reduced-trust deployments - `--enabled-tools` is applied first, `--disable-tools` on top of whatever it kept. Run `tracehub-mcp --help` for the full list.
 
 **Known third-party egress dependency:** the underlying FastMCP framework checks PyPI (`https://pypi.org/pypi/fastmcp/json`) for a newer FastMCP release once every 12 hours when it prints its startup banner - this is FastMCP's own behavior, not tracehub-mcp's, and unrelated to the OTel self-instrumentation above. It fails silently if there's no network access. For network-restricted/air-gapped deployments, disable it with `FASTMCP_CHECK_FOR_UPDATES=off`, or suppress the banner entirely with `FASTMCP_SHOW_SERVER_BANNER=false`.
 
@@ -272,6 +274,25 @@ BACKEND_SENTRY_PROJECT=your-project-slug
 Sentry requires **both** an auth token *and* an organization slug — every endpoint this backend calls is organization-scoped. Trace search uses [Sentry's search syntax](https://docs.sentry.io/concepts/search/) against the Discover/Explore Events API. Unlike Datadog, Sentry does have a native trace-lookup endpoint, so `get_trace` calls it directly instead of reconstructing a trace from spans — `search_traces` still discovers candidate trace IDs via a span search first, since Sentry's search surface is itself span-centric. Like Datadog, this backend refuses a plain `http://` URL.
 
 > **Troubleshooting:** a `403`/`401` from the Sentry API almost always means the auth token is missing, invalid, or lacks the necessary scopes. A `404` on an org-scoped endpoint usually means the organization slug is wrong. For a self-hosted install, `BACKEND_URL` should be the install's own base URL, not `https://sentry.io`. Some of the tracing endpoints this backend depends on are newer/experimental on Sentry's side and may not be available on every plan or self-hosted version — see the module docstring in [backends/sentry.py](src/opentelemetry_mcp/backends/sentry.py) for specifics.
+
+</details>
+
+<details>
+<summary><b>AWS X-Ray</b></summary>
+
+```bash
+BACKEND_TYPE=xray
+# Decorative only - never dereferenced for a live request. Keep it
+# consistent with BACKEND_AWS_REGION by convention.
+BACKEND_URL=https://xray.us-east-1.amazonaws.com
+BACKEND_AWS_REGION=us-east-1
+```
+
+Unlike every other backend here, X-Ray is queried via `boto3`/SigV4, not a bearer token — auth comes from boto3's standard credential chain (environment variables, `~/.aws/credentials`, an assumed role, or an instance/task role). The running process needs `xray:GetTraceSummaries`, `xray:BatchGetTraces`, and (optionally, for faster `list_services`) `xray:GetServiceGraph` IAM permissions.
+
+**Filtering is more limited than the other backends.** By default, OpenTelemetry span attributes are converted to X-Ray segment *metadata*, not *annotations* — only annotations are indexed and queryable via X-Ray's `FilterExpression` search syntax. This backend can only natively push down service name, duration, and error/fault/throttle-derived status; every other field (including all `gen_ai.*` attributes) is always applied client-side after hydrating full traces, unless your own OTel/ADOT collector config explicitly promotes those keys to indexed annotations.
+
+> **Troubleshooting:** an `AccessDeniedException` from `GetServiceGraph` is non-fatal — `list_services` automatically falls back to sampling recent traces. An `AccessDeniedException` from `GetTraceSummaries`/`BatchGetTraces` is fatal for search/hydration and will surface as an unhealthy `health_check`/`doctor` result; double check the IAM permissions above.
 
 </details>
 
@@ -546,18 +567,19 @@ tracehub-mcp exposes **17 MCP tools**:
 
 ### Backend Support Matrix
 
-| Feature          | Jaeger | Tempo | Traceloop | Datadog | Sentry |
-| ---------------- | :----: | :---: | :-------: | :-----: | :----: |
-| Search traces    |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓‡   |
-| Search spans     |  ✓\*   |   ✓   |     ✓     |    ✓    |   ✓    |
-| Get trace by ID  |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓    |
-| Advanced filters |   ✓    |   ✓   |     ✓     |    ✓    |    ✓    |
-| Error traces     |   ✓    |   ✓   |     ✓     |    ✓    |    ✓    |
-| All LLM tools    |   ✓    |   ✓   |     ✓     |    ✓    |    ✓    |
+| Feature          | Jaeger | Tempo | Traceloop | Datadog | Sentry | AWS X-Ray |
+| ---------------- | :----: | :---: | :-------: | :-----: | :----: | :-------: |
+| Search traces    |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓‡   |    ✓†     |
+| Search spans     |  ✓\*   |   ✓   |     ✓     |    ✓    |   ✓    |    ✓†     |
+| Get trace by ID  |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓    |    ✓      |
+| Advanced filters |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓§     |
+| Error traces     |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓      |
+| All LLM tools    |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓      |
 
 <sub>\* Jaeger requires the `service_name` parameter for span search.</sub><br>
-<sub>† Datadog has no trace-level API; traces are reconstructed by searching spans and grouping by `trace_id`, with every result re-verified against the exact ID requested.</sub><br>
-<sub>‡ Sentry does have a native trace-lookup endpoint (unlike Datadog), so `get_trace` calls it directly; `search_traces` still discovers candidate trace IDs via a span search first, since Sentry's search surface is itself span-centric.</sub>
+<sub>† Datadog and AWS X-Ray have no trace-level *search* API (X-Ray's `BatchGetTraces` fetches by exact ID); traces are reconstructed by searching (spans, or X-Ray trace summaries) and hydrating, with every result re-verified against the exact ID requested.</sub><br>
+<sub>‡ Sentry does have a native trace-lookup endpoint (unlike Datadog), so `get_trace` calls it directly; `search_traces` still discovers candidate trace IDs via a span search first, since Sentry's search surface is itself span-centric.</sub><br>
+<sub>§ AWS X-Ray natively filters only service name, duration, and error/fault/throttle-derived status — OTel attributes (including all `gen_ai.*` fields) land in unindexed segment *metadata* by default, not indexed *annotations*, so they're always applied client-side rather than pushed down to `FilterExpression`.</sub>
 
 ### Key Tool Details
 
@@ -903,7 +925,7 @@ Two ideas are deliberately **not** built yet — they're being deferred until v0
 - **Cross-backend correlation** — querying multiple configured backends in a single call and correlating results across them (e.g. a Datadog trace and its downstream Sentry error, joined).
 - **Agent-native triage** — tools that flag a likely root cause rather than just returning raw trace data, so an agent can act on a diagnosis instead of re-deriving one from a trace dump every time.
 
-Beyond that, the next backends under research (in order, not yet started): **Grafana Cloud**, **New Relic**, **Honeycomb**, **AWS X-Ray**.
+Beyond that, the next backends under research (in order, not yet started): **Grafana Cloud**, **New Relic**, **Honeycomb**.
 
 Carried over from upstream's older roadmap and still pending, re-prioritized behind the above rather than dropped: cost calculation with built-in pricing tables, model performance comparison tools, prompt pattern analysis, MCP resources for common queries, a caching layer for frequent queries, and SigNoz/ClickHouse backend support.
 

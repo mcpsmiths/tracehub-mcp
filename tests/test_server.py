@@ -29,6 +29,7 @@ from opentelemetry_mcp.backends.jaeger import JaegerBackend
 from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
+from opentelemetry_mcp.backends.xray import XRayBackend
 from opentelemetry_mcp.config import BackendConfig, ServerConfig
 from opentelemetry_mcp.models import SearchTracesResult, TraceDetail
 
@@ -68,7 +69,7 @@ def reset_server_globals() -> Generator[None]:
 
 
 class TestCreateBackend:
-    """_create_backend is a pure factory - verify each of the 5 backend
+    """_create_backend is a pure factory - verify each of the 6 backend
     types produces the right class with the right constructor args threaded
     through, plus the ValueError branch for an unsupported type."""
 
@@ -136,6 +137,19 @@ class TestCreateBackend:
         assert backend.org_slug == FAKE_SENTRY_ORG
         assert backend.project_slug == FAKE_SENTRY_PROJECT
         assert backend.timeout == 13.0
+
+    def test_xray(self) -> None:
+        config = _config(
+            type="xray",
+            url=HttpUrl("https://xray.us-east-1.amazonaws.com"),
+            aws_region="us-east-1",
+            timeout=8.0,
+        )
+        backend = server._create_backend(config)
+
+        assert isinstance(backend, XRayBackend)
+        assert backend.aws_region == "us-east-1"
+        assert backend.timeout == 8.0
 
     def test_unsupported_backend_type_raises(self) -> None:
         config = _config(type="jaeger")
@@ -792,6 +806,7 @@ class TestMainCli:
             sentry_org=FAKE_SENTRY_ORG,
             sentry_project=FAKE_SENTRY_PROJECT,
             tempo_instance_id=FAKE_TEMPO_INSTANCE_ID,
+            aws_region=None,
             environments="prd,staging",
             log_level=None,
             max_traces_per_query=None,

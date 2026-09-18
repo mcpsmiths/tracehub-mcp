@@ -82,6 +82,7 @@ Concrete implementations:
 - [backends/traceloop.py](opentelemetry_mcp/backends/traceloop.py) - Traceloop backend
 - [backends/datadog.py](opentelemetry_mcp/backends/datadog.py) - Datadog backend
 - [backends/sentry.py](opentelemetry_mcp/backends/sentry.py) - Sentry backend
+- [backends/xray.py](opentelemetry_mcp/backends/xray.py) - AWS X-Ray backend (boto3/SigV4, not httpx - see its module docstring)
 
 ### Tool-Based Architecture
 
@@ -140,12 +141,13 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 
 **Environment Variables** (see [.env.example](.env.example)):
 
-- `BACKEND_TYPE` - Required: `jaeger`, `tempo`, `traceloop`, `datadog`, or `sentry`
-- `BACKEND_URL` - Required: Backend API endpoint
-- `BACKEND_API_KEY` - Optional: Authentication key
+- `BACKEND_TYPE` - Required: `jaeger`, `tempo`, `traceloop`, `datadog`, `sentry`, or `xray`
+- `BACKEND_URL` - Required: Backend API endpoint (decorative-only placeholder for X-Ray - see config.py's `BackendConfig.url` docstring)
+- `BACKEND_API_KEY` - Optional: Authentication key (unused by X-Ray, which authenticates via boto3's standard AWS credential chain)
 - `BACKEND_APP_KEY` - Required for Datadog backend only: Application key, in addition to `BACKEND_API_KEY`
 - `BACKEND_SENTRY_ORG` - Required for Sentry backend only: Organization slug
 - `BACKEND_SENTRY_PROJECT` - Optional for Sentry backend: Project slug to narrow queries
+- `BACKEND_AWS_REGION` - Required for X-Ray backend only: AWS region (e.g. `us-east-1`)
 - `BACKEND_TIMEOUT` - Optional: Request timeout (default: 30s)
 - `BACKEND_TEMPO_INSTANCE_ID` - Optional for Tempo backend: Grafana Cloud stack/instance ID (Basic Auth with `BACKEND_API_KEY` instead of Bearer auth)
 - `LOG_LEVEL` - Optional: Logging level (default: INFO)
@@ -238,12 +240,17 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
 1. Create new file in [opentelemetry_mcp/backends/](opentelemetry_mcp/backends/)
 2. Extend `BaseBackend` class
 3. Implement all abstract methods
-4. Add to backend factory in [config.py](opentelemetry_mcp/config.py)
-5. Add the new backend name to all 4 hardcoded backend-name literal sites (must update in
+4. Add a branch to the `_create_backend` factory in [server.py](opentelemetry_mcp/server.py)
+   (not config.py - config.py only holds the config *schema*). Any field the backend needs
+   beyond `url`/`api_key`/`timeout` (e.g. Sentry's `org_slug`, X-Ray's `aws_region`) is read
+   unconditionally from `BackendConfig` regardless of `type` - there is no per-backend-type
+   *validation* at the config layer; "required for this backend" is enforced inside the
+   concrete backend's own `__init__` via a `ValueError`, not in config.py
+5. Add the new backend name to every hardcoded backend-name literal site (must update in
    lockstep): [config.py](opentelemetry_mcp/config.py)'s `BackendConfig.type` `Literal` (and its
-   `from_env`/`apply_cli_overrides` validation), [attributes.py](opentelemetry_mcp/attributes.py)'s
-   `HealthCheckResponse.backend` `Literal`, and [server.py](opentelemetry_mcp/server.py)'s
-   `click.Choice` for the `--backend` CLI flag
+   `from_env`/`apply_cli_overrides` inline validation lists),
+   [attributes.py](opentelemetry_mcp/attributes.py)'s `HealthCheckResponse.backend` `Literal`, and
+   [server.py](opentelemetry_mcp/server.py)'s `click.Choice` for the `--backend` CLI flag
 
 ### 6. Adding New Tools
 
@@ -588,6 +595,7 @@ The server uses a hybrid filtering strategy:
 | **Datadog**         | Most operators via span-search syntax                                                     | Field names validated against an allowlist before being spliced into the query |
 | **Sentry**          | Most operators via Discover search syntax                                                 | Same field-name allowlisting as Datadog |
 | **Jaeger**          | equals (via tags only)                                                                    | **Requires service_name parameter** |
+| **AWS X-Ray**       | equals, not_equals, gt, lt, gte, lte, in - only on `service.name`/`duration`/`status`      | `gen_ai.*` and every other field is never natively filterable via `FilterExpression` - by default OTel attributes land in unindexed segment *metadata*, not indexed *annotations* (undetectable at runtime) - always applied client-side |
 
 ### Combining Filters
 

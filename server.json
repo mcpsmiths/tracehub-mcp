@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mcpsmiths/tracehub-mcp",
-  "description": "Query OpenTelemetry traces from LLM apps across Jaeger, Tempo, Traceloop, Datadog, and Sentry.",
+  "description": "Query OpenTelemetry traces from LLM apps across Jaeger, Tempo, Traceloop, Datadog, Sentry, and AWS X-Ray.",
   "repository": {
     "url": "https://github.com/mcpsmiths/tracehub-mcp",
     "source": "github"
@@ -22,21 +22,28 @@
           "isRequired": true,
           "isSecret": false,
           "format": "string",
-          "choices": ["jaeger", "tempo", "traceloop", "datadog", "sentry"],
+          "choices": ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"],
           "default": "jaeger"
         },
         {
           "name": "BACKEND_URL",
-          "description": "Backend API endpoint, e.g. http://localhost:16686 for Jaeger or https://api.datadoghq.com for Datadog.",
+          "description": "Backend API endpoint, e.g. http://localhost:16686 for Jaeger or https://api.datadoghq.com for Datadog. For the X-Ray backend this is decorative only (e.g. https://xray.us-east-1.amazonaws.com) - never dereferenced for a live request.",
           "isRequired": true,
           "isSecret": false,
           "format": "string"
         },
         {
           "name": "BACKEND_API_KEY",
-          "description": "API key or auth token. Required for Traceloop, Datadog, and Sentry; not used by Jaeger or Tempo.",
+          "description": "API key or auth token. Required for Traceloop, Datadog, and Sentry; not used by Jaeger, Tempo, or X-Ray.",
           "isRequired": false,
           "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "BACKEND_AWS_REGION",
+          "description": "AWS region, e.g. us-east-1. Required for the X-Ray backend only - X-Ray authenticates via boto3's standard AWS credential chain, not BACKEND_API_KEY.",
+          "isRequired": false,
+          "isSecret": false,
           "format": "string"
         },
         {

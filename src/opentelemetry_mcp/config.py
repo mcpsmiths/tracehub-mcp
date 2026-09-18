@@ -18,7 +18,7 @@ load_dotenv()
 class BackendConfig(BaseModel):
     """Configuration for OpenTelemetry trace backend."""
 
-    type: Literal["jaeger", "tempo", "traceloop", "datadog", "sentry"]
+    type: Literal["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"]
     url: HttpUrl
     api_key: str | None = Field(default=None, exclude=True)
     app_key: str | None = Field(
@@ -38,6 +38,9 @@ class BackendConfig(BaseModel):
         description="Grafana Cloud stack/instance ID for Basic Auth (Tempo backend only, "
         "used instead of Bearer auth when set - required for Grafana Cloud-hosted Tempo, "
         "not needed for self-hosted Tempo)",
+    )
+    aws_region: str | None = Field(
+        default=None, exclude=True, description="AWS region (X-Ray backend only)"
     )
     timeout: float = Field(default=30.0, gt=0, le=300)
     environments: list[str] = Field(default_factory=lambda: ["prd"])
@@ -77,10 +80,10 @@ class BackendConfig(BaseModel):
         """Load configuration from environment variables."""
         backend_type = os.getenv("BACKEND_TYPE", "jaeger")
         backend_url = os.getenv("BACKEND_URL", "http://localhost:16686")
-        if backend_type not in ["jaeger", "tempo", "traceloop", "datadog", "sentry"]:
+        if backend_type not in ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"]:
             raise ValueError(
                 f"Invalid BACKEND_TYPE: {backend_type}. "
-                "Must be one of: jaeger, tempo, traceloop, datadog, sentry"
+                "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray"
             )
 
         # Parse environments from comma-separated string
@@ -103,6 +106,7 @@ class BackendConfig(BaseModel):
             sentry_org=os.getenv("BACKEND_SENTRY_ORG"),
             sentry_project=os.getenv("BACKEND_SENTRY_PROJECT"),
             tempo_instance_id=os.getenv("BACKEND_TEMPO_INSTANCE_ID"),
+            aws_region=os.getenv("BACKEND_AWS_REGION"),
             timeout=timeout,
             environments=environments,
         )
@@ -177,6 +181,7 @@ class ServerConfig(BaseModel):
         sentry_org: str | None = None,
         sentry_project: str | None = None,
         tempo_instance_id: str | None = None,
+        aws_region: str | None = None,
         environments: str | None = None,
         log_level: str | None = None,
         max_traces_per_query: int | None = None,
@@ -216,10 +221,10 @@ class ServerConfig(BaseModel):
             self.max_traces_per_query = max_traces_per_query
 
         if backend_type:
-            if backend_type not in ["jaeger", "tempo", "traceloop", "datadog", "sentry"]:
+            if backend_type not in ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"]:
                 raise ValueError(
                     f"Invalid backend type: {backend_type}. "
-                    "Must be one of: jaeger, tempo, traceloop, datadog, sentry"
+                    "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray"
                 )
             self.backend.type = backend_type  # type: ignore
 
@@ -246,6 +251,9 @@ class ServerConfig(BaseModel):
 
         if tempo_instance_id:
             self.backend.tempo_instance_id = tempo_instance_id
+
+        if aws_region:
+            self.backend.aws_region = aws_region
 
         if environments:
             self.backend.environments = [
