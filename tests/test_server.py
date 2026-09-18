@@ -836,8 +836,24 @@ class TestMainCli:
         assert call_kwargs["port"] == 9001
         # HTTP transport must wire in the Origin-validation middleware
         # (Tier 1 security fix: fastmcp disables DNS-rebinding protection
-        # by default, see OriginValidationMiddleware's docstring).
+        # by default, see OriginValidationMiddleware's docstring), and the
+        # rate limiter (enabled by default, see RateLimitMiddleware).
         middleware = call_kwargs["middleware"]
+        assert len(middleware) == 2
+        assert middleware[0].cls is server.OriginValidationMiddleware
+        assert middleware[1].cls is server.RateLimitMiddleware
+
+    def test_rate_limit_disabled_when_max_requests_is_zero(self) -> None:
+        runner = CliRunner()
+        with patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(
+                server.main,
+                ["--transport", "http", "--rate-limit-max-requests", "0"],
+            )
+
+        assert result.exit_code == 0, result.output
+        middleware = mock_mcp.run.call_args.kwargs["middleware"]
         assert len(middleware) == 1
         assert middleware[0].cls is server.OriginValidationMiddleware
 

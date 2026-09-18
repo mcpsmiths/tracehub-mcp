@@ -5,6 +5,8 @@ import json
 import logging
 import re
 import sys
+import time
+from collections.abc import Callable
 from typing import Any, Literal, NoReturn
 
 import click
@@ -1096,6 +1098,68 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+class _FixedWindowRateLimiter:
+    """Fixed-window (start_time, count) rate limiter keyed by an arbitrary
+    string, guarded by an asyncio.Lock. No rate-limiting dependency exists
+    in this repo (slowapi/asgi-ratelimit/redis/limits: zero matches), so
+    this is hand-rolled to match backends/base.py's own precedent of
+    hand-rolling retry/SSRF-guarding rather than adding a library.
+    """
+
+    def __init__(
+        self,
+        max_requests: int,
+        window_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._max_requests = max_requests
+        self._window_seconds = window_seconds
+        self._clock = clock
+        self._buckets: dict[str, tuple[float, int]] = {}
+        self._lock = asyncio.Lock()
+
+    async def hit(self, key: str) -> bool:
+        """Record one hit for `key`. Returns True if within the allowed
+        limit, False if this hit breaches it (caller should reject)."""
+        now = self._clock()
+        async with self._lock:
+            window_start, count = self._buckets.get(key, (now, 0))
+            if now - window_start >= self._window_seconds:
+                window_start, count = now, 0
+            count += 1
+            self._buckets[key] = (window_start, count)
+            return count <= self._max_requests
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Per-client-IP fixed-window rate limiter for the streamable-http
+    transport. Bare 429 on breach.
+
+    Known v1 limitation: keys on request.client.host only, with no
+    X-Forwarded-For parsing - this codebase has no trusted-proxy allowlist
+    anywhere to validate that header against, and trusting a client-
+    supplied header without one would make the limiter trivially
+    bypassable.
+    """
+
+    def __init__(
+        self,
+        app: Any,
+        max_requests: int = 100,
+        window_seconds: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(app)
+        self._limiter = _FixedWindowRateLimiter(max_requests, window_seconds, clock)
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        client_ip = request.client.host if request.client else "unknown"
+        if not await self._limiter.hit(client_ip):
+            logger.warning(f"Rate limit exceeded for client {client_ip}")
+            return Response("Rate limit exceeded", status_code=429)
+        return await call_next(request)
+
+
 def _backend_config_options(f: Any) -> Any:
     """Shared backend-override flags, applied to both main (serve) and
     doctor, so an operator can validate a candidate config with doctor
@@ -1229,6 +1293,24 @@ def _backend_config_options(f: Any) -> Any:
     help="Log a warning when a backend request takes longer than this many "
     "milliseconds, independent of --log-level (unset: disabled)",
 )
+@click.option(
+    "--rate-limit-max-requests",
+    type=int,
+    default=100,
+    envvar="RATE_LIMIT_MAX_REQUESTS",
+    help="Max requests per client IP per --rate-limit-window-seconds on the "
+    "HTTP transport (only for --transport http, default: 100, set to 0 "
+    "to disable, overrides RATE_LIMIT_MAX_REQUESTS env var)",
+)
+@click.option(
+    "--rate-limit-window-seconds",
+    type=float,
+    default=60.0,
+    envvar="RATE_LIMIT_WINDOW_SECONDS",
+    help="Fixed window size in seconds for --rate-limit-max-requests (only "
+    "for --transport http, default: 60.0, overrides "
+    "RATE_LIMIT_WINDOW_SECONDS env var)",
+)
 def main(
     ctx: click.Context,
     backend: str | None,
@@ -1249,6 +1331,8 @@ def main(
     disable_tools: str | None,
     enabled_tools: str | None,
     slow_request_threshold_ms: float | None,
+    rate_limit_max_requests: int,
+    rate_limit_window_seconds: float,
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
@@ -1344,6 +1428,8 @@ def main(
                 "include_args_in_spans": include_args_in_spans,
                 "disable_tools": disable_tools,
                 "enabled_tools": enabled_tools,
+                "rate_limit_max_requests": rate_limit_max_requests,
+                "rate_limit_window_seconds": rate_limit_window_seconds,
             }
             click.echo(json.dumps(resolved, indent=2))
             return
@@ -1366,11 +1452,20 @@ def main(
             logger.info(f"Starting MCP server with HTTP transport on {host}:{port}")
             logger.info("Using streamable-http transport for better compatibility")
             logger.info(f"Connect clients to: http://{host}:{port}/mcp")
+            middleware = [Middleware(OriginValidationMiddleware)]
+            if rate_limit_max_requests > 0:
+                middleware.append(
+                    Middleware(
+                        RateLimitMiddleware,
+                        max_requests=rate_limit_max_requests,
+                        window_seconds=rate_limit_window_seconds,
+                    )
+                )
             mcp.run(
                 transport="streamable-http",
                 host=host,
                 port=port,
-                middleware=[Middleware(OriginValidationMiddleware)],
+                middleware=middleware,
             )
         else:
             logger.info(

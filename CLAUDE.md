@@ -155,6 +155,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `MCP_INCLUDE_ARGS_IN_SPANS` - Optional: Env-var equivalent of `--include-args-in-spans` (default: `false`). Known credential shapes are redacted before export (`observability._redact_secrets`) - a pattern match, not a guarantee.
 - `OTEL_EXPORTER_OTLP_ENDPOINT` - Optional: Enables opt-in OTel self-instrumentation of tool calls when set (unset by default - no TracerProvider is configured and no middleware is registered, so there is zero overhead if you don't opt in)
 - `OTEL_SERVICE_NAME` - Optional: Service name reported in self-instrumentation spans (default: `tracehub-mcp`)
+- `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` - Optional: Env-var equivalents of `--rate-limit-max-requests`/`--rate-limit-window-seconds` (HTTP transport only, defaults: `100`/`60.0`)
 
 **CLI Flags** (all mirror an env var above where noted; run `tracehub-mcp --help` for the full list):
 
@@ -164,6 +165,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `--enabled-tools <name1,name2,...>` - Allowlist: every tool not named here is removed from this server instance
 - `--slow-request-threshold-ms <float>` - Overrides `SLOW_REQUEST_THRESHOLD_MS`
 - `--include-args-in-spans` - Overrides `MCP_INCLUDE_ARGS_IN_SPANS`
+- `--rate-limit-max-requests <int>` / `--rate-limit-window-seconds <float>` - HTTP transport only. Per-client-IP fixed-window rate limit (defaults: 100 requests / 60s window). Set `--rate-limit-max-requests 0` to disable.
 - `--print-config` - Print the resolved configuration as JSON and exit without starting the server (secrets reported as `*_set` booleans, never their actual value)
 
 **`tracehub-mcp doctor`** - Subcommand (not a flag) that runs startup diagnostics against the resolved backend config: config load, backend construction, `health_check()`, and a real read-only connectivity probe (`list_services`). Prints `[OK]`/`[FAIL]` per step and exits non-zero on any failure - unlike the server's own lazy backend initialization, which deliberately swallows a failed health check and keeps running. Accepts the same `--backend`/`--url`/etc. override flags as the main command, so a candidate config can be validated before committing to it.
