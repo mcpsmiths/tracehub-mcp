@@ -29,6 +29,7 @@ false-positive frictions.
 
 # mypy: disable-error-code="arg-type, attr-defined"
 
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -44,8 +45,10 @@ from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry_mcp import observability
 from opentelemetry_mcp.observability import (
     McpServerTracingMiddleware,
+    TraceContextLogFilter,
     configure_metrics,
     configure_tracing,
+    install_trace_context_log_filter,
 )
 
 
@@ -230,6 +233,42 @@ class TestMcpServerTracingMiddlewareMetrics:
         count_points = _metric_data_points(reader, "mcp.server.tool.call.count")
         assert count_points[0].attributes == {"gen_ai.tool.name": "search_traces", "error": "true"}
         assert count_points[0].value == 1
+
+
+class TestTraceContextLogFilter:
+    def test_stamps_zero_placeholders_when_no_span_recording(self) -> None:
+        record = logging.LogRecord("test", logging.INFO, "path", 1, "message", None, None)
+        log_filter = TraceContextLogFilter()
+
+        result = log_filter.filter(record)
+
+        assert result is True
+        assert record.trace_id == "0" * 32
+        assert record.span_id == "0" * 16
+        assert record.trace_flags == "00"
+
+    def test_stamps_real_ids_when_span_is_recording(self) -> None:
+        tracer, _exporter = _tracer_with_exporter()
+        log_filter = TraceContextLogFilter()
+
+        with tracer.start_as_current_span("x") as span:
+            record = logging.LogRecord("test", logging.INFO, "path", 1, "message", None, None)
+            log_filter.filter(record)
+
+            ctx = span.get_span_context()
+            assert record.trace_id == f"{ctx.trace_id:032x}"
+            assert record.span_id == f"{ctx.span_id:016x}"
+
+    def test_install_attaches_filter_and_formatter_to_given_handlers(self) -> None:
+        handler = logging.Handler()
+
+        install_trace_context_log_filter([handler])
+
+        assert any(isinstance(f, TraceContextLogFilter) for f in handler.filters)
+        assert handler.formatter is not None
+        fmt = handler.formatter._fmt
+        assert fmt is not None
+        assert "trace_id" in fmt
 
 
 class TestMcpServerTracingMiddlewareHappyPath:

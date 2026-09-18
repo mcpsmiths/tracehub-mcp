@@ -30,6 +30,7 @@ from opentelemetry_mcp.observability import (
     McpServerTracingMiddleware,
     configure_metrics,
     configure_tracing,
+    install_trace_context_log_filter,
 )
 from opentelemetry_mcp.tools import (
     compare,
@@ -1468,6 +1469,7 @@ def main(
         configure_metrics()
         if tracing_enabled:
             mcp.add_middleware(McpServerTracingMiddleware(include_args=include_args_in_spans))
+            install_trace_context_log_filter()
 
         # Run server with selected transport
         if transport == "http":

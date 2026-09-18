@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Iterable
 from typing import Any
 
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
@@ -130,6 +131,47 @@ def configure_metrics(service_name: str | None = None) -> bool:
     metrics.set_meter_provider(provider)
     logger.info(f"OTel metrics self-instrumentation enabled, exporting metrics to {endpoint}")
     return True
+
+
+_TRACE_CONTEXT_LOG_FORMAT = (
+    "%(asctime)s - %(name)s - %(levelname)s - "
+    "[trace_id=%(trace_id)s span_id=%(span_id)s] - %(message)s"
+)
+
+
+class TraceContextLogFilter(logging.Filter):
+    """Stamps the 3 standardized field names from OTel's "Trace Context in
+    non-OTLP Log Formats" spec onto every LogRecord: the real hex ids when
+    a span is recording, or the spec's own all-zero placeholder otherwise -
+    never omits the fields, so a formatter referencing them never
+    KeyErrors.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        span = trace.get_current_span()
+        ctx = span.get_span_context()
+        if ctx.is_valid and span.is_recording():
+            record.trace_id = f"{ctx.trace_id:032x}"
+            record.span_id = f"{ctx.span_id:016x}"
+            record.trace_flags = f"{ctx.trace_flags:02x}"
+        else:
+            record.trace_id = "0" * 32
+            record.span_id = "0" * 16
+            record.trace_flags = "00"
+        return True
+
+
+def install_trace_context_log_filter(handlers: Iterable[logging.Handler] | None = None) -> None:
+    """Attach TraceContextLogFilter and upgrade formatters on the given
+    handlers (default: the root logger's own, i.e. whatever
+    logging.basicConfig wired up in server.py). Call only when
+    configure_tracing() returned True - see server.py's main() gating."""
+    target_handlers = list(handlers) if handlers is not None else logging.getLogger().handlers
+    log_filter = TraceContextLogFilter()
+    formatter = logging.Formatter(_TRACE_CONTEXT_LOG_FORMAT)
+    for handler in target_handlers:
+        handler.addFilter(log_filter)
+        handler.setFormatter(formatter)
 
 
 class McpServerTracingMiddleware(Middleware):
