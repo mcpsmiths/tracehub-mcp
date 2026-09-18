@@ -1,13 +1,16 @@
 """Abstract base backend for OpenTelemetry trace storage systems."""
 
+import functools
 import logging
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
+from pydantic import BaseModel
 from tenacity import (
     AsyncRetrying,
     RetryCallState,
@@ -20,10 +23,42 @@ from tenacity import (
 )
 
 from opentelemetry_mcp.attributes import HealthCheckResponse
+from opentelemetry_mcp.backends.cache import TTLCoalescingCache
 from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceData, TraceQuery
 from opentelemetry_mcp.security import is_cloud_metadata_host
 
 logger = logging.getLogger(__name__)
+
+# health_check() is deliberately excluded: /ready and doctor both depend on
+# it reflecting live backend state, and caching it would defeat that.
+_CACHEABLE_METHODS = (
+    "search_traces",
+    "search_spans",
+    "get_trace",
+    "list_services",
+    "get_service_operations",
+)
+
+
+def _cache_key(method_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
+    parts: list[Any] = [method_name]
+    for value in (*args, *kwargs.values()):
+        parts.append(value.model_dump_json() if isinstance(value, BaseModel) else value)
+    return tuple(parts)
+
+
+def _wrap_with_cache(
+    method_name: str, original: Callable[..., Awaitable[Any]]
+) -> Callable[..., Awaitable[Any]]:
+    @functools.wraps(original)
+    async def wrapper(self: "BaseBackend", *args: Any, **kwargs: Any) -> Any:
+        cache = self._query_cache
+        if cache is None:
+            return await original(self, *args, **kwargs)
+        key = _cache_key(method_name, args, kwargs)
+        return await cache.get_or_compute(key, lambda: original(self, *args, **kwargs))
+
+    return wrapper
 
 
 class MetadataEndpointBlockedError(httpx.TransportError):
@@ -184,6 +219,20 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
 class BaseBackend(ABC):
     """Abstract interface for OpenTelemetry trace backends."""
 
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Wraps each concrete subclass's own directly-defined cacheable
+        methods with a cache-lookup wrapper, once, at class-creation time -
+        requires zero edits to any concrete backend file. Only wraps
+        methods a subclass defines itself (cls.__dict__), never a method
+        inherited unchanged from a parent, which would otherwise be
+        wrapped twice across a subclass hierarchy.
+        """
+        super().__init_subclass__(**kwargs)
+        for method_name in _CACHEABLE_METHODS:
+            original = cls.__dict__.get(method_name)
+            if original is not None:
+                setattr(cls, method_name, _wrap_with_cache(method_name, original))
+
     def __init__(self, url: str, api_key: str | None = None, timeout: float = 30.0):
         """Initialize backend with connection parameters.
 
@@ -201,6 +250,16 @@ class BaseBackend(ABC):
         # timeout) positionally, so a caller (server.py's _create_backend)
         # sets this as a plain attribute after construction instead.
         self.slow_request_threshold_ms: float | None = None
+        self._query_cache: TTLCoalescingCache | None = None
+
+    def configure_query_cache(self, ttl_seconds: float | None) -> None:
+        """Mirrors slow_request_threshold_ms's own post-construction-
+        attribute pattern above - set by the caller (server.py's
+        _create_backend) after construction, since several subclasses
+        override __init__ with their own named params."""
+        self._query_cache = (
+            TTLCoalescingCache(ttl_seconds) if ttl_seconds and ttl_seconds > 0 else None
+        )
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -342,3 +401,5 @@ class BaseBackend(ABC):
         if self._client:
             await self._client.aclose()
             self._client = None
+        if self._query_cache is not None:
+            self._query_cache.clear()

@@ -796,6 +796,7 @@ class TestMainCli:
             log_level=None,
             max_traces_per_query=None,
             slow_request_threshold_ms=None,
+            query_cache_ttl_seconds=None,
         )
 
     def test_no_cli_flags_skips_apply_cli_overrides(self) -> None:

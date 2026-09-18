@@ -164,6 +164,7 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
     # several backend subclasses override __init__ with their own named
     # params, so this is applied uniformly here instead.
     backend.slow_request_threshold_ms = config.slow_request_threshold_ms
+    backend.configure_query_cache(config.query_cache_ttl_seconds)
     return backend
 
 
@@ -1311,6 +1312,15 @@ def _backend_config_options(f: Any) -> Any:
     "for --transport http, default: 60.0, overrides "
     "RATE_LIMIT_WINDOW_SECONDS env var)",
 )
+@click.option(
+    "--query-cache-ttl-seconds",
+    type=float,
+    default=None,
+    help="Cache backend query results (search_traces/search_spans/get_trace/"
+    "list_services/get_service_operations) for this many seconds, with "
+    "in-flight request coalescing (unset: disabled, overrides "
+    "QUERY_CACHE_TTL_SECONDS env var)",
+)
 def main(
     ctx: click.Context,
     backend: str | None,
@@ -1333,6 +1343,7 @@ def main(
     slow_request_threshold_ms: float | None,
     rate_limit_max_requests: int,
     rate_limit_window_seconds: float,
+    query_cache_ttl_seconds: float | None,
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
@@ -1384,6 +1395,7 @@ def main(
             or log_level
             or max_traces_per_query is not None
             or slow_request_threshold_ms is not None
+            or query_cache_ttl_seconds is not None
         ):
             _config.apply_cli_overrides(
                 backend_type=backend,
@@ -1397,6 +1409,7 @@ def main(
                 log_level=log_level,
                 max_traces_per_query=max_traces_per_query,
                 slow_request_threshold_ms=slow_request_threshold_ms,
+                query_cache_ttl_seconds=query_cache_ttl_seconds,
             )
             logging.getLogger().setLevel(_config.log_level)
 
@@ -1422,6 +1435,7 @@ def main(
                 "log_level": _config.log_level,
                 "max_traces_per_query": _config.max_traces_per_query,
                 "slow_request_threshold_ms": _config.slow_request_threshold_ms,
+                "query_cache_ttl_seconds": _config.query_cache_ttl_seconds,
                 "transport": transport,
                 "host": host,
                 "port": port,

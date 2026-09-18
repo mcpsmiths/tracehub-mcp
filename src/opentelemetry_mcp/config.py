@@ -115,6 +115,7 @@ class ServerConfig(BaseModel):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     max_traces_per_query: int = Field(default=500, ge=1, le=1000)
     slow_request_threshold_ms: float | None = Field(default=None, gt=0)
+    query_cache_ttl_seconds: float | None = Field(default=None, gt=0)
 
     @classmethod
     def from_env(cls) -> "ServerConfig":
@@ -147,11 +148,24 @@ class ServerConfig(BaseModel):
                     f"'{slow_request_threshold_str}': {e}. Slow-request logging disabled."
                 )
 
+        # Parse query_cache_ttl_seconds with validation (optional, unset by default)
+        query_cache_ttl_seconds: float | None = None
+        query_cache_ttl_str = os.getenv("QUERY_CACHE_TTL_SECONDS")
+        if query_cache_ttl_str:
+            try:
+                query_cache_ttl_seconds = float(query_cache_ttl_str)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Invalid QUERY_CACHE_TTL_SECONDS value "
+                    f"'{query_cache_ttl_str}': {e}. Query caching disabled."
+                )
+
         return cls(
             backend=BackendConfig.from_env(),
             log_level=log_level,
             max_traces_per_query=max_traces_per_query,
             slow_request_threshold_ms=slow_request_threshold_ms,
+            query_cache_ttl_seconds=query_cache_ttl_seconds,
         )
 
     def apply_cli_overrides(
@@ -167,6 +181,7 @@ class ServerConfig(BaseModel):
         log_level: str | None = None,
         max_traces_per_query: int | None = None,
         slow_request_threshold_ms: float | None = None,
+        query_cache_ttl_seconds: float | None = None,
     ) -> None:
         """Apply CLI argument overrides to configuration."""
         if slow_request_threshold_ms is not None:
@@ -176,6 +191,14 @@ class ServerConfig(BaseModel):
                     "Must be greater than 0"
                 )
             self.slow_request_threshold_ms = slow_request_threshold_ms
+
+        if query_cache_ttl_seconds is not None:
+            if query_cache_ttl_seconds <= 0:
+                raise ValueError(
+                    f"Invalid query_cache_ttl_seconds: {query_cache_ttl_seconds}. "
+                    "Must be greater than 0"
+                )
+            self.query_cache_ttl_seconds = query_cache_ttl_seconds
 
         if log_level:
             log_level_upper = log_level.upper()
