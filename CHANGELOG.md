@@ -1,3 +1,12 @@
+## v0.10.0 (2026-09-18)
+
+### Feat
+
+- **observability**: add log-to-trace correlation
+- **observability**: add opt-in OTel metrics self-instrumentation
+- **backends**: add TTL cache + request coalescing for backend queries
+- **server**: add per-IP rate limiting on the HTTP transport
+
 ## v0.9.0 (2026-09-17)
 
 ### Feat
