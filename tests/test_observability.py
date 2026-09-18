@@ -34,13 +34,19 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastmcp.server.middleware import MiddlewareContext
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
 
 from opentelemetry_mcp import observability
-from opentelemetry_mcp.observability import McpServerTracingMiddleware, configure_tracing
+from opentelemetry_mcp.observability import (
+    McpServerTracingMiddleware,
+    configure_metrics,
+    configure_tracing,
+)
 
 
 def _tracer_with_exporter() -> tuple[Any, InMemorySpanExporter]:
@@ -48,6 +54,28 @@ def _tracer_with_exporter() -> tuple[Any, InMemorySpanExporter]:
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     return provider.get_tracer("test"), exporter
+
+
+def _instruments_with_reader() -> tuple[Any, Any, InMemoryMetricReader]:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    meter = provider.get_meter("test")
+    duration = meter.create_histogram("mcp.server.tool.call.duration", unit="s")
+    counter = meter.create_counter("mcp.server.tool.call.count")
+    return duration, counter, reader
+
+
+def _metric_data_points(reader: InMemoryMetricReader, metric_name: str) -> list[Any]:
+    data = reader.get_metrics_data()
+    points: list[Any] = []
+    if data is None:
+        return points
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == metric_name:
+                    points.extend(metric.data.data_points)
+    return points
 
 
 def _last_span_attrs(exporter: InMemorySpanExporter) -> dict[str, Any]:
@@ -108,6 +136,100 @@ class TestConfigureTracing:
 
         provider = mocked.call_args.args[0]
         assert provider.resource.attributes["service.name"] == "tracehub-mcp"
+
+
+class TestConfigureMetrics:
+    """Mirrors TestConfigureTracing exactly - configure_metrics is the
+    direct structural analog of configure_tracing, gated behind the same
+    env var."""
+
+    def test_returns_false_when_endpoint_not_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+        with patch.object(observability.metrics, "set_meter_provider") as mocked:
+            result = configure_metrics()
+
+        assert result is False
+        mocked.assert_not_called()
+
+    def test_returns_true_and_configures_provider_when_endpoint_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+        monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+
+        with patch.object(observability.metrics, "set_meter_provider") as mocked:
+            result = configure_metrics(service_name="my-service")
+
+        assert result is True
+        mocked.assert_called_once()
+        provider = mocked.call_args.args[0]
+        # MeterProvider (unlike TracerProvider) doesn't expose .resource
+        # publicly - it's on the internal _sdk_config, confirmed via source.
+        assert provider._sdk_config.resource.attributes["service.name"] == "my-service"
+
+    def test_falls_back_to_otel_service_name_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+        monkeypatch.setenv("OTEL_SERVICE_NAME", "env-configured-name")
+
+        with patch.object(observability.metrics, "set_meter_provider") as mocked:
+            configure_metrics()
+
+        provider = mocked.call_args.args[0]
+        assert provider._sdk_config.resource.attributes["service.name"] == "env-configured-name"
+
+    def test_defaults_to_tracehub_mcp_when_nothing_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+        monkeypatch.delenv("OTEL_SERVICE_NAME", raising=False)
+
+        with patch.object(observability.metrics, "set_meter_provider") as mocked:
+            configure_metrics()
+
+        provider = mocked.call_args.args[0]
+        assert provider._sdk_config.resource.attributes["service.name"] == "tracehub-mcp"
+
+
+class TestMcpServerTracingMiddlewareMetrics:
+    async def test_records_duration_and_count_on_success(self) -> None:
+        tracer, _exporter = _tracer_with_exporter()
+        duration, counter, reader = _instruments_with_reader()
+        middleware = McpServerTracingMiddleware(
+            tracer=tracer, tool_call_duration=duration, tool_call_counter=counter
+        )
+
+        async def call_next(ctx: MiddlewareContext[Any]) -> str:
+            return "ok"
+
+        await middleware.on_call_tool(_context(tool_name="search_traces"), call_next)
+
+        count_points = _metric_data_points(reader, "mcp.server.tool.call.count")
+        duration_points = _metric_data_points(reader, "mcp.server.tool.call.duration")
+        assert count_points[0].attributes == {"gen_ai.tool.name": "search_traces", "error": "false"}
+        assert count_points[0].value == 1
+        assert duration_points[0].attributes == {
+            "gen_ai.tool.name": "search_traces",
+            "error": "false",
+        }
+        assert duration_points[0].sum >= 0.0
+
+    async def test_records_error_true_on_exception(self) -> None:
+        tracer, _exporter = _tracer_with_exporter()
+        duration, counter, reader = _instruments_with_reader()
+        middleware = McpServerTracingMiddleware(
+            tracer=tracer, tool_call_duration=duration, tool_call_counter=counter
+        )
+
+        async def call_next(ctx: MiddlewareContext[Any]) -> str:
+            raise RuntimeError("backend down")
+
+        with pytest.raises(RuntimeError, match="backend down"):
+            await middleware.on_call_tool(_context(tool_name="search_traces"), call_next)
+
+        count_points = _metric_data_points(reader, "mcp.server.tool.call.count")
+        assert count_points[0].attributes == {"gen_ai.tool.name": "search_traces", "error": "true"}
+        assert count_points[0].value == 1
 
 
 class TestMcpServerTracingMiddlewareHappyPath:

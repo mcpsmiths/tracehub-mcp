@@ -26,7 +26,11 @@ from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.config import ServerConfig
 from opentelemetry_mcp.models import SearchSpansResult, SearchTracesResult, TraceDetail
-from opentelemetry_mcp.observability import McpServerTracingMiddleware, configure_tracing
+from opentelemetry_mcp.observability import (
+    McpServerTracingMiddleware,
+    configure_metrics,
+    configure_tracing,
+)
 from opentelemetry_mcp.tools import (
     compare,
     errors,
@@ -1453,12 +1457,16 @@ def main(
 
         _apply_tool_gating(disable_tools=disable_tools, enabled_tools=enabled_tools)
 
-        # OTel self-instrumentation is fully opt-in: configure_tracing() only
-        # returns True (and only then do we register the middleware) when
-        # OTEL_EXPORTER_OTLP_ENDPOINT is actually set, so there is zero
-        # overhead and no dependency on a collector for anyone who has not
-        # opted in.
-        if configure_tracing():
+        # OTel self-instrumentation is fully opt-in: configure_tracing()/
+        # configure_metrics() only return True when OTEL_EXPORTER_OTLP_ENDPOINT
+        # is actually set, so there is zero overhead and no dependency on a
+        # collector for anyone who has not opted in. configure_metrics()
+        # runs before the middleware is constructed so metrics.get_meter()
+        # resolves against the real provider immediately, mirroring the
+        # existing tracer-resolution ordering.
+        tracing_enabled = configure_tracing()
+        configure_metrics()
+        if tracing_enabled:
             mcp.add_middleware(McpServerTracingMiddleware(include_args=include_args_in_spans))
 
         # Run server with selected transport

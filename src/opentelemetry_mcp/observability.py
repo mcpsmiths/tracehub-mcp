@@ -16,11 +16,16 @@ dependency on having a collector running for anyone who has not opted in.
 import logging
 import os
 import re
+import time
 from typing import Any
 
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
-from opentelemetry import trace
+from opentelemetry import metrics, trace
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.metrics import Counter, Histogram, Meter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -29,6 +34,7 @@ from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
 logger = logging.getLogger(__name__)
 
 _TRACER_NAME = "opentelemetry_mcp"
+_METER_NAME = "opentelemetry_mcp"
 _MAX_RESULT_ATTRIBUTE_CHARS = 2000
 
 # Field-name fragments that signal the value next to them is a credential,
@@ -101,6 +107,31 @@ def configure_tracing(service_name: str | None = None) -> bool:
     return True
 
 
+def configure_metrics(service_name: str | None = None) -> bool:
+    """Direct structural analog of configure_tracing: OTLPMetricExporter ->
+    PeriodicExportingMetricReader -> MeterProvider -> set_meter_provider(),
+    gated behind the same OTEL_EXPORTER_OTLP_ENDPOINT check - no new env
+    var needed, since the OTLP spec's per-signal endpoint override still
+    falls back to this general one.
+
+    Returns:
+        True if metrics were configured, False if skipped (no endpoint
+        configured).
+    """
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not endpoint:
+        return False
+
+    resource = Resource.create(
+        {SERVICE_NAME: service_name or os.getenv("OTEL_SERVICE_NAME") or "tracehub-mcp"}
+    )
+    reader = PeriodicExportingMetricReader(OTLPMetricExporter())
+    provider = MeterProvider(resource=resource, metric_readers=[reader])
+    metrics.set_meter_provider(provider)
+    logger.info(f"OTel metrics self-instrumentation enabled, exporting metrics to {endpoint}")
+    return True
+
+
 class McpServerTracingMiddleware(Middleware):
     """FastMCP middleware implementing the OTel GenAI semantic conventions
     for MCP tool calls: mcp.server spans, SERVER kind, required
@@ -111,13 +142,31 @@ class McpServerTracingMiddleware(Middleware):
     the spec's own guidance that they may contain sensitive information.
     """
 
-    def __init__(self, include_args: bool = False, tracer: Tracer | None = None) -> None:
+    def __init__(
+        self,
+        include_args: bool = False,
+        tracer: Tracer | None = None,
+        tool_call_duration: Histogram | None = None,
+        tool_call_counter: Counter | None = None,
+    ) -> None:
         self.include_args = include_args
-        # Accepting an explicit tracer (rather than always resolving one via
-        # trace.get_tracer() here) lets tests inject one bound to an
-        # in-memory exporter without touching the process-global
-        # TracerProvider, which OTel only allows setting once per process.
+        # Accepting an explicit tracer/instruments (rather than always
+        # resolving them via trace.get_tracer()/metrics.get_meter() here)
+        # lets tests inject ones bound to an in-memory exporter/reader
+        # without touching the process-global TracerProvider/MeterProvider,
+        # which OTel only allows setting once per process.
         self._tracer = tracer or trace.get_tracer(_TRACER_NAME)
+        meter: Meter = metrics.get_meter(_METER_NAME)
+        self._tool_call_duration = tool_call_duration or meter.create_histogram(
+            name="mcp.server.tool.call.duration",
+            unit="s",
+            description="Duration of MCP tools/call requests handled by this server.",
+        )
+        self._tool_call_counter = tool_call_counter or meter.create_counter(
+            name="mcp.server.tool.call.count",
+            unit="1",
+            description="Count of MCP tools/call requests, labeled by tool name and error status.",
+        )
 
     async def on_call_tool(
         self, context: MiddlewareContext[Any], call_next: CallNext[Any, Any]
@@ -142,6 +191,7 @@ class McpServerTracingMiddleware(Middleware):
                     :_MAX_RESULT_ATTRIBUTE_CHARS
                 ]
 
+        start_time = time.perf_counter()
         with self._tracer.start_as_current_span(
             span_name, kind=SpanKind.SERVER, attributes=attributes
         ) as span:
@@ -149,13 +199,24 @@ class McpServerTracingMiddleware(Middleware):
                 result = await call_next(context)
             except Exception as e:
                 self._record_error(span, e)
+                self._record_tool_call_metrics(tool_name, start_time, error=True)
                 raise
             if self.include_args:
                 span.set_attribute(
                     "gen_ai.tool.call.result",
                     _redact_secrets(str(result))[:_MAX_RESULT_ATTRIBUTE_CHARS],
                 )
+            self._record_tool_call_metrics(tool_name, start_time, error=False)
             return result
+
+    def _record_tool_call_metrics(self, tool_name: str, start_time: float, *, error: bool) -> None:
+        """Safe to call unconditionally, even when configure_metrics() was
+        never invoked - OTel's API-level no-op meter/instruments make this
+        free, exactly like self._tracer already works today when tracing
+        is disabled."""
+        attrs = {"gen_ai.tool.name": tool_name, "error": str(error).lower()}
+        self._tool_call_duration.record(time.perf_counter() - start_time, attrs)
+        self._tool_call_counter.add(1, attrs)
 
     @staticmethod
     def _record_error(span: Span, error: Exception) -> None:
