@@ -820,41 +820,58 @@ class TestMainCli:
         assert result.exit_code == 0, result.output
         mock_mcp.run.assert_called_once_with(transport="stdio")
 
-    def test_http_transport_calls_mcp_run_with_host_and_port(self) -> None:
+    def test_http_transport_builds_app_and_serves_with_host_and_port(self) -> None:
+        """HTTP transport no longer calls mcp.run() - see
+        _install_shutdown_drain's docstring for why (a real SIGTERM never
+        returns control to mcp.run()'s own outer lifespan wrap, so the
+        drain/close logic has to live inside mcp.http_app()'s app instead,
+        driven directly by a hand-constructed uvicorn.Server)."""
         runner = CliRunner()
-        with patch.object(server, "mcp") as mock_mcp:
-            mock_mcp.run = MagicMock()
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
             result = runner.invoke(
                 server.main,
                 ["--transport", "http", "--host", "127.0.0.1", "--port", "9001"],
             )
 
         assert result.exit_code == 0, result.output
-        mock_mcp.run.assert_called_once()
-        call_kwargs = mock_mcp.run.call_args.kwargs
-        assert call_kwargs["transport"] == "streamable-http"
-        assert call_kwargs["host"] == "127.0.0.1"
-        assert call_kwargs["port"] == 9001
+
+        mock_mcp.http_app.assert_called_once()
+        http_app_kwargs = mock_mcp.http_app.call_args.kwargs
+        assert http_app_kwargs["transport"] == "streamable-http"
         # HTTP transport must wire in the Origin-validation middleware
         # (Tier 1 security fix: fastmcp disables DNS-rebinding protection
         # by default, see OriginValidationMiddleware's docstring), and the
         # rate limiter (enabled by default, see RateLimitMiddleware).
-        middleware = call_kwargs["middleware"]
+        middleware = http_app_kwargs["middleware"]
         assert len(middleware) == 2
         assert middleware[0].cls is server.OriginValidationMiddleware
         assert middleware[1].cls is server.RateLimitMiddleware
 
+        mock_server_cls.assert_called_once()
+        config_arg = mock_server_cls.call_args.args[0]
+        assert config_arg.app is mock_mcp.http_app.return_value
+        assert config_arg.host == "127.0.0.1"
+        assert config_arg.port == 9001
+        mock_server_cls.return_value.serve.assert_awaited_once()
+
     def test_rate_limit_disabled_when_max_requests_is_zero(self) -> None:
         runner = CliRunner()
-        with patch.object(server, "mcp") as mock_mcp:
-            mock_mcp.run = MagicMock()
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
             result = runner.invoke(
                 server.main,
                 ["--transport", "http", "--rate-limit-max-requests", "0"],
             )
 
         assert result.exit_code == 0, result.output
-        middleware = mock_mcp.run.call_args.kwargs["middleware"]
+        middleware = mock_mcp.http_app.call_args.kwargs["middleware"]
         assert len(middleware) == 1
         assert middleware[0].cls is server.OriginValidationMiddleware
 

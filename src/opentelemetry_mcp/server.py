@@ -6,12 +6,16 @@ import logging
 import re
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import Any, Literal, NoReturn
 
 import click
+import uvicorn
 from fastmcp import FastMCP
+from fastmcp.server.http import StarletteWithLifespan
 from mcp.types import ToolAnnotations
+from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
@@ -1166,6 +1170,88 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+_BACKEND_CLOSE_TIMEOUT_SECONDS = 5.0
+
+
+async def _drain_and_close_backend(drain_seconds: float) -> None:
+    """Runs from inside the *inner* ASGI lifespan.shutdown callback that
+    _install_shutdown_drain splices onto mcp.http_app()'s app - i.e. from
+    inside uvicorn.Server.shutdown(), strictly before capture_signals()'s
+    post-serve() finally block restores the default SIGTERM handler and
+    re-raises the captured signal (uvicorn/server.py). That ordering is
+    what makes this fire reliably on a real SIGTERM, unlike a
+    FastMCP(lifespan=...) constructor-kwarg attempt (tried and reverted),
+    whose teardown was deferred until `await server.serve()` itself
+    returned - which never happens on a real SIGTERM.
+
+    Sleeps `drain_seconds` (uvicorn has already finished draining
+    in-flight connections/tasks by this point - this is a final grace
+    window, not a substitute for that phase), then closes the shared
+    backend HTTP client if one was ever lazily created. Bounded by
+    _BACKEND_CLOSE_TIMEOUT_SECONDS because uvicorn places no timeout of
+    its own around the lifespan.shutdown wait - an unbounded backend.close()
+    could otherwise hang process exit forever.
+    """
+    global _backend
+
+    if drain_seconds > 0:
+        logger.info(
+            f"HTTP transport shutting down - draining for {drain_seconds}s "
+            "before closing the backend client"
+        )
+        await asyncio.sleep(drain_seconds)
+
+    if _backend is None:
+        logger.info("HTTP transport shutdown: no backend was ever created, nothing to close")
+        return
+
+    backend_to_close, _backend = _backend, None
+    try:
+        await asyncio.wait_for(backend_to_close.close(), timeout=_BACKEND_CLOSE_TIMEOUT_SECONDS)
+        logger.info("Backend closed during shutdown drain")
+    except TimeoutError:
+        logger.warning(
+            f"Backend close did not finish within {_BACKEND_CLOSE_TIMEOUT_SECONDS}s "
+            "during shutdown, abandoning it"
+        )
+    except Exception as e:
+        logger.warning(f"Error closing backend during shutdown: {e}")
+
+
+def _install_shutdown_drain(app: StarletteWithLifespan, drain_seconds: float) -> None:
+    """Splice _drain_and_close_backend onto the *inner* lifespan
+    mcp.http_app() builds, by reassigning the mutable
+    app.router.lifespan_context attribute after construction - rather
+    than passing FastMCP(lifespan=...) at the constructor.
+    FastMCP._lifespan_manager() is ref-counted/reentrant; a
+    constructor-level lifespan's teardown only runs on the ref_count==0
+    transition, which on the HTTP path used to be the *outer* entrant
+    wrapping the whole `await server.serve()` call in run_http_async - and
+    that call never returns on a real SIGTERM (see
+    _drain_and_close_backend's docstring). Splicing here means
+    FastMCP._lifespan_manager() is entered exactly once, by this inner
+    lifespan (since main() no longer calls mcp.run()/run_http_async() for
+    the HTTP path at all), so there is no second entrant to race with.
+
+    Starlette (this installed version, 1.3.1) has no on_shutdown/
+    add_event_handler API - lifespan= is the only mechanism, and
+    StarletteWithLifespan.lifespan is literally
+    `self.router.lifespan_context`, read fresh on every ASGI lifespan
+    dispatch - so this reassignment is guaranteed to take effect.
+    """
+    original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def combined_lifespan(app: Starlette) -> AsyncIterator[None]:
+        async with original_lifespan(app):
+            try:
+                yield
+            finally:
+                await _drain_and_close_backend(drain_seconds)
+
+    app.router.lifespan_context = combined_lifespan
+
+
 def _backend_config_options(f: Any) -> Any:
     """Shared backend-override flags, applied to both main (serve) and
     doctor, so an operator can validate a candidate config with doctor
@@ -1326,6 +1412,17 @@ def _backend_config_options(f: Any) -> Any:
     "in-flight request coalescing (unset: disabled, overrides "
     "QUERY_CACHE_TTL_SECONDS env var)",
 )
+@click.option(
+    "--shutdown-drain-seconds",
+    type=float,
+    default=0.0,
+    envvar="SHUTDOWN_DRAIN_SECONDS",
+    help="On HTTP transport, wait this many seconds inside the ASGI shutdown "
+    "handler - after uvicorn has already finished draining in-flight "
+    "connections - before closing the shared backend HTTP client (only "
+    "for --transport http, default: 0.0/disabled, overrides "
+    "SHUTDOWN_DRAIN_SECONDS env var)",
+)
 def main(
     ctx: click.Context,
     backend: str | None,
@@ -1349,6 +1446,7 @@ def main(
     rate_limit_max_requests: int,
     rate_limit_window_seconds: float,
     query_cache_ttl_seconds: float | None,
+    shutdown_drain_seconds: float,
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
@@ -1449,6 +1547,7 @@ def main(
                 "enabled_tools": enabled_tools,
                 "rate_limit_max_requests": rate_limit_max_requests,
                 "rate_limit_window_seconds": rate_limit_window_seconds,
+                "shutdown_drain_seconds": shutdown_drain_seconds,
             }
             click.echo(json.dumps(resolved, indent=2))
             return
@@ -1485,12 +1584,20 @@ def main(
                         window_seconds=rate_limit_window_seconds,
                     )
                 )
-            mcp.run(
-                transport="streamable-http",
+            app = mcp.http_app(transport="streamable-http", middleware=middleware)
+            _install_shutdown_drain(app, drain_seconds=shutdown_drain_seconds)
+            uvicorn_config = uvicorn.Config(
+                app,
                 host=host,
                 port=port,
-                middleware=middleware,
+                lifespan="on",
+                # Preserves run_http_async's own default (lost by bypassing
+                # it) for the connection/task-draining wait uvicorn does
+                # BEFORE dispatching lifespan.shutdown - unrelated to the
+                # drain feature itself, which fires after this.
+                timeout_graceful_shutdown=2,
             )
+            asyncio.run(uvicorn.Server(uvicorn_config).serve())
         else:
             logger.info(
                 f"Starting MCP server with stdio transport using Backend: {_config.backend.type} connected to: {_config.backend.url}"
