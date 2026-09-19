@@ -920,16 +920,16 @@ export BACKEND_API_KEY=your_key_here
 
 ## Roadmap
 
-Two ideas are deliberately **not** built yet — they're being deferred until v0.1 ships and gets real usage feedback, rather than guessed at up front:
+Two ideas are deliberately **not** built yet — they're being deferred until they get real usage feedback against the six backends already shipped, rather than guessed at up front:
 
 - **Cross-backend correlation** — querying multiple configured backends in a single call and correlating results across them (e.g. a Datadog trace and its downstream Sentry error, joined).
 - **Agent-native triage** — tools that flag a likely root cause rather than just returning raw trace data, so an agent can act on a diagnosis instead of re-deriving one from a trace dump every time.
 
-Beyond that, the next backends under research (in order, not yet started): **Grafana Cloud**, **New Relic**, **Honeycomb**.
+Beyond that, the next backends under research (in order, not yet started): **New Relic**, **Honeycomb**. (Grafana Cloud is not on this list — it already ships today via Tempo's Basic Auth path; see [Grafana Tempo](#backend-specific-setup) above.)
 
-Carried over from upstream's older roadmap and still pending, re-prioritized behind the above rather than dropped: cost calculation with built-in pricing tables, model performance comparison tools, prompt pattern analysis, MCP resources for common queries, a caching layer for frequent queries, and SigNoz/ClickHouse backend support.
+Carried over from upstream's older roadmap, re-prioritized behind the above rather than dropped: a dedicated model-vs-model comparison tool (today's `get_llm_model_stats` and `compare_time_windows` cover per-model stats and time-window diffing separately, but not a single tool that diffs two specific models directly), broader prompt-pattern analysis across templates rather than just version-over-version for one prompt (`get_prompt_version_stats` already covers the latter), MCP resources for common queries, and SigNoz/ClickHouse backend support. Cost calculation with built-in pricing tables and a query-result caching layer are **shipped**, not pending: every usage-reporting tool (e.g. `investigate_cost_spike` in the [Tools Reference](#tools-reference)) returns a `cost_usd`/`cost_usd_is_partial` pair backed by a vendored litellm pricing table (`src/opentelemetry_mcp/pricing/`), and query results are cached with in-flight request coalescing via the `QUERY_CACHE_TTL_SECONDS` env var (not yet listed in the [configuration table](#all-configuration-options) above — see `--query-cache-ttl-seconds` in `tracehub-mcp --help` in the meantime).
 
-None of the above is shipped. Everything documented elsewhere in this README is.
+Everything else documented elsewhere in this README is shipped.
 
 ---
 
