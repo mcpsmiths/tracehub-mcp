@@ -802,3 +802,63 @@ class TraceDetail(BaseModel):
     spans: list[SpanDetail]
     llm_summary: dict[str, Any] | None = None
     detail_level: Literal["summary", "full"]
+
+
+class TriagedSpanSummary(BaseModel):
+    """One span's shape inside a TriageResult - deliberately smaller than
+    SpanDetail (no raw attributes/events) since a triage result is meant to
+    be a synthesized diagnosis an agent can act on directly, not a second
+    copy of the full trace dump get_trace already provides.
+
+    error_detail is populated only when detail_level="full" and the verdict
+    is error-driven, and then only on the single span diagnosed as the
+    likely root cause - i.e. TriageResult.verdict.likely_root_cause, and
+    (since they represent the same underlying span) the matching last
+    entry of TriageResult.error_chain. See tools/triage.py. It is always
+    None on critical_path/top_latency_contributors entries, and on every
+    other error_chain entry, regardless of detail_level.
+    """
+
+    span_id: str
+    operation_name: str
+    service_name: str
+    duration_ms: float
+    self_time_ms: float
+    status: Literal["OK", "ERROR", "UNSET"]
+    error_detail: dict[str, Any] | None = None
+
+
+class TriageVerdict(BaseModel):
+    """The synthesized root-cause diagnosis triage_trace produces.
+
+    likely_root_cause is None only when the trace has no spans at all (a
+    backend returned an empty TraceData) - every non-empty trace always
+    finds a candidate, since the pure-latency fallback (confidence="low")
+    applies whenever no error chain exists.
+    """
+
+    likely_root_cause: TriagedSpanSummary | None
+    confidence: Literal["high", "medium", "low"]
+    reasoning: str
+
+
+class TriageResult(BaseModel):
+    """Structured response shape for the triage_trace tool - see
+    SearchTracesResult's docstring for why this is a real model rather than
+    a bare str.
+
+    error_chain is populated only when the trace contains at least one
+    ERROR-status span; verdict.confidence is then "high" (a single deepest
+    error chain) or "medium" (multiple equally-deep error chains - ambiguous
+    blame). With no error chain at all, the verdict falls back to the
+    highest self-time span as a pure-latency diagnosis with confidence="low".
+    """
+
+    trace_id: str
+    verdict: TriageVerdict
+    critical_path: list[TriagedSpanSummary]
+    top_latency_contributors: list[TriagedSpanSummary] = Field(
+        description="Top spans by self-time (latency contribution net of "
+        "children) across the whole trace, capped at 10 entries."
+    )
+    error_chain: list[TriagedSpanSummary] | None

@@ -549,13 +549,14 @@ gemini "Analyze token usage for gpt-4 requests today"
 
 ## Tools Reference
 
-tracehub-mcp exposes **17 MCP tools**:
+tracehub-mcp exposes **18 MCP tools**:
 
 | Tool                       | Description                                       | Use Case                           |
 | --------------------------- | -------------------------------------------------- | ----------------------------------- |
 | `search_traces`            | Search traces with simple params or advanced filters | Find specific requests or patterns |
 | `search_spans_tool`        | Search individual spans (not grouped into traces) | Find LLM tool calls, specific ops  |
 | `get_trace`                | Get complete trace details by trace ID            | Deep-dive into a single trace      |
+| `triage_trace`             | Synthesize a likely-root-cause diagnosis for a trace (critical path, latency ranking, error chain) | Act on a diagnosis instead of re-deriving one from a trace dump |
 | `get_llm_usage`             | Aggregate token usage metrics                     | Track costs and usage trends       |
 | `list_services`            | List available services                           | Discover what's instrumented       |
 | `find_errors`               | Find traces with errors                           | Debug failures quickly             |
@@ -613,6 +614,14 @@ Parameters: `service_name`, `operation_name`, `start_time`/`end_time` (ISO 8601)
 ```
 
 Returns the full trace tree: all spans with attributes, parsed OpenTelemetry `gen_ai.*` data for LLM spans, per-span token usage, error information, and each span's raw `events` (e.g. `gen_ai.evaluation.result`, or any other instrumentation-emitted event — not filtered to a fixed set of names).
+
+**`triage_trace`**
+
+```python
+{ "trace_id": "abc123def456", "detail_level": "summary" }
+```
+
+Instead of returning raw trace data for an agent to re-derive a diagnosis from every time, this synthesizes one directly: a critical path (the "Last Finishing Child" chain actually responsible for the trace's total latency), the top spans ranked by self-time (latency contribution net of children), and — when the trace contains an error — the deepest error span in the trace's error chain as the likely root cause (`confidence: "high"`, or `"medium"` when multiple equally-deep error chains make blame ambiguous). Falls back to the highest self-time span as a pure-latency diagnosis (`confidence: "low"`) when no error is present. Deterministic — no LLM call — and works against any configured backend, since it operates on `get_trace`'s already-fetched span data. `detail_level: "full"` additionally attaches the diagnosed root cause's raw error detail (message/type/stacktrace) when the verdict is error-driven.
 
 **`get_llm_usage`**
 
@@ -926,10 +935,11 @@ export BACKEND_API_KEY=your_key_here
 
 ## Roadmap
 
-Two ideas are deliberately **not** built yet — they're being deferred until they get real usage feedback against the six backends already shipped, rather than guessed at up front:
+One idea is deliberately **not** built yet — it's being deferred until it gets real usage feedback against the six backends already shipped, rather than guessed at up front:
 
 - **Cross-backend correlation** — querying multiple configured backends in a single call and correlating results across them (e.g. a Datadog trace and its downstream Sentry error, joined).
-- **Agent-native triage** — tools that flag a likely root cause rather than just returning raw trace data, so an agent can act on a diagnosis instead of re-deriving one from a trace dump every time.
+
+Agent-native triage — tools that flag a likely root cause rather than just returning raw trace data — is **shipped**: see `triage_trace` in the [Tools Reference](#tools-reference) above.
 
 Beyond that, the next backends under research (in order, not yet started): **New Relic**, **Honeycomb**. (Grafana Cloud is not on this list — it already ships today via Tempo's Basic Auth path; see [Grafana Tempo](#backend-specific-setup) above.)
 

@@ -31,7 +31,7 @@ from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.backends.xray import XRayBackend
 from opentelemetry_mcp.config import BackendConfig, ServerConfig
-from opentelemetry_mcp.models import SearchTracesResult, TraceDetail
+from opentelemetry_mcp.models import SearchTracesResult, TraceDetail, TriageResult, TriageVerdict
 
 FAKE_API_KEY = "dd-key1"
 FAKE_APP_KEY = "dd-app1"
@@ -330,6 +330,33 @@ class TestToolWrappers:
         ):
             await server.get_trace(trace_id="missing")
 
+    async def test_triage_trace_passes_trace_id(self) -> None:
+        await self._set_backend()
+        sentinel = TriageResult(
+            trace_id="abc123",
+            verdict=TriageVerdict(likely_root_cause=None, confidence="low", reasoning="no spans"),
+            critical_path=[],
+            top_latency_contributors=[],
+            error_chain=None,
+        )
+        with patch.object(
+            server.triage, "triage_trace", AsyncMock(return_value=sentinel)
+        ) as mocked:
+            result = await server.triage_trace(trace_id="abc123")
+
+        assert result is sentinel
+        _, kwargs = mocked.call_args
+        assert kwargs["trace_id"] == "abc123"
+        assert kwargs["detail_level"] == "summary"
+
+    async def test_triage_trace_exception_propagates(self) -> None:
+        await self._set_backend()
+        with (
+            patch.object(server.triage, "triage_trace", AsyncMock(side_effect=KeyError("nope"))),
+            pytest.raises(KeyError, match="nope"),
+        ):
+            await server.triage_trace(trace_id="missing")
+
     async def test_get_llm_usage_passes_arguments_through(self) -> None:
         await self._set_backend()
         with patch.object(server.usage, "get_llm_usage", AsyncMock(return_value="{}")) as mocked:
@@ -625,7 +652,7 @@ class TestToolAnnotationsComplete:
         async with Client(server.mcp) as client:
             tools = await client.list_tools()
 
-        assert len(tools) == 17
+        assert len(tools) == 18
         for t in tools:
             assert t.annotations is not None, f"{t.name} has no annotations at all"
             assert t.annotations.read_only_hint is True, t.name
@@ -640,10 +667,10 @@ class TestToolAnnotationsComplete:
         async with Client(server.mcp) as client:
             tools = await client.list_tools()
 
-        assert len(tools) == 17
+        assert len(tools) == 18
         titles = [t.title for t in tools]
         assert all(isinstance(title, str) and title for title in titles), titles
-        assert len(set(titles)) == 17, "titles must be distinct per tool"
+        assert len(set(titles)) == 18, "titles must be distinct per tool"
 
 
 class TestClampLimit:

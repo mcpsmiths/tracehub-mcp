@@ -8,8 +8,8 @@ tracehub-mcp is an MCP (Model Context Protocol) server that enables AI agents to
 
 **Key Features:**
 
-- Multi-backend support: Jaeger, Grafana Tempo, Traceloop, Datadog, and Sentry
-- 17 MCP tools: Core tools + LLM-oriented discovery and analysis tools + session/prompt-version/time-window aggregation + cost/error spike investigation
+- Multi-backend support: Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry, and AWS X-Ray
+- 18 MCP tools: Core tools + agent-native triage + LLM-oriented discovery and analysis tools + session/prompt-version/time-window aggregation + cost/error spike investigation
 - Cost attribution (`cost_usd`) via a vendored litellm pricing table, with an honest `cost_usd_is_partial` flag when a model's price can't be resolved
 - Token usage tracking and aggregation across models/services
 - Finish reasons tracking for debugging truncated/filtered responses
@@ -93,6 +93,7 @@ Each MCP capability is implemented as a separate tool module in [opentelemetry_m
 - [tools/search.py](opentelemetry_mcp/tools/search.py) - Search traces with filters
 - [tools/search_spans.py](opentelemetry_mcp/tools/search_spans.py) - Search individual spans with filters
 - [tools/trace.py](opentelemetry_mcp/tools/trace.py) - Get detailed trace by ID (`detail_level`: `"full"` default returns everything unbounded; `"summary"` elides large gen_ai.\* message/document fields and truncates long event attributes)
+- [tools/triage.py](opentelemetry_mcp/tools/triage.py) - `triage_trace`: synthesize a likely-root-cause diagnosis (critical path, latency-contribution ranking, error chain) instead of returning raw trace data - composes [tools/span_tree.py](opentelemetry_mcp/tools/span_tree.py)'s tree-walking utilities, which no backend or other tool builds elsewhere
 - [tools/usage.py](opentelemetry_mcp/tools/usage.py) - Aggregate token usage metrics
 - [tools/services.py](opentelemetry_mcp/tools/services.py) - List available services
 - [tools/errors.py](opentelemetry_mcp/tools/errors.py) - Find traces with errors
@@ -112,9 +113,10 @@ Each MCP capability is implemented as a separate tool module in [opentelemetry_m
 **Two valid return patterns exist.** Returning a JSON string was never actually an MCP protocol
 requirement - it was this codebase's original convention, from before FastMCP auto-derived
 `outputSchema`/`structuredContent` from a tool function's return-type annotation. Most tools
-still use the original pattern; `search_traces`, `search_spans_tool`, and `list_sessions` were
-converted to the newer pattern (see [models.py](opentelemetry_mcp/models.py)'s
-`SearchTracesResult`/`SearchSpansResult` and [tools/sessions.py](opentelemetry_mcp/tools/sessions.py)'s
+still use the original pattern; `search_traces`, `search_spans_tool`, `list_sessions`, `get_trace`,
+and `triage_trace` were converted to (or, for the latter two, built directly on) the newer pattern
+(see [models.py](opentelemetry_mcp/models.py)'s `SearchTracesResult`/`SearchSpansResult`/
+`TraceDetail`/`TriageResult` and [tools/sessions.py](opentelemetry_mcp/tools/sessions.py)'s
 `ListSessionsResult`) so MCP clients get real structured output instead of a JSON string wrapped
 in `{"result": "<json string>"}`.
 
@@ -122,7 +124,7 @@ in `{"result": "<json string>"}`.
 # Pattern A (most tools): return a JSON string
 return json.dumps({"result": data})
 
-# Pattern B (search_traces, search_spans_tool, list_sessions): return a typed model
+# Pattern B (search_traces, search_spans_tool, list_sessions, get_trace, triage_trace): return a typed model
 return SearchTracesResult(count=len(summaries), traces=summaries)
 ```
 

@@ -30,7 +30,12 @@ from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.backends.xray import XRayBackend
 from opentelemetry_mcp.config import ServerConfig
-from opentelemetry_mcp.models import SearchSpansResult, SearchTracesResult, TraceDetail
+from opentelemetry_mcp.models import (
+    SearchSpansResult,
+    SearchTracesResult,
+    TraceDetail,
+    TriageResult,
+)
 from opentelemetry_mcp.observability import (
     McpServerTracingMiddleware,
     configure_metrics,
@@ -52,6 +57,7 @@ from opentelemetry_mcp.tools import (
     sessions,
     slow_traces,
     trace,
+    triage,
     usage,
 )
 
@@ -61,7 +67,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# All 17 tools below only ever query trace/span backends and never mutate
+# All 18 tools below only ever query trace/span backends and never mutate
 # backend state, so the same read-only/destructive/idempotent/open-world
 # annotations apply to every one of them. destructiveHint is meaningful
 # only when readOnlyHint is false per the MCP spec, so it carries no
@@ -382,6 +388,45 @@ async def get_trace(
         return result
     except Exception as e:
         return _handle_tool_error("get_trace", e)
+
+
+@mcp.tool(title="Triage Trace", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def triage_trace(
+    trace_id: str, detail_level: Literal["summary", "full"] = "summary"
+) -> TriageResult:
+    """Synthesize a likely-root-cause diagnosis for a trace, instead of
+    returning raw trace data for the caller to re-derive one from every time.
+
+    Computes a critical path (the "Last Finishing Child" chain actually
+    responsible for the trace's total latency), ranks spans by self-time
+    (latency contribution net of children, top 10), and - when the trace
+    contains an error anywhere under any root span - identifies the deepest
+    error span in the trace's error chain as the likely root cause. Falls
+    back to the highest self-time span as a pure-latency diagnosis when no
+    error is present. Deterministic (no LLM call); works against any
+    configured backend.
+
+    Args:
+        trace_id: Trace identifier
+        detail_level: "summary" (default) returns a compact diagnosis only
+            - this differs from get_trace's own "full"-by-default, since a
+            triage result is already a small synthesized diagnosis rather
+            than a raw data dump, so there is no unbounded-by-default
+            payload to guard against here. "full" additionally attaches
+            the diagnosed root cause's raw error detail (message/type/
+            stacktrace) to both the verdict and the matching error_chain
+            entry, when the verdict is error-driven.
+
+    Returns:
+        TriageResult with a verdict, critical path, top 10 latency
+        contributors, and (when present) the error chain.
+    """
+    try:
+        backend = await _get_backend()
+        result = await triage.triage_trace(backend, trace_id=trace_id, detail_level=detail_level)
+        return result
+    except Exception as e:
+        return _handle_tool_error("triage_trace", e)
 
 
 @mcp.tool(title="Get LLM Usage", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
@@ -1051,6 +1096,7 @@ _ALL_TOOL_NAMES = frozenset(
         "get_llm_slow_traces",
         "search_spans_tool",
         "list_llm_tools_tool",
+        "triage_trace",
     }
 )
 
