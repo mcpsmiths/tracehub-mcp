@@ -85,8 +85,9 @@ See [MCP Client Setup](#mcp-client-setup) for Cursor, Windsurf, VS Code, and Gem
 - **[Datadog](https://www.datadoghq.com/)** — cloud APM, requires an API key *and* an Application key.
 - **[Sentry](https://sentry.io/)** — cloud or self-hosted, requires an auth token and an organization slug.
 - **[AWS X-Ray](https://aws.amazon.com/xray/)** — SigV4-signed via `boto3`, requires an AWS region and standard AWS credentials (not an API key). Because OTel span attributes land in unindexed X-Ray segment *metadata* by default (only *annotations* are queryable), native server-side filtering is narrower here than for the other backends — see the [Backend Support Matrix](#backend-support-matrix).
+- **[New Relic](https://newrelic.com/)** — NerdGraph GraphQL API, requires a User API key (not an Ingest/License key) and an account ID. **Built without a live account to verify against** — see the [New Relic setup section](#backend-specific-setup) below and the module docstring in [backends/newrelic.py](src/opentelemetry_mcp/backends/newrelic.py) for exactly which assumptions are unverified.
 
-All six implement the same `BaseBackend` interface, so every MCP tool works identically regardless of which one you point the server at. See [Configuration](#configuration) for per-backend setup.
+All seven implement the same `BaseBackend` interface, so every MCP tool works identically regardless of which one you point the server at. See [Configuration](#configuration) for per-backend setup.
 
 ---
 
@@ -170,14 +171,15 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 
 | Variable                 | Type    | Default  | Description                                                          |
 | ------------------------ | ------- | -------- | ---------------------------------------------------------------------|
-| `BACKEND_TYPE`           | string  | `jaeger` | Backend type: `jaeger`, `tempo`, `traceloop`, `datadog`, `sentry`, or `xray` |
+| `BACKEND_TYPE`           | string  | `jaeger` | Backend type: `jaeger`, `tempo`, `traceloop`, `datadog`, `sentry`, `xray`, or `newrelic` |
 | `BACKEND_URL`            | URL     | -        | Backend API endpoint (required; decorative-only placeholder for X-Ray) |
-| `BACKEND_API_KEY`        | string  | -        | API key/auth token (required for Traceloop, Datadog, and Sentry; unused by X-Ray) |
+| `BACKEND_API_KEY`        | string  | -        | API key/auth token (required for Traceloop, Datadog, Sentry, and New Relic; unused by X-Ray) |
 | `BACKEND_APP_KEY`        | string  | -        | Application key (Datadog only, in addition to `BACKEND_API_KEY`)     |
 | `BACKEND_TEMPO_INSTANCE_ID` | string | -     | Grafana Cloud stack/instance ID (Tempo only, enables Basic Auth in addition to `BACKEND_API_KEY`) |
 | `BACKEND_SENTRY_ORG`     | string  | -        | Organization slug (required for Sentry)                             |
 | `BACKEND_SENTRY_PROJECT` | string  | -        | Project slug (optional for Sentry, narrows queries to one project)   |
 | `BACKEND_AWS_REGION`     | string  | -        | AWS region, e.g. `us-east-1` (required for X-Ray)                    |
+| `BACKEND_NEWRELIC_ACCOUNT_ID` | string | -   | New Relic account ID (required for New Relic - NerdGraph queries are user-scoped, not account-scoped) |
 | `BACKEND_ENVIRONMENTS`   | string  | `prd`    | Comma-separated environments (Traceloop only)                        |
 | `BACKEND_TIMEOUT`        | float   | `30`     | Request timeout in seconds                                           |
 | `SECONDARY_BACKEND_TYPE` / `SECONDARY_BACKEND_URL` / ... | string/URL | unset (opt-in) | A second, independently-configured backend for `correlate_trace` (cross-backend correlation) - every `BACKEND_*` variable above has a `SECONDARY_BACKEND_*` equivalent. Env-var only, no CLI flags. Unset means `correlate_trace` raises a clear error if called |
@@ -300,6 +302,24 @@ Unlike every other backend here, X-Ray is queried via `boto3`/SigV4, not a beare
 **Filtering is more limited than the other backends.** By default, OpenTelemetry span attributes are converted to X-Ray segment *metadata*, not *annotations* — only annotations are indexed and queryable via X-Ray's `FilterExpression` search syntax. This backend can only natively push down service name, duration, and error/fault/throttle-derived status; every other field (including all `gen_ai.*` attributes) is always applied client-side after hydrating full traces, unless your own OTel/ADOT collector config explicitly promotes those keys to indexed annotations.
 
 > **Troubleshooting:** an `AccessDeniedException` from `GetServiceGraph` is non-fatal — `list_services` automatically falls back to sampling recent traces. An `AccessDeniedException` from `GetTraceSummaries`/`BatchGetTraces` is fatal for search/hydration and will surface as an unhealthy `health_check`/`doctor` result; double check the IAM permissions above.
+
+</details>
+
+<details>
+<summary><b>New Relic</b></summary>
+
+```bash
+BACKEND_TYPE=newrelic
+# US datacenter (default): https://api.newrelic.com/graphql
+# EU datacenter:            https://api.eu.newrelic.com/graphql
+BACKEND_URL=https://api.newrelic.com/graphql
+BACKEND_API_KEY=your_user_api_key_here
+BACKEND_NEWRELIC_ACCOUNT_ID=1234567
+```
+
+New Relic requires a **User** API key (not an Ingest or License key, which cannot query) *and* an account ID — a User key is user-scoped, not account-scoped, so every NerdGraph query here states which account to query explicitly. Search uses NRQL (`SELECT * FROM Span WHERE ...`); `get_trace` uses NerdGraph's native `distributedTracing.trace` lookup, like Sentry, rather than reconstructing a trace from search results.
+
+> **Built without a live New Relic account to verify against.** Two things a real account is needed to confirm: the exact shape of OTel span attributes inside `distributedTracing.trace`'s GraphQL response (assumed to be a flat, directly-keyed object), and the account's actual Span-data retention window (a conservative 7-day default is used pending confirmation). See the module docstring in [backends/newrelic.py](src/opentelemetry_mcp/backends/newrelic.py) for the complete list of unverified assumptions before relying on this backend in production.
 
 </details>
 
@@ -576,19 +596,20 @@ tracehub-mcp exposes **19 MCP tools**:
 
 ### Backend Support Matrix
 
-| Feature          | Jaeger | Tempo | Traceloop | Datadog | Sentry | AWS X-Ray |
-| ---------------- | :----: | :---: | :-------: | :-----: | :----: | :-------: |
-| Search traces    |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓‡   |    ✓†     |
-| Search spans     |  ✓\*   |   ✓   |     ✓     |    ✓    |   ✓    |    ✓†     |
-| Get trace by ID  |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓    |    ✓      |
-| Advanced filters |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓§     |
-| Error traces     |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓      |
-| All LLM tools    |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓      |
+| Feature          | Jaeger | Tempo | Traceloop | Datadog | Sentry | AWS X-Ray | New Relic |
+| ---------------- | :----: | :---: | :-------: | :-----: | :----: | :-------: | :-------: |
+| Search traces    |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓‡   |    ✓†     |    ✓†     |
+| Search spans     |  ✓\*   |   ✓   |     ✓     |    ✓    |   ✓    |    ✓†     |    ✓      |
+| Get trace by ID  |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓    |    ✓      |    ✓‡     |
+| Advanced filters |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓§     |    ✓      |
+| Error traces     |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓      |    ✓      |
+| All LLM tools    |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓      |   ✓¶      |
 
 <sub>\* Jaeger requires the `service_name` parameter for span search.</sub><br>
-<sub>† Datadog and AWS X-Ray have no trace-level *search* API (X-Ray's `BatchGetTraces` fetches by exact ID); traces are reconstructed by searching (spans, or X-Ray trace summaries) and hydrating, with every result re-verified against the exact ID requested.</sub><br>
-<sub>‡ Sentry does have a native trace-lookup endpoint (unlike Datadog), so `get_trace` calls it directly; `search_traces` still discovers candidate trace IDs via a span search first, since Sentry's search surface is itself span-centric.</sub><br>
-<sub>§ AWS X-Ray natively filters only service name, duration, and error/fault/throttle-derived status — OTel attributes (including all `gen_ai.*` fields) land in unindexed segment *metadata* by default, not indexed *annotations*, so they're always applied client-side rather than pushed down to `FilterExpression`.</sub>
+<sub>† Datadog, AWS X-Ray, and New Relic have no trace-level *search* API (X-Ray's `BatchGetTraces` fetches by exact ID); traces are reconstructed by searching (spans, X-Ray trace summaries, or NRQL Span events) and hydrating, with every result re-verified against the exact ID requested.</sub><br>
+<sub>‡ Sentry and New Relic both have a native trace-lookup endpoint (unlike Datadog), so `get_trace` calls it directly; `search_traces` still discovers candidate trace IDs via a span/NRQL search first, since both backends' search surface is itself span-centric.</sub><br>
+<sub>§ AWS X-Ray natively filters only service name, duration, and error/fault/throttle-derived status — OTel attributes (including all `gen_ai.*` fields) land in unindexed segment *metadata* by default, not indexed *annotations*, so they're always applied client-side rather than pushed down to `FilterExpression`.</sub><br>
+<sub>¶ `search_spans` reads `gen_ai.*` attributes directly off NRQL's well-documented flat row shape. `search_traces`/`get_trace` additionally rely on an unverified assumption about the shape of the `attributes` field inside NerdGraph's `distributedTracing.trace` response - `search_traces` overlays the original NRQL search row's attributes back onto the hydrated result specifically to degrade gracefully if that assumption turns out to be wrong; see the New Relic setup section above.</sub>
 
 ### Key Tool Details
 
@@ -950,7 +971,7 @@ Both ideas that were previously listed here as deferred are now **shipped**:
 - Agent-native triage — tools that flag a likely root cause rather than just returning raw trace data: see `triage_trace` in the [Tools Reference](#tools-reference) above.
 - Cross-backend correlation — querying a second, independently-configured backend and correlating results against it: see `correlate_trace` above. This ships as a best-effort, heuristic correlation (direct `trace_id` match, or a time-window/service-overlap fallback) rather than a guaranteed schema-level join, per the research behind it — trace-id continuity across a vendor boundary is not guaranteed even under normal W3C Trace Context propagation.
 
-Beyond that, the next backends under research (in order, not yet started): **New Relic**, **Honeycomb**. (Grafana Cloud is not on this list — it already ships today via Tempo's Basic Auth path; see [Grafana Tempo](#backend-specific-setup) above.)
+New Relic has since **shipped** as a 7th backend, built entirely from research/documentation without a live account to verify against — see the [New Relic setup section](#backend-specific-setup) for exactly what's unverified before relying on it in production. Beyond that, the next backend under research (not yet started): **Honeycomb**. (Grafana Cloud is not on this list — it already ships today via Tempo's Basic Auth path; see [Grafana Tempo](#backend-specific-setup) above.)
 
 Carried over from upstream's older roadmap, re-prioritized behind the above rather than dropped: a dedicated model-vs-model comparison tool (today's `get_llm_model_stats` and `compare_time_windows` cover per-model stats and time-window diffing separately, but not a single tool that diffs two specific models directly), broader prompt-pattern analysis across templates rather than just version-over-version for one prompt (`get_prompt_version_stats` already covers the latter), MCP resources for common queries, and SigNoz/ClickHouse backend support. Cost calculation with built-in pricing tables and a query-result caching layer are **shipped**, not pending: every usage-reporting tool (e.g. `investigate_cost_spike` in the [Tools Reference](#tools-reference)) returns a `cost_usd`/`cost_usd_is_partial` pair backed by a vendored litellm pricing table (`src/opentelemetry_mcp/pricing/`), and query results are cached with in-flight request coalescing via the `QUERY_CACHE_TTL_SECONDS` env var (see the [configuration table](#all-configuration-options) above).
 

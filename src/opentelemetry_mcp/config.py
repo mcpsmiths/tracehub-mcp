@@ -18,7 +18,7 @@ load_dotenv()
 class BackendConfig(BaseModel):
     """Configuration for OpenTelemetry trace backend."""
 
-    type: Literal["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"]
+    type: Literal["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray", "newrelic"]
     url: HttpUrl
     api_key: str | None = Field(default=None, exclude=True)
     app_key: str | None = Field(
@@ -41,6 +41,12 @@ class BackendConfig(BaseModel):
     )
     aws_region: str | None = Field(
         default=None, exclude=True, description="AWS region (X-Ray backend only)"
+    )
+    newrelic_account_id: str | None = Field(
+        default=None,
+        exclude=True,
+        description="New Relic account ID, required since NerdGraph queries are "
+        "user-scoped not account-scoped (New Relic backend only)",
     )
     timeout: float = Field(default=30.0, gt=0, le=300)
     environments: list[str] = Field(default_factory=lambda: ["prd"])
@@ -112,10 +118,18 @@ class BackendConfig(BaseModel):
         every BackendConfig field, read from `{prefix}<FIELD>`."""
         backend_type = os.getenv(f"{prefix}TYPE", type_default)
         backend_url = os.getenv(f"{prefix}URL", url_default)
-        if backend_type not in ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"]:
+        if backend_type not in [
+            "jaeger",
+            "tempo",
+            "traceloop",
+            "datadog",
+            "sentry",
+            "xray",
+            "newrelic",
+        ]:
             raise ValueError(
                 f"Invalid {prefix}TYPE: {backend_type}. "
-                "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray"
+                "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray, newrelic"
             )
         if not backend_url:
             raise ValueError(f"{prefix}URL is required when {prefix}TYPE is set")
@@ -141,6 +155,7 @@ class BackendConfig(BaseModel):
             sentry_project=os.getenv(f"{prefix}SENTRY_PROJECT"),
             tempo_instance_id=os.getenv(f"{prefix}TEMPO_INSTANCE_ID"),
             aws_region=os.getenv(f"{prefix}AWS_REGION"),
+            newrelic_account_id=os.getenv(f"{prefix}NEWRELIC_ACCOUNT_ID"),
             timeout=timeout,
             environments=environments,
         )
@@ -223,6 +238,7 @@ class ServerConfig(BaseModel):
         sentry_project: str | None = None,
         tempo_instance_id: str | None = None,
         aws_region: str | None = None,
+        newrelic_account_id: str | None = None,
         environments: str | None = None,
         log_level: str | None = None,
         max_traces_per_query: int | None = None,
@@ -262,10 +278,18 @@ class ServerConfig(BaseModel):
             self.max_traces_per_query = max_traces_per_query
 
         if backend_type:
-            if backend_type not in ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"]:
+            if backend_type not in [
+                "jaeger",
+                "tempo",
+                "traceloop",
+                "datadog",
+                "sentry",
+                "xray",
+                "newrelic",
+            ]:
                 raise ValueError(
                     f"Invalid backend type: {backend_type}. "
-                    "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray"
+                    "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray, newrelic"
                 )
             self.backend.type = backend_type  # type: ignore
 
@@ -295,6 +319,9 @@ class ServerConfig(BaseModel):
 
         if aws_region:
             self.backend.aws_region = aws_region
+
+        if newrelic_account_id:
+            self.backend.newrelic_account_id = newrelic_account_id
 
         if environments:
             self.backend.environments = [

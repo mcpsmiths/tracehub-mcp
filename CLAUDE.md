@@ -8,7 +8,7 @@ tracehub-mcp is an MCP (Model Context Protocol) server that enables AI agents to
 
 **Key Features:**
 
-- Multi-backend support: Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry, and AWS X-Ray
+- Multi-backend support: Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry, AWS X-Ray, and New Relic
 - 19 MCP tools: Core tools + agent-native triage + cross-backend correlation + LLM-oriented discovery and analysis tools + session/prompt-version/time-window aggregation + cost/error spike investigation
 - Cost attribution (`cost_usd`) via a vendored litellm pricing table, with an honest `cost_usd_is_partial` flag when a model's price can't be resolved
 - Token usage tracking and aggregation across models/services
@@ -83,6 +83,7 @@ Concrete implementations:
 - [backends/datadog.py](opentelemetry_mcp/backends/datadog.py) - Datadog backend
 - [backends/sentry.py](opentelemetry_mcp/backends/sentry.py) - Sentry backend
 - [backends/xray.py](opentelemetry_mcp/backends/xray.py) - AWS X-Ray backend (boto3/SigV4, not httpx - see its module docstring)
+- [backends/newrelic.py](opentelemetry_mcp/backends/newrelic.py) - New Relic backend (NerdGraph GraphQL API - built without a live account to verify against, see its module docstring for exactly what's unverified)
 
 ### Tool-Based Architecture
 
@@ -144,13 +145,14 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 
 **Environment Variables** (see [.env.example](.env.example)):
 
-- `BACKEND_TYPE` - Required: `jaeger`, `tempo`, `traceloop`, `datadog`, `sentry`, or `xray`
+- `BACKEND_TYPE` - Required: `jaeger`, `tempo`, `traceloop`, `datadog`, `sentry`, `xray`, or `newrelic`
 - `BACKEND_URL` - Required: Backend API endpoint (decorative-only placeholder for X-Ray - see config.py's `BackendConfig.url` docstring)
 - `BACKEND_API_KEY` - Optional: Authentication key (unused by X-Ray, which authenticates via boto3's standard AWS credential chain)
 - `BACKEND_APP_KEY` - Required for Datadog backend only: Application key, in addition to `BACKEND_API_KEY`
 - `BACKEND_SENTRY_ORG` - Required for Sentry backend only: Organization slug
 - `BACKEND_SENTRY_PROJECT` - Optional for Sentry backend: Project slug to narrow queries
 - `BACKEND_AWS_REGION` - Required for X-Ray backend only: AWS region (e.g. `us-east-1`)
+- `BACKEND_NEWRELIC_ACCOUNT_ID` - Required for New Relic backend only: numeric account ID (NerdGraph queries are user-scoped, not account-scoped)
 - `BACKEND_TIMEOUT` - Optional: Request timeout (default: 30s)
 - `BACKEND_TEMPO_INSTANCE_ID` - Optional for Tempo backend: Grafana Cloud stack/instance ID (Basic Auth with `BACKEND_API_KEY` instead of Bearer auth)
 - `SECONDARY_BACKEND_TYPE` / `SECONDARY_BACKEND_URL` / ... - Optional, opt-in: a second, independently-configured backend for `correlate_trace` (cross-backend correlation) - every `BACKEND_*` variable above has a `SECONDARY_BACKEND_*` equivalent. Env-var only (no CLI override), see `config.py`'s `BackendConfig.from_env_optional`

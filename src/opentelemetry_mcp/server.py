@@ -25,6 +25,7 @@ from opentelemetry_mcp import __version__
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.datadog import DatadogBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
+from opentelemetry_mcp.backends.newrelic import NewRelicBackend
 from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
@@ -182,6 +183,14 @@ def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             aws_region=backend_config.aws_region,
+            timeout=backend_config.timeout,
+        )
+    elif backend_config.type == "newrelic":
+        logger.info(f"Initializing New Relic backend: account {backend_config.newrelic_account_id}")
+        backend = NewRelicBackend(
+            url=str(backend_config.url),
+            api_key=backend_config.api_key,
+            account_id=backend_config.newrelic_account_id,
             timeout=backend_config.timeout,
         )
     else:
@@ -1446,6 +1455,7 @@ def _print_config_backend_dict(backend_config: BackendConfig) -> dict[str, Any]:
         "sentry_project": backend_config.sentry_project,
         "tempo_instance_id": backend_config.tempo_instance_id,
         "aws_region": backend_config.aws_region,
+        "newrelic_account_id": backend_config.newrelic_account_id,
         "api_key_set": backend_config.api_key is not None,
         "app_key_set": backend_config.app_key is not None,
     }
@@ -1457,7 +1467,9 @@ def _backend_config_options(f: Any) -> Any:
     before committing to it via the same flags main accepts."""
     f = click.option(
         "--backend",
-        type=click.Choice(["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"]),
+        type=click.Choice(
+            ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray", "newrelic"]
+        ),
         help="Backend type (overrides BACKEND_TYPE env var)",
     )(f)
     f = click.option(
@@ -1506,6 +1518,13 @@ def _backend_config_options(f: Any) -> Any:
         "--aws-region",
         type=str,
         help="AWS region, required by the X-Ray backend (overrides BACKEND_AWS_REGION env var)",
+    )(f)
+    f = click.option(
+        "--newrelic-account-id",
+        type=str,
+        help="New Relic account ID, required by the New Relic backend since NerdGraph "
+        "queries are user-scoped not account-scoped (overrides "
+        "BACKEND_NEWRELIC_ACCOUNT_ID env var)",
     )(f)
     return f
 
@@ -1660,6 +1679,7 @@ def main(
     sentry_project: str | None,
     environments: str | None,
     aws_region: str | None,
+    newrelic_account_id: str | None,
     print_config: bool,
     transport: str,
     host: str,
@@ -1679,7 +1699,7 @@ def main(
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
-    Supports multiple backends: Jaeger, Tempo, Traceloop, Datadog, Sentry, and AWS X-Ray.
+    Supports multiple backends: Jaeger, Tempo, Traceloop, Datadog, Sentry, AWS X-Ray, and New Relic.
     Configuration can be provided via environment variables or CLI arguments.
 
     Transport options:
@@ -1725,6 +1745,7 @@ def main(
             or sentry_project
             or environments
             or aws_region
+            or newrelic_account_id
             or log_level
             or max_traces_per_query is not None
             or slow_request_threshold_ms is not None
@@ -1739,6 +1760,7 @@ def main(
                 sentry_project=sentry_project,
                 tempo_instance_id=tempo_instance_id,
                 aws_region=aws_region,
+                newrelic_account_id=newrelic_account_id,
                 environments=environments,
                 log_level=log_level,
                 max_traces_per_query=max_traces_per_query,
@@ -1889,6 +1911,7 @@ def doctor(
     sentry_project: str | None,
     environments: str | None,
     aws_region: str | None,
+    newrelic_account_id: str | None,
 ) -> None:
     """Run startup diagnostics against the resolved backend config: config
     load, backend construction, health check, and a live read-only
@@ -1912,6 +1935,7 @@ def doctor(
             or sentry_project
             or environments
             or aws_region
+            or newrelic_account_id
         ):
             config.apply_cli_overrides(
                 backend_type=backend,
@@ -1922,6 +1946,7 @@ def doctor(
                 sentry_project=sentry_project,
                 tempo_instance_id=tempo_instance_id,
                 aws_region=aws_region,
+                newrelic_account_id=newrelic_account_id,
                 environments=environments,
             )
         click.secho("[OK] Configuration loaded and validated", fg="green")

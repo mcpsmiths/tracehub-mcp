@@ -27,6 +27,7 @@ from opentelemetry_mcp.attributes import HealthCheckResponse
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.datadog import DatadogBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
+from opentelemetry_mcp.backends.newrelic import NewRelicBackend
 from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
@@ -45,6 +46,7 @@ FAKE_APP_KEY = "dd-app1"
 FAKE_SENTRY_ORG = "fake-org"
 FAKE_SENTRY_PROJECT = "fake-project"
 FAKE_TEMPO_INSTANCE_ID = "123456"
+FAKE_NEWRELIC_ACCOUNT_ID = "7654321"
 
 
 def _config(**overrides: object) -> ServerConfig:
@@ -81,7 +83,7 @@ def reset_server_globals() -> Generator[None]:
 
 
 class TestCreateBackend:
-    """_create_backend is a pure factory - verify each of the 6 backend
+    """_create_backend is a pure factory - verify each of the 7 backend
     types produces the right class with the right constructor args threaded
     through, plus the ValueError branch for an unsupported type."""
 
@@ -162,6 +164,21 @@ class TestCreateBackend:
         assert isinstance(backend, XRayBackend)
         assert backend.aws_region == "us-east-1"
         assert backend.timeout == 8.0
+
+    def test_newrelic(self) -> None:
+        config = _config(
+            type="newrelic",
+            url=HttpUrl("https://api.newrelic.com/graphql"),
+            api_key=FAKE_API_KEY,
+            newrelic_account_id=FAKE_NEWRELIC_ACCOUNT_ID,
+            timeout=14.0,
+        )
+        backend = server._create_backend(config)
+
+        assert isinstance(backend, NewRelicBackend)
+        assert backend.api_key == FAKE_API_KEY
+        assert backend.account_id == int(FAKE_NEWRELIC_ACCOUNT_ID)
+        assert backend.timeout == 14.0
 
     def test_unsupported_backend_type_raises(self) -> None:
         config = _config(type="jaeger")
@@ -939,6 +956,7 @@ class TestMainCli:
             sentry_project=FAKE_SENTRY_PROJECT,
             tempo_instance_id=FAKE_TEMPO_INSTANCE_ID,
             aws_region=None,
+            newrelic_account_id=None,
             environments="prd,staging",
             log_level=None,
             max_traces_per_query=None,
