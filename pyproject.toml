@@ -1,6 +1,6 @@
 [project]
 name = "tracehub-mcp"
-version = "0.10.0"
+version = "0.11.0"
 description = "MCP server for querying OpenTelemetry traces across multiple observability backends (Jaeger, Tempo, Traceloop, Datadog, and more) for LLM application debugging"
 authors = [
     {name = "Doron Kopit", email = "doron@traceloop.com"},

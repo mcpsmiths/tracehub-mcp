@@ -1,3 +1,15 @@
+## v0.11.0 (2026-09-19)
+
+### Feat
+
+- **deps**: upgrade FastMCP 3.2 -> 4.0.5
+- **backends**: add AWS X-Ray backend
+- **server**: add real graceful shutdown/drain for the HTTP transport
+
+### Fix
+
+- **ci**: pin anyio for a real CVE and disable rate limiting in the conformance job
+
 ## v0.10.0 (2026-09-18)
 
 ### Feat
