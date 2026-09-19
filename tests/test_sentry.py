@@ -19,8 +19,20 @@ import httpx
 import pytest
 
 from opentelemetry_mcp.backends.base import MetadataEndpointBlockedError, _RetryingTransport
-from opentelemetry_mcp.backends.sentry import _MAX_SEARCH_PAGES, _SPAN_SEARCH_FIELDS, SentryBackend
-from opentelemetry_mcp.models import Filter, FilterOperator, FilterType
+from opentelemetry_mcp.backends.sentry import (
+    _MAX_SEARCH_PAGES,
+    _MAX_TRACES_TO_HYDRATE,
+    _SPAN_SEARCH_FIELDS,
+    SentryBackend,
+)
+from opentelemetry_mcp.models import (
+    Filter,
+    FilterOperator,
+    FilterType,
+    SpanQuery,
+    TraceData,
+    TraceQuery,
+)
 
 FAKE_AUTH = "sentry-key1"
 FAKE_ORG = "acme"
@@ -1202,3 +1214,445 @@ class TestHealthCheck:
         assert health.status == "unhealthy"
         assert health.backend == "sentry"
         assert health.error == "boom"
+
+
+def _search_row(
+    span_id: str,
+    trace_id: str,
+    *,
+    op: str = "op",
+    project: str = "svc",
+    timestamp: str = "2023-01-02T09:42:36.320Z",
+    duration: float = 10.0,
+    status: str = "ok",
+    **extra: Any,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "id": span_id,
+        "trace": trace_id,
+        "span.op": op,
+        "project": project,
+        "timestamp": timestamp,
+        "span.duration": duration,
+        "span.status": status,
+    }
+    row.update(extra)
+    return row
+
+
+def _trace_item(
+    span_id: str,
+    trace_id: str,
+    *,
+    op: str = "op",
+    project: str = "svc",
+    start_timestamp: str = "2023-01-02T09:42:36.320Z",
+    duration: float = 10.0,
+) -> dict[str, Any]:
+    return {
+        "span_id": span_id,
+        "trace_id": trace_id,
+        "op": op,
+        "project": project,
+        "start_timestamp": start_timestamp,
+        "duration": duration,
+    }
+
+
+def _hydrated_trace(backend: SentryBackend, trace_id: str, span_id: str) -> TraceData:
+    """Build a real TraceData the way get_trace() would, for use as a
+    controlled AsyncMock return/side_effect value in the search_traces
+    tests below - avoids re-mocking the HTTP layer just to get a
+    plausible hydration result."""
+    span = backend._parse_sentry_trace_item(_trace_item(span_id, trace_id), trace_id)
+    assert span is not None
+    return backend._group_into_trace(trace_id, [span])
+
+
+class TestSearchSpans:
+    """search_spans: unlike search_traces, no hydration step - each row from
+    the span search is parsed and returned directly (optionally filtered
+    client-side for operators Sentry's search syntax doesn't support)."""
+
+    async def test_parses_rows_into_spans(self) -> None:
+        backend = _backend()
+        backend._search_events_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _search_row("s1", "t1", op="db.query"),
+                _search_row("s2", "t1", op="http.client"),
+            ]
+        )
+
+        spans = await backend.search_spans(SpanQuery(limit=10))
+
+        assert {s.span_id for s in spans} == {"s1", "s2"}
+        assert {s.operation_name for s in spans} == {"db.query", "http.client"}
+
+    async def test_unparseable_rows_are_skipped_not_raised(self) -> None:
+        backend = _backend()
+        backend._search_events_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _search_row("s1", "t1"),
+                {"id": "s2", "trace": "t1"},  # missing op/project/timestamp/duration
+            ]
+        )
+
+        spans = await backend.search_spans(SpanQuery(limit=10))
+
+        assert len(spans) == 1
+        assert spans[0].span_id == "s1"
+
+    async def test_client_side_filters_are_applied_after_native_search(self) -> None:
+        """CONTAINS has no native Sentry mapping (get_supported_operators
+        doesn't include it) - it must still be applied client-side rather
+        than silently ignored."""
+        backend = _backend()
+        backend._search_events_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _search_row("s1", "t1", op="db.query.select"),
+                _search_row("s2", "t1", op="http.client"),
+            ]
+        )
+
+        spans = await backend.search_spans(
+            SpanQuery(
+                limit=10,
+                filters=[
+                    Filter(
+                        field="operation_name",
+                        operator=FilterOperator.CONTAINS,
+                        value="db.query",
+                        value_type=FilterType.STRING,
+                    )
+                ],
+            )
+        )
+
+        assert len(spans) == 1
+        assert spans[0].operation_name == "db.query.select"
+
+    async def test_result_is_truncated_to_query_limit(self) -> None:
+        backend = _backend()
+        backend._search_events_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[_search_row(f"s{i}", "t1") for i in range(5)]
+        )
+
+        spans = await backend.search_spans(SpanQuery(limit=2))
+
+        assert len(spans) == 2
+
+
+class TestSearchTraces:
+    """search_traces's real search-then-hydrate flow: discover distinct
+    trace_ids from a span search, hydrate each via get_trace, overlay the
+    richer search-row attributes/status back onto the hydrated result."""
+
+    async def test_discovers_and_hydrates_multiple_distinct_traces(self) -> None:
+        backend = _backend()
+        backend._search_events_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _search_row("s1", "t1"),
+                _search_row("s2", "t2"),
+            ]
+        )
+        backend.get_trace = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda trace_id: _hydrated_trace(backend, trace_id, "root-" + trace_id)
+        )
+
+        traces = await backend.search_traces(TraceQuery(limit=10))
+
+        assert {t.trace_id for t in traces} == {"t1", "t2"}
+        assert backend.get_trace.await_count == 2
+
+    async def test_groups_multiple_rows_under_the_same_trace_id_into_one_hydration_call(
+        self,
+    ) -> None:
+        """Two search rows sharing a trace_id must hydrate that trace exactly
+        once, not once per row."""
+        backend = _backend()
+        backend._search_events_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _search_row("s1", "t1"),
+                _search_row("s2", "t1"),
+            ]
+        )
+        backend.get_trace = AsyncMock(  # type: ignore[method-assign]
+            return_value=_hydrated_trace(backend, "t1", "s1")
+        )
+
+        traces = await backend.search_traces(TraceQuery(limit=10))
+
+        assert len(traces) == 1
+        backend.get_trace.assert_awaited_once_with("t1")
+
+    async def test_rows_with_no_trace_id_are_skipped(self) -> None:
+        backend = _backend()
+        row_no_trace = _search_row("s1", "t1")
+        del row_no_trace["trace"]
+        backend._search_events_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[row_no_trace]
+        )
+        backend.get_trace = AsyncMock()  # type: ignore[method-assign]
+
+        traces = await backend.search_traces(TraceQuery(limit=10))
+
+        assert traces == []
+        backend.get_trace.assert_not_awaited()
+
+    async def test_truncates_hydration_to_max_traces_to_hydrate(self) -> None:
+        """More distinct trace_ids than _MAX_TRACES_TO_HYDRATE are discovered
+        - only the cap's worth are actually hydrated, and a warning is logged
+        rather than silently hydrating everything or crashing."""
+        backend = _backend()
+        rows = [_search_row(f"s{i}", f"t{i}") for i in range(_MAX_TRACES_TO_HYDRATE + 5)]
+        backend._search_events_raw = AsyncMock(return_value=rows)  # type: ignore[method-assign]
+        backend.get_trace = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda trace_id: _hydrated_trace(backend, trace_id, "s")
+        )
+
+        traces = await backend.search_traces(TraceQuery(limit=1000))
+
+        assert backend.get_trace.await_count == _MAX_TRACES_TO_HYDRATE
+        assert len(traces) == _MAX_TRACES_TO_HYDRATE
+
+    async def test_a_failed_hydration_is_logged_and_skipped_not_propagated(self) -> None:
+        """One trace's get_trace() call raising must not abort the whole
+        search - the other, successfully-hydrated traces are still returned."""
+        backend = _backend()
+        backend._search_events_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _search_row("s1", "t1"),
+                _search_row("s2", "t2"),
+            ]
+        )
+
+        async def _get_trace(trace_id: str) -> TraceData:
+            if trace_id == "t1":
+                raise ValueError("No spans found for trace t1")
+            return _hydrated_trace(backend, trace_id, "s2")
+
+        backend.get_trace = AsyncMock(side_effect=_get_trace)  # type: ignore[method-assign]
+
+        traces = await backend.search_traces(TraceQuery(limit=10))
+
+        assert len(traces) == 1
+        assert traces[0].trace_id == "t2"
+
+    async def test_result_is_truncated_to_query_limit(self) -> None:
+        backend = _backend()
+        backend._search_events_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[_search_row(f"s{i}", f"t{i}") for i in range(5)]
+        )
+        backend.get_trace = AsyncMock(  # type: ignore[method-assign]
+            side_effect=lambda trace_id: _hydrated_trace(backend, trace_id, "s")
+        )
+
+        traces = await backend.search_traces(TraceQuery(limit=2))
+
+        assert len(traces) == 2
+
+
+class TestEnrichTraceWithSearchRows:
+    """_enrich_trace_with_search_rows overlays richer per-span
+    attributes/status from the original span search onto a get_trace()
+    -hydrated trace, matched by span_id only."""
+
+    def test_overlays_attributes_and_status_for_matching_span_id(self) -> None:
+        backend = _backend()
+        hydrated_span = backend._parse_sentry_trace_item(_trace_item("s1", "t1"), "t1")
+        assert hydrated_span is not None
+        # get_trace()'s own endpoint has no gen_ai attributes and no
+        # reliable status - simulate that sparse baseline explicitly.
+        hydrated_span = hydrated_span.model_copy(update={"status": "UNSET"})
+        trace = backend._group_into_trace("t1", [hydrated_span])
+
+        search_row = _search_row("s1", "t1", status="ok")
+        search_row["gen_ai.system"] = "openai"
+
+        enriched = backend._enrich_trace_with_search_rows(trace, [search_row])
+
+        assert enriched.spans[0].status == "OK"
+        assert enriched.spans[0].attributes.get("gen_ai.system") == "openai"
+
+    def test_spans_with_no_matching_search_row_pass_through_unchanged(self) -> None:
+        backend = _backend()
+        hydrated_span = backend._parse_sentry_trace_item(_trace_item("s1", "t1"), "t1")
+        assert hydrated_span is not None
+        trace = backend._group_into_trace("t1", [hydrated_span])
+
+        # Search row is for a completely different span_id.
+        enriched = backend._enrich_trace_with_search_rows(
+            trace, [_search_row("some-other-span", "t1")]
+        )
+
+        assert enriched.spans[0].status == hydrated_span.status
+        assert enriched.spans[0] == hydrated_span
+
+    def test_returns_original_trace_unchanged_when_no_rows_parse(self) -> None:
+        """Every row fails to parse (e.g. missing required fields) -
+        _enrich_trace_with_search_rows must return the original trace as-is,
+        not an empty/broken one."""
+        backend = _backend()
+        hydrated_span = backend._parse_sentry_trace_item(_trace_item("s1", "t1"), "t1")
+        assert hydrated_span is not None
+        trace = backend._group_into_trace("t1", [hydrated_span])
+
+        unparseable_row = {"id": "s1", "trace": "t1"}  # missing op/project/timestamp/duration
+
+        enriched = backend._enrich_trace_with_search_rows(trace, [unparseable_row])
+
+        assert enriched is trace
+
+    def test_multiple_spans_only_matching_ones_are_overlaid(self) -> None:
+        backend = _backend()
+        span1 = backend._parse_sentry_trace_item(_trace_item("s1", "t1"), "t1")
+        span2 = backend._parse_sentry_trace_item(_trace_item("s2", "t1"), "t1")
+        assert span1 is not None and span2 is not None
+        span1 = span1.model_copy(update={"status": "UNSET"})
+        span2 = span2.model_copy(update={"status": "UNSET"})
+        trace = backend._group_into_trace("t1", [span1, span2])
+
+        enriched = backend._enrich_trace_with_search_rows(
+            trace, [_search_row("s1", "t1", status="ok")]
+        )
+
+        by_id = {s.span_id: s for s in enriched.spans}
+        assert by_id["s1"].status == "OK"
+        assert by_id["s2"].status == "UNSET"
+
+
+class TestGetOperationsViaAttributeValues:
+    """_get_operations_via_attribute_values: the primary (feature-gated)
+    path for get_service_operations, before falling back to sampling."""
+
+    async def test_accepts_bare_string_list(self) -> None:
+        backend = _backend()
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: ["db.query", "http.client"]
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        result = await backend._get_operations_via_attribute_values("svc")
+
+        assert result == ["db.query", "http.client"]
+
+    async def test_accepts_list_of_dicts_with_value_key(self) -> None:
+        backend = _backend()
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: [{"value": "db.query"}, {"value": "http.client"}]
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        result = await backend._get_operations_via_attribute_values("svc")
+
+        assert result == ["db.query", "http.client"]
+
+    async def test_returns_none_when_response_is_not_a_list(self) -> None:
+        backend = _backend()
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: {"not": "a list"}
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        result = await backend._get_operations_via_attribute_values("svc")
+
+        assert result is None
+
+    async def test_returns_none_when_no_values_extracted(self) -> None:
+        """A 200 response that's a list, but contains nothing this backend
+        can interpret as a value (e.g. bare numbers) - must degrade to the
+        sampling fallback rather than returning an empty list as if that
+        were a confirmed answer."""
+        backend = _backend()
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: [1, 2, 3]
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        result = await backend._get_operations_via_attribute_values("svc")
+
+        assert result is None
+
+    async def test_returns_none_on_request_exception_and_falls_back(self) -> None:
+        backend = _backend()
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "not found",
+                request=httpx.Request("GET", "https://sentry.io"),
+                response=httpx.Response(404),
+            )
+        )
+
+        result = await backend._get_operations_via_attribute_values("svc")
+
+        assert result is None
+
+    async def test_get_service_operations_falls_back_to_sampling_on_none(self) -> None:
+        backend = _backend()
+        backend._get_operations_via_attribute_values = AsyncMock(  # type: ignore[method-assign]
+            return_value=None
+        )
+        backend._get_operations_via_sampling = AsyncMock(  # type: ignore[method-assign]
+            return_value=["sampled.op"]
+        )
+
+        result = await backend.get_service_operations("svc")
+
+        assert result == ["sampled.op"]
+        backend._get_operations_via_sampling.assert_awaited_once_with("svc")
+
+    async def test_get_service_operations_skips_fallback_when_primary_succeeds(self) -> None:
+        backend = _backend()
+        backend._get_operations_via_attribute_values = AsyncMock(  # type: ignore[method-assign]
+            return_value=["primary.op"]
+        )
+        backend._get_operations_via_sampling = AsyncMock()  # type: ignore[method-assign]
+
+        result = await backend.get_service_operations("svc")
+
+        assert result == ["primary.op"]
+        backend._get_operations_via_sampling.assert_not_awaited()
+
+
+class TestListServicesShapeValidation:
+    async def test_returns_empty_list_when_response_is_not_a_list(self) -> None:
+        backend = _backend()
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: {"not": "a list"}
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        result = await backend.list_services()
+
+        assert result == []
+
+    async def test_skips_entries_without_a_valid_slug(self) -> None:
+        backend = _backend()
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: [
+            {"slug": "real-project"},
+            {"slug": ""},
+            {"slug": 123},
+            "not-a-dict",
+            {},
+        ]
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        result = await backend.list_services()
+
+        assert result == ["real-project"]

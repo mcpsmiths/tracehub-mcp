@@ -19,8 +19,19 @@ import httpx
 import pytest
 
 from opentelemetry_mcp.backends.base import MetadataEndpointBlockedError, _RetryingTransport
-from opentelemetry_mcp.backends.datadog import _MAX_SEARCH_PAGES, DatadogBackend
-from opentelemetry_mcp.models import Filter, FilterOperator, FilterType
+from opentelemetry_mcp.backends.datadog import (
+    _MAX_SEARCH_PAGES,
+    _MAX_TRACES_TO_HYDRATE,
+    DatadogBackend,
+)
+from opentelemetry_mcp.models import (
+    Filter,
+    FilterOperator,
+    FilterType,
+    SpanQuery,
+    TraceData,
+    TraceQuery,
+)
 
 FAKE_API_KEY = "dd-api1"
 FAKE_APP_KEY = "dd-app1"
@@ -905,3 +916,296 @@ class TestSearchSpansRawMalformedEnvelope:
         result = await backend._search_spans_raw("*", now, now, limit=10)
 
         assert result == [{"attributes": {"span_id": "s1"}}]
+
+
+def _fake_trace(trace_id: str, status: str = "OK") -> TraceData:
+    now = datetime(2023, 1, 2, tzinfo=UTC)
+    return TraceData(
+        trace_id=trace_id,
+        spans=[],
+        start_time=now,
+        duration_ms=10.0,
+        service_name="svc",
+        root_operation="op",
+        status=status,  # type: ignore[arg-type]
+    )
+
+
+class TestSearchTraces:
+    """Test the search_traces() orchestration: discover trace_ids from a
+    span search, hydrate each via get_trace, and re-verify filters against
+    the fully-hydrated trace - the top-level method itself was previously
+    untested even though its two building blocks (_search_spans_raw,
+    get_trace) each have their own dedicated coverage above."""
+
+    async def test_discovers_and_hydrates_each_distinct_trace_id(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {"attributes": {"trace_id": "t1"}},
+                {"attributes": {"trace_id": "t2"}},
+            ]
+        )
+        backend.get_trace = AsyncMock(side_effect=lambda tid: _fake_trace(tid))  # type: ignore[method-assign]
+
+        result = await backend.search_traces(TraceQuery(limit=100))
+
+        assert {t.trace_id for t in result} == {"t1", "t2"}
+        assert backend.get_trace.await_count == 2
+
+    async def test_dedupes_trace_ids_preserving_discovery_order(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {"attributes": {"trace_id": "t1"}},
+                {"attributes": {"trace_id": "t2"}},
+                {"attributes": {"trace_id": "t1"}},  # duplicate, same trace
+            ]
+        )
+        backend.get_trace = AsyncMock(side_effect=lambda tid: _fake_trace(tid))  # type: ignore[method-assign]
+
+        await backend.search_traces(TraceQuery(limit=100))
+
+        hydrated_ids = [call.args[0] for call in backend.get_trace.await_args_list]
+        assert hydrated_ids == ["t1", "t2"]
+
+    async def test_caps_hydration_at_max_traces_to_hydrate_and_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend = _backend()
+        discovered = _MAX_TRACES_TO_HYDRATE + 5
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[{"attributes": {"trace_id": f"t{i}"}} for i in range(discovered)]
+        )
+        backend.get_trace = AsyncMock(side_effect=lambda tid: _fake_trace(tid))  # type: ignore[method-assign]
+
+        with caplog.at_level("WARNING"):
+            result = await backend.search_traces(TraceQuery(limit=1000))
+
+        assert backend.get_trace.await_count == _MAX_TRACES_TO_HYDRATE
+        assert len(result) == _MAX_TRACES_TO_HYDRATE
+        assert any("Limiting trace fetch" in r.message for r in caplog.records)
+
+    async def test_a_failed_hydration_is_skipped_not_propagated(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {"attributes": {"trace_id": "good"}},
+                {"attributes": {"trace_id": "bad"}},
+            ]
+        )
+
+        async def _get_trace(trace_id: str) -> TraceData:
+            if trace_id == "bad":
+                raise ValueError("no spans found for trace bad")
+            return _fake_trace(trace_id)
+
+        backend.get_trace = AsyncMock(side_effect=_get_trace)  # type: ignore[method-assign]
+
+        with caplog.at_level("WARNING"):
+            result = await backend.search_traces(TraceQuery(limit=100))
+
+        assert [t.trace_id for t in result] == ["good"]
+        assert any("Failed to fetch trace bad" in r.message for r in caplog.records)
+
+    async def test_client_side_filter_excludes_a_hydrated_trace_that_does_not_match(
+        self,
+    ) -> None:
+        """Datadog's native operators don't include CONTAINS - a filter
+        using it must still be re-verified against the fully-hydrated
+        trace (FilterEngine.apply_filters), not just passed through
+        because the initial span search couldn't apply it either."""
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {"attributes": {"trace_id": "matches"}},
+                {"attributes": {"trace_id": "does-not-match"}},
+            ]
+        )
+
+        async def _get_trace(trace_id: str) -> TraceData:
+            return _fake_trace(trace_id, status="ERROR" if trace_id == "matches" else "OK")
+
+        backend.get_trace = AsyncMock(side_effect=_get_trace)  # type: ignore[method-assign]
+
+        result = await backend.search_traces(
+            TraceQuery(
+                limit=100,
+                filters=[
+                    Filter(
+                        field="status",
+                        operator=FilterOperator.CONTAINS,
+                        value="ERR",
+                        value_type=FilterType.STRING,
+                    )
+                ],
+            )
+        )
+
+        assert [t.trace_id for t in result] == ["matches"]
+
+    async def test_truncates_to_query_limit_after_hydration(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[{"attributes": {"trace_id": f"t{i}"}} for i in range(5)]
+        )
+        backend.get_trace = AsyncMock(side_effect=lambda tid: _fake_trace(tid))  # type: ignore[method-assign]
+
+        result = await backend.search_traces(TraceQuery(limit=2))
+
+        assert len(result) == 2
+
+
+class TestSearchSpans:
+    """Test the search_spans() orchestration: parse raw spans returned by
+    _search_spans_raw, re-apply client-side filters, and truncate to the
+    query limit - previously untested at the top-level-method scope even
+    though _parse_dd_span and _search_spans_raw each have their own
+    dedicated coverage above."""
+
+    def _raw_span(self, span_id: str, service: str = "svc") -> dict[str, Any]:
+        now = "2023-01-02T09:42:36.320Z"
+        later = "2023-01-02T09:42:36.420Z"
+        return {
+            "attributes": {
+                "trace_id": "t1",
+                "span_id": span_id,
+                "service": service,
+                "resource_name": "op",
+                "start_timestamp": now,
+                "end_timestamp": later,
+            }
+        }
+
+    async def test_parses_every_valid_span_returned_by_search(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._raw_span("s1"), self._raw_span("s2")]
+        )
+
+        result = await backend.search_spans(SpanQuery(limit=100))
+
+        assert {s.span_id for s in result} == {"s1", "s2"}
+
+    async def test_skips_spans_that_fail_to_parse(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                self._raw_span("s1"),
+                {"attributes": {"span_id": "s2"}},  # missing trace_id -> unparseable
+            ]
+        )
+
+        result = await backend.search_spans(SpanQuery(limit=100))
+
+        assert [s.span_id for s in result] == ["s1"]
+
+    async def test_client_side_filter_excludes_non_matching_spans(self) -> None:
+        """CONTAINS is not one of Datadog's natively supported operators
+        (get_supported_operators) - a filter using it must be re-applied
+        client-side against the parsed spans."""
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._raw_span("s1", service="foo"), self._raw_span("s2", service="bar")]
+        )
+
+        result = await backend.search_spans(
+            SpanQuery(
+                limit=100,
+                filters=[
+                    Filter(
+                        field="service.name",
+                        operator=FilterOperator.CONTAINS,
+                        value="fo",
+                        value_type=FilterType.STRING,
+                    )
+                ],
+            )
+        )
+
+        assert [s.span_id for s in result] == ["s1"]
+
+    async def test_truncates_to_query_limit(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[self._raw_span(f"s{i}") for i in range(5)]
+        )
+
+        result = await backend.search_spans(SpanQuery(limit=2))
+
+        assert len(result) == 2
+
+
+class TestListServices:
+    """Test list_services()'s sampling-based service extraction - the
+    existing escaping test for get_service_operations always returned an
+    empty span list, so this backend's actual dedup/sort logic over real
+    span data was never exercised."""
+
+    async def test_extracts_unique_sorted_services_from_sampled_spans(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {"attributes": {"service": "b-service"}},
+                {"attributes": {"service": "a-service"}},
+                {"attributes": {"service": "b-service"}},  # duplicate
+            ]
+        )
+
+        result = await backend.list_services()
+
+        assert result == ["a-service", "b-service"]
+
+    async def test_spans_missing_service_attribute_are_ignored(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[{"attributes": {}}, {"attributes": {"service": "real"}}]
+        )
+
+        result = await backend.list_services()
+
+        assert result == ["real"]
+
+
+class TestGetServiceOperationsExtraction:
+    """Complements TestGetServiceOperationsEscaping (which only verifies
+    the query string) by exercising the actual operation-extraction logic
+    over real span data."""
+
+    async def test_extracts_unique_sorted_operations(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {"attributes": {"resource_name": "GET /b"}},
+                {"attributes": {"resource_name": "GET /a"}},
+                {"attributes": {"resource_name": "GET /b"}},
+            ]
+        )
+
+        result = await backend.get_service_operations("svc")
+
+        assert result == ["GET /a", "GET /b"]
+
+
+class TestHealthCheck:
+    async def test_healthy_when_search_succeeds(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        result = await backend.health_check()
+
+        assert result.status == "healthy"
+        assert result.backend == "datadog"
+        assert result.error is None
+
+    async def test_unhealthy_wraps_the_exception(self) -> None:
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(side_effect=RuntimeError("boom"))  # type: ignore[method-assign]
+
+        result = await backend.health_check()
+
+        assert result.status == "unhealthy"
+        assert result.backend == "datadog"
+        assert result.error == "boom"
