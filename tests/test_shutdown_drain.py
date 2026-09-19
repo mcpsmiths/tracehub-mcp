@@ -27,8 +27,10 @@ from opentelemetry_mcp import server
 @pytest.fixture(autouse=True)
 def _reset_backend_global() -> Generator[None]:
     server._backend = None
+    server._secondary_backend = None
     yield
     server._backend = None
+    server._secondary_backend = None
 
 
 def _build_app_with_drain(
@@ -58,6 +60,70 @@ def test_shutdown_is_a_noop_when_no_backend_was_ever_created() -> None:
     app = _build_app_with_drain(drain_seconds=0.0)
     with TestClient(app):
         pass  # must not raise even though there is nothing to close
+
+
+def test_shutdown_closes_both_primary_and_secondary_backend() -> None:
+    fake_primary = AsyncMock()
+    fake_secondary = AsyncMock()
+    server._backend = fake_primary
+    server._secondary_backend = fake_secondary
+
+    app = _build_app_with_drain(drain_seconds=0.0)
+    with TestClient(app):
+        fake_primary.close.assert_not_called()
+        fake_secondary.close.assert_not_called()
+
+    fake_primary.close.assert_awaited_once()
+    fake_secondary.close.assert_awaited_once()
+    assert server._backend is None
+    assert server._secondary_backend is None
+
+
+async def test_shutdown_closes_secondary_even_when_primary_close_hangs() -> None:
+    """A hanging primary close() must not starve the secondary's own close
+    attempt - each is independently bounded by close_timeout_seconds."""
+    import asyncio
+
+    async def _hang() -> None:
+        await asyncio.sleep(10)
+
+    fake_primary = AsyncMock()
+    fake_primary.close = AsyncMock(side_effect=_hang)
+    fake_secondary = AsyncMock()
+    server._backend = fake_primary
+    server._secondary_backend = fake_secondary
+
+    await server._drain_and_close_backend(0.0, close_timeout_seconds=0.05)
+
+    fake_secondary.close.assert_awaited_once()
+    assert server._backend is None
+    assert server._secondary_backend is None
+
+
+async def test_both_backends_close_concurrently_not_sequentially() -> None:
+    """Regression: closing backends one after another would make total
+    shutdown latency close_timeout_seconds * N instead of a single
+    close_timeout_seconds - both must be in flight at the same time."""
+    import asyncio
+
+    async def _hang() -> None:
+        await asyncio.sleep(10)
+
+    fake_primary = AsyncMock()
+    fake_primary.close = AsyncMock(side_effect=_hang)
+    fake_secondary = AsyncMock()
+    fake_secondary.close = AsyncMock(side_effect=_hang)
+    server._backend = fake_primary
+    server._secondary_backend = fake_secondary
+
+    start = time.monotonic()
+    await server._drain_and_close_backend(0.0, close_timeout_seconds=0.1)
+    elapsed = time.monotonic() - start
+
+    # Sequential closes of two hanging backends would take ~0.2s (2x the
+    # per-backend timeout); concurrent closes take ~0.1s regardless of how
+    # many backends are hanging.
+    assert elapsed < 0.15
 
 
 def test_shutdown_sleeps_for_the_configured_drain_seconds_before_closing() -> None:

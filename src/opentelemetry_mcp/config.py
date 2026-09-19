@@ -77,36 +77,70 @@ class BackendConfig(BaseModel):
 
     @classmethod
     def from_env(cls) -> "BackendConfig":
-        """Load configuration from environment variables."""
-        backend_type = os.getenv("BACKEND_TYPE", "jaeger")
-        backend_url = os.getenv("BACKEND_URL", "http://localhost:16686")
+        """Load the primary backend's configuration from BACKEND_* env vars."""
+        return cls._from_env_with_prefix(
+            prefix="BACKEND_",
+            type_default="jaeger",
+            url_default="http://localhost:16686",
+        )
+
+    @classmethod
+    def from_env_optional(cls, prefix: str = "SECONDARY_BACKEND_") -> "BackendConfig | None":
+        """Load an optional secondary backend's configuration from
+        `{prefix}*` env vars (SECONDARY_BACKEND_* by default), for
+        cross-backend correlation (tools/correlate.py). Returns None if
+        `{prefix}TYPE` is unset OR blank, so an unconfigured secondary
+        backend is a valid, opt-in-by-default state - unlike the always-
+        required primary backend, this must not silently fall back to
+        jaeger/localhost. Blank (not just absent) is treated the same as
+        unset because .env.example ships `SECONDARY_BACKEND_TYPE=` with no
+        value, matching every other optional field's convention in that
+        file - `dotenv.load_dotenv()` sets that to an empty string, not
+        leaving the key absent, so `os.getenv(...) is None` alone would
+        incorrectly treat "the user left the example's blank default in
+        place" as "the user opted in with an empty type."
+        """
+        if not (os.getenv(f"{prefix}TYPE") or "").strip():
+            return None
+        return cls._from_env_with_prefix(prefix=prefix, type_default=None, url_default=None)
+
+    @classmethod
+    def _from_env_with_prefix(
+        cls, *, prefix: str, type_default: str | None, url_default: str | None
+    ) -> "BackendConfig":
+        """Shared env-var parsing behind from_env()/from_env_optional() -
+        every BackendConfig field, read from `{prefix}<FIELD>`."""
+        backend_type = os.getenv(f"{prefix}TYPE", type_default)
+        backend_url = os.getenv(f"{prefix}URL", url_default)
         if backend_type not in ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"]:
             raise ValueError(
-                f"Invalid BACKEND_TYPE: {backend_type}. "
+                f"Invalid {prefix}TYPE: {backend_type}. "
                 "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray"
             )
+        if not backend_url:
+            raise ValueError(f"{prefix}URL is required when {prefix}TYPE is set")
 
         # Parse environments from comma-separated string
-        environments_str = os.getenv("BACKEND_ENVIRONMENTS", "prd")
+        environments_str = os.getenv(f"{prefix}ENVIRONMENTS", "prd")
         environments = [env.strip() for env in environments_str.split(",") if env.strip()]
 
         # Parse timeout with validation
-        timeout_str = os.getenv("BACKEND_TIMEOUT", "30")
+        timeout_str = os.getenv(f"{prefix}TIMEOUT", "30")
         try:
             timeout = float(timeout_str)
         except (ValueError, TypeError) as e:
-            logger.warning(f"Invalid BACKEND_TIMEOUT value '{timeout_str}': {e}. Using default: 30")
+            logger.warning(f"Invalid {prefix}TIMEOUT value '{timeout_str}': {e}. Using default: 30")
             timeout = 30.0
 
         return cls(
             type=backend_type,  # type: ignore
             url=backend_url,  # type: ignore
-            api_key=os.getenv("BACKEND_API_KEY"),
-            app_key=os.getenv("BACKEND_APP_KEY"),
-            sentry_org=os.getenv("BACKEND_SENTRY_ORG"),
-            sentry_project=os.getenv("BACKEND_SENTRY_PROJECT"),
-            tempo_instance_id=os.getenv("BACKEND_TEMPO_INSTANCE_ID"),
-            aws_region=os.getenv("BACKEND_AWS_REGION"),
+            api_key=os.getenv(f"{prefix}API_KEY"),
+            app_key=os.getenv(f"{prefix}APP_KEY"),
+            sentry_org=os.getenv(f"{prefix}SENTRY_ORG"),
+            sentry_project=os.getenv(f"{prefix}SENTRY_PROJECT"),
+            tempo_instance_id=os.getenv(f"{prefix}TEMPO_INSTANCE_ID"),
+            aws_region=os.getenv(f"{prefix}AWS_REGION"),
             timeout=timeout,
             environments=environments,
         )
@@ -116,6 +150,12 @@ class ServerConfig(BaseModel):
     """MCP Server configuration."""
 
     backend: BackendConfig
+    # Opt-in only, for tools/correlate.py's correlate_trace - unlike
+    # `backend`, there is deliberately no CLI override surface for this in
+    # v1 (SECONDARY_BACKEND_* env vars only); see the Roadmap/README note
+    # on cross-backend correlation for why this stays a smaller surface
+    # than the primary backend's.
+    secondary_backend: BackendConfig | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     max_traces_per_query: int = Field(default=500, ge=1, le=1000)
     slow_request_threshold_ms: float | None = Field(default=None, gt=0)
@@ -166,6 +206,7 @@ class ServerConfig(BaseModel):
 
         return cls(
             backend=BackendConfig.from_env(),
+            secondary_backend=BackendConfig.from_env_optional(),
             log_level=log_level,
             max_traces_per_query=max_traces_per_query,
             slow_request_threshold_ms=slow_request_threshold_ms,

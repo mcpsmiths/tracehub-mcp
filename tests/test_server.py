@@ -24,6 +24,7 @@ from pydantic import HttpUrl
 
 from opentelemetry_mcp import server
 from opentelemetry_mcp.attributes import HealthCheckResponse
+from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.datadog import DatadogBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
 from opentelemetry_mcp.backends.sentry import SentryBackend
@@ -31,7 +32,13 @@ from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.backends.xray import XRayBackend
 from opentelemetry_mcp.config import BackendConfig, ServerConfig
-from opentelemetry_mcp.models import SearchTracesResult, TraceDetail, TriageResult, TriageVerdict
+from opentelemetry_mcp.models import (
+    CorrelationResult,
+    SearchTracesResult,
+    TraceDetail,
+    TriageResult,
+    TriageVerdict,
+)
 
 FAKE_API_KEY = "dd-key1"
 FAKE_APP_KEY = "dd-app1"
@@ -52,20 +59,25 @@ def _config(**overrides: object) -> ServerConfig:
 
 @pytest.fixture(autouse=True)
 def reset_server_globals() -> Generator[None]:
-    """The module-level _backend/_config globals are shared mutable state -
-    reset them before and after every test so tests can't leak into each
-    other via caching in _get_backend. TestToolWrappers also reassigns the
-    _get_backend function itself (not just the globals it caches) via raw
-    attribute assignment rather than unittest.mock.patch, so it must be
-    restored here too or a mocked _get_backend silently leaks into every
-    test that runs afterward in the same session."""
+    """The module-level _backend/_secondary_backend/_config globals are
+    shared mutable state - reset them before and after every test so tests
+    can't leak into each other via caching in _get_backend/
+    _get_secondary_backend. TestToolWrappers also reassigns _get_backend/
+    _get_secondary_backend themselves (not just the globals they cache) via
+    raw attribute assignment rather than unittest.mock.patch, so both must
+    be restored here too or a mocked version silently leaks into every test
+    that runs afterward in the same session."""
     real_get_backend = server._get_backend
+    real_get_secondary_backend = server._get_secondary_backend
     server._backend = None
+    server._secondary_backend = None
     server._config = None
     yield
     server._backend = None
+    server._secondary_backend = None
     server._config = None
     server._get_backend = real_get_backend
+    server._get_secondary_backend = real_get_secondary_backend
 
 
 class TestCreateBackend:
@@ -254,6 +266,63 @@ class TestGetBackend:
         assert server._backend is fake_backend
 
 
+class TestGetSecondaryBackend:
+    """_get_secondary_backend mirrors _get_backend's own lazy-init/caching
+    pattern, plus a config.secondary_backend is None -> ValueError branch
+    _get_backend has no equivalent of (the primary backend is always
+    required, so it has nothing analogous to check)."""
+
+    async def test_raises_when_config_not_set(self) -> None:
+        server._config = None
+        server._secondary_backend = None
+
+        with pytest.raises(RuntimeError, match="Server configuration not set"):
+            await server._get_secondary_backend()
+
+    async def test_raises_when_no_secondary_backend_configured(self) -> None:
+        server._config = _config()
+        assert server._config.secondary_backend is None
+
+        with pytest.raises(ValueError, match="No secondary backend configured"):
+            await server._get_secondary_backend()
+
+    async def test_lazily_creates_and_caches_secondary_backend(self) -> None:
+        server._config = _config()
+        server._config.secondary_backend = BackendConfig(
+            type="sentry", url=HttpUrl("https://sentry.io"), sentry_org=FAKE_SENTRY_ORG
+        )
+        fake_backend = AsyncMock(spec=BaseBackend)
+        fake_backend.health_check = AsyncMock(
+            return_value=HealthCheckResponse(
+                status="healthy", backend="sentry", url="https://sentry.io"
+            )
+        )
+
+        with patch.object(
+            server, "_build_backend_from_config", return_value=fake_backend
+        ) as mock_build:
+            first = await server._get_secondary_backend()
+            second = await server._get_secondary_backend()
+
+        assert first is fake_backend
+        assert second is fake_backend
+        mock_build.assert_called_once_with(server._config.secondary_backend)
+        fake_backend.health_check.assert_awaited_once()
+
+    async def test_health_check_exception_is_swallowed(self) -> None:
+        server._config = _config()
+        server._config.secondary_backend = BackendConfig(
+            type="sentry", url=HttpUrl("https://sentry.io"), sentry_org=FAKE_SENTRY_ORG
+        )
+        fake_backend = AsyncMock(spec=BaseBackend)
+        fake_backend.health_check = AsyncMock(side_effect=RuntimeError("unreachable"))
+
+        with patch.object(server, "_build_backend_from_config", return_value=fake_backend):
+            result = await server._get_secondary_backend()
+
+        assert result is fake_backend
+
+
 class TestToolWrappers:
     """Each @mcp.tool()-decorated function is a thin wrapper: get backend,
     call the matching tools.<module> function with its own parameters, and
@@ -356,6 +425,42 @@ class TestToolWrappers:
             pytest.raises(KeyError, match="nope"),
         ):
             await server.triage_trace(trace_id="missing")
+
+    async def test_correlate_trace_passes_trace_id_to_both_backends(self) -> None:
+        primary = await self._set_backend()
+        secondary = AsyncMock()
+        server._get_secondary_backend = AsyncMock(return_value=secondary)
+        sentinel = CorrelationResult(primary_trace_id="abc123", matches=[], limitations=[])
+        with patch.object(
+            server.correlate, "correlate_trace", AsyncMock(return_value=sentinel)
+        ) as mocked:
+            result = await server.correlate_trace(trace_id="abc123")
+
+        assert result is sentinel
+        args, kwargs = mocked.call_args
+        assert args[0] is primary
+        assert args[1] is secondary
+        assert kwargs["trace_id"] == "abc123"
+
+    async def test_correlate_trace_no_secondary_backend_propagates_as_value_error(self) -> None:
+        await self._set_backend()
+        server._get_secondary_backend = AsyncMock(
+            side_effect=ValueError("No secondary backend configured")
+        )
+
+        with pytest.raises(ValueError, match="No secondary backend configured"):
+            await server.correlate_trace(trace_id="abc123")
+
+    async def test_correlate_trace_exception_propagates(self) -> None:
+        await self._set_backend()
+        server._get_secondary_backend = AsyncMock(return_value=AsyncMock())
+        with (
+            patch.object(
+                server.correlate, "correlate_trace", AsyncMock(side_effect=KeyError("nope"))
+            ),
+            pytest.raises(KeyError, match="nope"),
+        ):
+            await server.correlate_trace(trace_id="missing")
 
     async def test_get_llm_usage_passes_arguments_through(self) -> None:
         await self._set_backend()
@@ -652,7 +757,7 @@ class TestToolAnnotationsComplete:
         async with Client(server.mcp) as client:
             tools = await client.list_tools()
 
-        assert len(tools) == 18
+        assert len(tools) == 19
         for t in tools:
             assert t.annotations is not None, f"{t.name} has no annotations at all"
             assert t.annotations.read_only_hint is True, t.name
@@ -667,10 +772,10 @@ class TestToolAnnotationsComplete:
         async with Client(server.mcp) as client:
             tools = await client.list_tools()
 
-        assert len(tools) == 18
+        assert len(tools) == 19
         titles = [t.title for t in tools]
         assert all(isinstance(title, str) and title for title in titles), titles
-        assert len(set(titles)) == 18, "titles must be distinct per tool"
+        assert len(set(titles)) == 19, "titles must be distinct per tool"
 
 
 class TestClampLimit:

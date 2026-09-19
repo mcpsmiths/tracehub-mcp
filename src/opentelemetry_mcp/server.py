@@ -29,8 +29,9 @@ from opentelemetry_mcp.backends.sentry import SentryBackend
 from opentelemetry_mcp.backends.tempo import TempoBackend
 from opentelemetry_mcp.backends.traceloop import TraceloopBackend
 from opentelemetry_mcp.backends.xray import XRayBackend
-from opentelemetry_mcp.config import ServerConfig
+from opentelemetry_mcp.config import BackendConfig, ServerConfig
 from opentelemetry_mcp.models import (
+    CorrelationResult,
     SearchSpansResult,
     SearchTracesResult,
     TraceDetail,
@@ -44,6 +45,7 @@ from opentelemetry_mcp.observability import (
 )
 from opentelemetry_mcp.tools import (
     compare,
+    correlate,
     errors,
     expensive_traces,
     investigate,
@@ -67,7 +69,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# All 18 tools below only ever query trace/span backends and never mutate
+# All 19 tools below only ever query trace/span backends and never mutate
 # backend state, so the same read-only/destructive/idempotent/open-world
 # annotations apply to every one of them. destructiveHint is meaningful
 # only when readOnlyHint is false per the MCP spec, so it carries no
@@ -99,6 +101,9 @@ def _handle_tool_error(tool_name: str, error: Exception) -> NoReturn:
 
 # Global backend instance
 _backend: BaseBackend | None = None
+# Optional second backend for tools/correlate.py's correlate_trace - only
+# ever constructed if config.secondary_backend is set (SECONDARY_BACKEND_*).
+_secondary_backend: BaseBackend | None = None
 _config: ServerConfig | None = None
 
 # Initialize FastMCP server
@@ -118,19 +123,17 @@ def _clamp_limit(limit: int) -> int:
     return min(limit, _config.max_traces_per_query)
 
 
-def _create_backend(config: ServerConfig) -> BaseBackend:
-    """Create backend instance based on configuration.
-
-    Args:
-        config: Server configuration
-
-    Returns:
-        Backend instance
+def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
+    """Pure backend-type dispatch: BackendConfig -> concrete BaseBackend
+    subclass. Shared by both the primary backend (_create_backend, below)
+    and the optional secondary backend (_get_secondary_backend) - a
+    secondary backend is just another BackendConfig, with no separate
+    construction path of its own. See CLAUDE.md's "Adding New Backends"
+    checklist - a new backend type only needs one elif branch here.
 
     Raises:
         ValueError: If backend type is unsupported
     """
-    backend_config = config.backend
     backend: BaseBackend
 
     if backend_config.type == "jaeger":
@@ -184,6 +187,19 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
     else:
         raise ValueError(f"Unsupported backend type: {backend_config.type}")
 
+    return backend
+
+
+def _create_backend(config: ServerConfig) -> BaseBackend:
+    """Create the primary backend instance based on configuration.
+
+    Args:
+        config: Server configuration
+
+    Returns:
+        Backend instance
+    """
+    backend = _build_backend_from_config(config.backend)
     # Not a constructor parameter (see BaseBackend.__init__'s own comment):
     # several backend subclasses override __init__ with their own named
     # params, so this is applied uniformly here instead.
@@ -225,6 +241,50 @@ async def _get_backend() -> BaseBackend:
             logger.warning("Continuing anyway, requests may fail...")
 
     return _backend
+
+
+async def _get_secondary_backend() -> BaseBackend:
+    """Get or lazily create the optional secondary backend, for
+    tools/correlate.py's correlate_trace. Mirrors _get_backend()'s own
+    lazy-init-in-the-current-event-loop pattern and non-fatal health check.
+
+    Returns:
+        Secondary backend instance
+
+    Raises:
+        RuntimeError: If server configuration is not set
+        ValueError: If no secondary backend is configured
+            (SECONDARY_BACKEND_TYPE/SECONDARY_BACKEND_URL)
+    """
+    global _secondary_backend, _config
+
+    if not _config:
+        raise RuntimeError("Server configuration not set")
+
+    if _config.secondary_backend is None:
+        raise ValueError(
+            "No secondary backend configured - set SECONDARY_BACKEND_TYPE and "
+            "SECONDARY_BACKEND_URL (and any backend-specific fields, e.g. "
+            "SECONDARY_BACKEND_SENTRY_ORG) via environment variables to enable "
+            "correlate_trace"
+        )
+
+    if _secondary_backend is None:
+        logger.info("Creating secondary backend in current event loop")
+        _secondary_backend = _build_backend_from_config(_config.secondary_backend)
+        _secondary_backend.slow_request_threshold_ms = _config.slow_request_threshold_ms
+        _secondary_backend.configure_query_cache(_config.query_cache_ttl_seconds)
+
+        try:
+            health = await _secondary_backend.health_check()
+            logger.info(f"Secondary backend health check: {health}")
+            if health.status != "healthy":
+                logger.warning("Secondary backend is not healthy, but continuing...")
+        except Exception as e:
+            logger.error(f"Secondary backend health check failed: {e}")
+            logger.warning("Continuing anyway, requests may fail...")
+
+    return _secondary_backend
 
 
 async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any]]:
@@ -427,6 +487,38 @@ async def triage_trace(
         return result
     except Exception as e:
         return _handle_tool_error("triage_trace", e)
+
+
+@mcp.tool(title="Correlate Trace", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def correlate_trace(trace_id: str) -> CorrelationResult:
+    """Try to find the corresponding trace in a second, independently-
+    configured backend (e.g. a Datadog trace and its downstream Sentry
+    error, joined) - given a trace_id known to the primary backend.
+
+    Tries a direct trace_id match in the secondary backend first
+    (confidence "high"); if that fails, falls back to a time-window +
+    service-name-overlap heuristic search (confidence "low"). This is a
+    best-effort correlation, not a guaranteed join - see the always-present
+    `limitations` in the result for why. Requires a secondary backend to be
+    configured via SECONDARY_BACKEND_TYPE/SECONDARY_BACKEND_URL (and any
+    backend-specific fields) environment variables; raises a clear error
+    otherwise.
+
+    Args:
+        trace_id: Trace identifier, as known to the primary (already
+            configured) backend.
+
+    Returns:
+        CorrelationResult with every candidate match found and the fixed
+        list of limitations that always apply to cross-backend correlation.
+    """
+    try:
+        backend = await _get_backend()
+        secondary = await _get_secondary_backend()
+        result = await correlate.correlate_trace(backend, secondary, trace_id=trace_id)
+        return result
+    except Exception as e:
+        return _handle_tool_error("correlate_trace", e)
 
 
 @mcp.tool(title="Get LLM Usage", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
@@ -1097,6 +1189,7 @@ _ALL_TOOL_NAMES = frozenset(
         "search_spans_tool",
         "list_llm_tools_tool",
         "triage_trace",
+        "correlate_trace",
     }
 )
 
@@ -1255,39 +1348,52 @@ async def _drain_and_close_backend(drain_seconds: float, close_timeout_seconds: 
     Sleeps `drain_seconds` (uvicorn has already finished draining
     in-flight connections/tasks by this point - this is a final grace
     window, not a substitute for that phase), then closes the shared
-    backend HTTP client if one was ever lazily created. Bounded by
-    `close_timeout_seconds` because uvicorn places no timeout of its own
-    around the lifespan.shutdown wait - an unbounded backend.close() could
-    otherwise hang process exit forever. Threaded as a parameter (default
+    backend HTTP client(s) - primary and, if one was ever lazily created,
+    the optional secondary backend too - if ever lazily created. Each
+    close is independently bounded by `close_timeout_seconds` because
+    uvicorn places no timeout of its own around the lifespan.shutdown
+    wait - an unbounded backend.close() could otherwise hang process exit
+    forever, and a hanging primary must not also starve the secondary's
+    own close attempt. Threaded as a parameter (default
     _BACKEND_CLOSE_TIMEOUT_SECONDS) rather than read directly from the
     module constant so a real signal-timing integration test can force the
     timeout-fallback branch deterministically without monkeypatching module
     internals from outside a subprocess, which is impossible.
     """
-    global _backend
+    global _backend, _secondary_backend
 
     if drain_seconds > 0:
         logger.info(
             f"HTTP transport shutting down - draining for {drain_seconds}s "
-            "before closing the backend client"
+            "before closing the backend client(s)"
         )
         await asyncio.sleep(drain_seconds)
 
-    if _backend is None:
+    backends_to_close = [b for b in (_backend, _secondary_backend) if b is not None]
+    _backend, _secondary_backend = None, None
+
+    if not backends_to_close:
         logger.info("HTTP transport shutdown: no backend was ever created, nothing to close")
         return
 
-    backend_to_close, _backend = _backend, None
-    try:
-        await asyncio.wait_for(backend_to_close.close(), timeout=close_timeout_seconds)
-        logger.info("Backend closed during shutdown drain")
-    except TimeoutError:
-        logger.warning(
-            f"Backend close did not finish within {close_timeout_seconds}s "
-            "during shutdown, abandoning it"
-        )
-    except Exception as e:
-        logger.warning(f"Error closing backend during shutdown: {e}")
+    async def _close_one(backend_to_close: BaseBackend) -> None:
+        try:
+            await asyncio.wait_for(backend_to_close.close(), timeout=close_timeout_seconds)
+            logger.info("Backend closed during shutdown drain")
+        except TimeoutError:
+            logger.warning(
+                f"Backend close did not finish within {close_timeout_seconds}s "
+                "during shutdown, abandoning it"
+            )
+        except Exception as e:
+            logger.warning(f"Error closing backend during shutdown: {e}")
+
+    # Concurrent, not sequential: a hanging primary's close() must not
+    # delay the secondary's own close attempt by the full
+    # close_timeout_seconds on top of its own - each is bounded
+    # independently, so total shutdown latency stays bounded by a single
+    # close_timeout_seconds regardless of how many backends were created.
+    await asyncio.gather(*(_close_one(b) for b in backends_to_close))
 
 
 def _install_shutdown_drain(
@@ -1324,6 +1430,25 @@ def _install_shutdown_drain(
                 await _drain_and_close_backend(drain_seconds, close_timeout_seconds)
 
     app.router.lifespan_context = combined_lifespan
+
+
+def _print_config_backend_dict(backend_config: BackendConfig) -> dict[str, Any]:
+    """Shape shared by --print-config's "backend"/"secondary_backend" keys.
+    Built by hand, not model_dump(): sentry_org/sentry_project/
+    tempo_instance_id are marked exclude=True on BackendConfig even though
+    they are not secrets (only api_key/app_key are)."""
+    return {
+        "type": backend_config.type,
+        "url": str(backend_config.url),
+        "environments": backend_config.environments,
+        "timeout": backend_config.timeout,
+        "sentry_org": backend_config.sentry_org,
+        "sentry_project": backend_config.sentry_project,
+        "tempo_instance_id": backend_config.tempo_instance_id,
+        "aws_region": backend_config.aws_region,
+        "api_key_set": backend_config.api_key is not None,
+        "app_key_set": backend_config.app_key is not None,
+    }
 
 
 def _backend_config_options(f: Any) -> Any:
@@ -1630,18 +1755,12 @@ def main(
             # config model at all - they only ever exist as this
             # invocation's own CLI args.
             resolved = {
-                "backend": {
-                    "type": _config.backend.type,
-                    "url": str(_config.backend.url),
-                    "environments": _config.backend.environments,
-                    "timeout": _config.backend.timeout,
-                    "sentry_org": _config.backend.sentry_org,
-                    "sentry_project": _config.backend.sentry_project,
-                    "tempo_instance_id": _config.backend.tempo_instance_id,
-                    "aws_region": _config.backend.aws_region,
-                    "api_key_set": _config.backend.api_key is not None,
-                    "app_key_set": _config.backend.app_key is not None,
-                },
+                "backend": _print_config_backend_dict(_config.backend),
+                "secondary_backend": (
+                    _print_config_backend_dict(_config.secondary_backend)
+                    if _config.secondary_backend is not None
+                    else None
+                ),
                 "log_level": _config.log_level,
                 "max_traces_per_query": _config.max_traces_per_query,
                 "slow_request_threshold_ms": _config.slow_request_threshold_ms,
@@ -1728,6 +1847,36 @@ def main(
         sys.exit(1)
 
 
+def _print_backend_check_results(details: dict[str, Any], *, prefix: str = "") -> None:
+    """Prints doctor's [OK]/[FAIL] health-check + connectivity-probe lines
+    for one backend's already-collected _run_backend_checks() details.
+    `prefix` (e.g. "Secondary ") distinguishes the secondary backend's own
+    lines from the primary's when both are checked in one doctor run."""
+    health = details["health_check"]
+    if health.get("status") == "healthy":
+        click.secho(f"[OK] {prefix}Health check: {health['status']}", fg="green")
+    elif health.get("status") == "error":
+        click.secho(f"[FAIL] {prefix}Health check raised: {health['error']}", fg="red")
+    else:
+        click.secho(
+            f"[FAIL] {prefix}Health check: {health.get('status')} ({health.get('error')})",
+            fg="red",
+        )
+
+    list_services_info = details["list_services"]
+    if "error" in list_services_info:
+        click.secho(
+            f"[FAIL] {prefix}Connectivity probe (list_services): {list_services_info['error']}",
+            fg="red",
+        )
+    else:
+        click.secho(
+            f"[OK] {prefix}Connectivity probe (list_services): "
+            f"{list_services_info['count']} service(s)",
+            fg="green",
+        )
+
+
 @main.command("doctor")
 @_backend_config_options
 def doctor(
@@ -1744,6 +1893,8 @@ def doctor(
     """Run startup diagnostics against the resolved backend config: config
     load, backend construction, health check, and a live read-only
     connectivity probe (list_services). Exits non-zero if any step fails.
+    Also validates the optional secondary backend (SECONDARY_BACKEND_*,
+    used by correlate_trace) the same way, if one is configured.
 
     Unlike the server's own lazy backend initialization (which deliberately
     swallows a failed health check and keeps running so requests may still
@@ -1788,36 +1939,41 @@ def doctor(
         sys.exit(1)
 
     async def _run_checks() -> int:
+        exit_code = 0
+
         try:
             all_ok, details = await _run_backend_checks(backend_instance)
-
-            health = details["health_check"]
-            if health.get("status") == "healthy":
-                click.secho(f"[OK] Health check: {health['status']}", fg="green")
-            elif health.get("status") == "error":
-                click.secho(f"[FAIL] Health check raised: {health['error']}", fg="red")
-            else:
-                click.secho(
-                    f"[FAIL] Health check: {health.get('status')} ({health.get('error')})",
-                    fg="red",
-                )
-
-            list_services_info = details["list_services"]
-            if "error" in list_services_info:
-                click.secho(
-                    f"[FAIL] Connectivity probe (list_services): {list_services_info['error']}",
-                    fg="red",
-                )
-            else:
-                click.secho(
-                    f"[OK] Connectivity probe (list_services): "
-                    f"{list_services_info['count']} service(s)",
-                    fg="green",
-                )
-
-            return 0 if all_ok else 1
+            _print_backend_check_results(details)
+            if not all_ok:
+                exit_code = 1
         finally:
             await backend_instance.close()
+
+        # Secondary backend is env-var-only (no CLI override surface, see
+        # config.py's ServerConfig.secondary_backend docstring), so there is
+        # nothing to apply_cli_overrides here - it's already fully resolved
+        # by ServerConfig.from_env() above.
+        if config.secondary_backend is not None:
+            try:
+                secondary_instance = _build_backend_from_config(config.secondary_backend)
+                click.secho(
+                    f"[OK] Secondary backend constructed: {config.secondary_backend.type} "
+                    f"@ {config.secondary_backend.url}",
+                    fg="green",
+                )
+            except Exception as e:
+                click.secho(f"[FAIL] Secondary backend construction: {e}", fg="red")
+                return 1
+
+            try:
+                secondary_all_ok, secondary_details = await _run_backend_checks(secondary_instance)
+                _print_backend_check_results(secondary_details, prefix="Secondary ")
+                if not secondary_all_ok:
+                    exit_code = 1
+            finally:
+                await secondary_instance.close()
+
+        return exit_code
 
     sys.exit(asyncio.run(_run_checks()))
 

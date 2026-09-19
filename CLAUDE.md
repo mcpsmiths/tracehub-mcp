@@ -9,7 +9,7 @@ tracehub-mcp is an MCP (Model Context Protocol) server that enables AI agents to
 **Key Features:**
 
 - Multi-backend support: Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry, and AWS X-Ray
-- 18 MCP tools: Core tools + agent-native triage + LLM-oriented discovery and analysis tools + session/prompt-version/time-window aggregation + cost/error spike investigation
+- 19 MCP tools: Core tools + agent-native triage + cross-backend correlation + LLM-oriented discovery and analysis tools + session/prompt-version/time-window aggregation + cost/error spike investigation
 - Cost attribution (`cost_usd`) via a vendored litellm pricing table, with an honest `cost_usd_is_partial` flag when a model's price can't be resolved
 - Token usage tracking and aggregation across models/services
 - Finish reasons tracking for debugging truncated/filtered responses
@@ -94,6 +94,7 @@ Each MCP capability is implemented as a separate tool module in [opentelemetry_m
 - [tools/search_spans.py](opentelemetry_mcp/tools/search_spans.py) - Search individual spans with filters
 - [tools/trace.py](opentelemetry_mcp/tools/trace.py) - Get detailed trace by ID (`detail_level`: `"full"` default returns everything unbounded; `"summary"` elides large gen_ai.\* message/document fields and truncates long event attributes)
 - [tools/triage.py](opentelemetry_mcp/tools/triage.py) - `triage_trace`: synthesize a likely-root-cause diagnosis (critical path, latency-contribution ranking, error chain) instead of returning raw trace data - composes [tools/span_tree.py](opentelemetry_mcp/tools/span_tree.py)'s tree-walking utilities, which no backend or other tool builds elsewhere
+- [tools/correlate.py](opentelemetry_mcp/tools/correlate.py) - `correlate_trace`: best-effort cross-backend correlation against a second, independently-configured backend (`SECONDARY_BACKEND_*`) - direct `trace_id` match first, else a time-window/service-overlap heuristic; also reuses `tools/span_tree.py` to compare error-driven root causes across both traces
 - [tools/usage.py](opentelemetry_mcp/tools/usage.py) - Aggregate token usage metrics
 - [tools/services.py](opentelemetry_mcp/tools/services.py) - List available services
 - [tools/errors.py](opentelemetry_mcp/tools/errors.py) - Find traces with errors
@@ -152,6 +153,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `BACKEND_AWS_REGION` - Required for X-Ray backend only: AWS region (e.g. `us-east-1`)
 - `BACKEND_TIMEOUT` - Optional: Request timeout (default: 30s)
 - `BACKEND_TEMPO_INSTANCE_ID` - Optional for Tempo backend: Grafana Cloud stack/instance ID (Basic Auth with `BACKEND_API_KEY` instead of Bearer auth)
+- `SECONDARY_BACKEND_TYPE` / `SECONDARY_BACKEND_URL` / ... - Optional, opt-in: a second, independently-configured backend for `correlate_trace` (cross-backend correlation) - every `BACKEND_*` variable above has a `SECONDARY_BACKEND_*` equivalent. Env-var only (no CLI override), see `config.py`'s `BackendConfig.from_env_optional`
 - `LOG_LEVEL` - Optional: Logging level (default: INFO)
 - `MAX_TRACES_PER_QUERY` - Optional: Result limit (default: 500, 1-1000)
 - `SLOW_REQUEST_THRESHOLD_MS` - Optional: Logs a WARNING for any backend request slower than this, independent of `LOG_LEVEL` (default: unset/disabled)
@@ -178,7 +180,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `--graceful-shutdown-timeout-seconds <int>` - HTTP transport only. uvicorn's own bound on waiting for in-flight connections/tasks to finish on shutdown before cancelling them - passed straight through as `uvicorn.Config(timeout_graceful_shutdown=)`, which only accepts whole seconds (default: `2`).
 - `--print-config` - Print the resolved configuration as JSON and exit without starting the server (secrets reported as `*_set` booleans, never their actual value)
 
-**`tracehub-mcp doctor`** - Subcommand (not a flag) that runs startup diagnostics against the resolved backend config: config load, backend construction, `health_check()`, and a real read-only connectivity probe (`list_services`). Prints `[OK]`/`[FAIL]` per step and exits non-zero on any failure - unlike the server's own lazy backend initialization, which deliberately swallows a failed health check and keeps running. Accepts the same `--backend`/`--url`/etc. override flags as the main command, so a candidate config can be validated before committing to it.
+**`tracehub-mcp doctor`** - Subcommand (not a flag) that runs startup diagnostics against the resolved backend config: config load, backend construction, `health_check()`, and a real read-only connectivity probe (`list_services`). Also validates the optional secondary backend (`SECONDARY_BACKEND_*`) the same way, if one is configured. Prints `[OK]`/`[FAIL]` per step and exits non-zero on any failure - unlike the server's own lazy backend initialization, which deliberately swallows a failed health check and keeps running. Accepts the same `--backend`/`--url`/etc. override flags as the main command, so a candidate config can be validated before committing to it (the secondary backend has no such override flags - it's resolved from env vars only).
 
 **HTTP Endpoints** (streamable-http transport only, registered via `FastMCP.custom_route` - not applicable to stdio): `GET /health` - liveness only, always `200 {"status": "ok"}`, no backend I/O. `GET /ready` - readiness, reuses the server's own cached backend (never closes it), `200` when `health_check`/`list_services` both succeed, `503` with details otherwise.
 

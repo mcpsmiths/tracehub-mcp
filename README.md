@@ -180,6 +180,7 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 | `BACKEND_AWS_REGION`     | string  | -        | AWS region, e.g. `us-east-1` (required for X-Ray)                    |
 | `BACKEND_ENVIRONMENTS`   | string  | `prd`    | Comma-separated environments (Traceloop only)                        |
 | `BACKEND_TIMEOUT`        | float   | `30`     | Request timeout in seconds                                           |
+| `SECONDARY_BACKEND_TYPE` / `SECONDARY_BACKEND_URL` / ... | string/URL | unset (opt-in) | A second, independently-configured backend for `correlate_trace` (cross-backend correlation) - every `BACKEND_*` variable above has a `SECONDARY_BACKEND_*` equivalent. Env-var only, no CLI flags. Unset means `correlate_trace` raises a clear error if called |
 | `LOG_LEVEL`              | string  | `INFO`   | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (`--log-level`)    |
 | `MAX_TRACES_PER_QUERY`   | integer | `500`    | Server-wide ceiling (1-1000, `--max-traces-per-query`) - caps every tool's `limit` argument before it reaches a backend query, regardless of what the calling agent requests |
 | `SLOW_REQUEST_THRESHOLD_MS` | float | unset  | Logs a WARNING for any backend request slower than this, independent of `LOG_LEVEL` (`--slow-request-threshold-ms`) |
@@ -549,7 +550,7 @@ gemini "Analyze token usage for gpt-4 requests today"
 
 ## Tools Reference
 
-tracehub-mcp exposes **18 MCP tools**:
+tracehub-mcp exposes **19 MCP tools**:
 
 | Tool                       | Description                                       | Use Case                           |
 | --------------------------- | -------------------------------------------------- | ----------------------------------- |
@@ -557,6 +558,7 @@ tracehub-mcp exposes **18 MCP tools**:
 | `search_spans_tool`        | Search individual spans (not grouped into traces) | Find LLM tool calls, specific ops  |
 | `get_trace`                | Get complete trace details by trace ID            | Deep-dive into a single trace      |
 | `triage_trace`             | Synthesize a likely-root-cause diagnosis for a trace (critical path, latency ranking, error chain) | Act on a diagnosis instead of re-deriving one from a trace dump |
+| `correlate_trace`          | Find the corresponding trace in a second, independently-configured backend | Join a trace across two backends (e.g. Datadog → Sentry) |
 | `get_llm_usage`             | Aggregate token usage metrics                     | Track costs and usage trends       |
 | `list_services`            | List available services                           | Discover what's instrumented       |
 | `find_errors`               | Find traces with errors                           | Debug failures quickly             |
@@ -622,6 +624,14 @@ Returns the full trace tree: all spans with attributes, parsed OpenTelemetry `ge
 ```
 
 Instead of returning raw trace data for an agent to re-derive a diagnosis from every time, this synthesizes one directly: a critical path (the "Last Finishing Child" chain actually responsible for the trace's total latency), the top spans ranked by self-time (latency contribution net of children), and — when the trace contains an error — the deepest error span in the trace's error chain as the likely root cause (`confidence: "high"`, or `"medium"` when multiple equally-deep error chains make blame ambiguous). Falls back to the highest self-time span as a pure-latency diagnosis (`confidence: "low"`) when no error is present. Deterministic — no LLM call — and works against any configured backend, since it operates on `get_trace`'s already-fetched span data. `detail_level: "full"` additionally attaches the diagnosed root cause's raw error detail (message/type/stacktrace) when the verdict is error-driven.
+
+**`correlate_trace`**
+
+```python
+{ "trace_id": "abc123def456" }
+```
+
+Tries to find the corresponding trace in a second, independently-configured backend (e.g. a Datadog trace and its downstream Sentry error, joined). Tries a direct `trace_id` match in the secondary backend first (`confidence: "high"`); if that fails, falls back to a time-window + service-name-overlap heuristic search (`confidence: "low"`) - queried once per service name in the primary trace, so this works against backends like Jaeger that require `service_name` on `search_traces`. Each match also reports `root_cause_consistent`: `null` when neither trace has an error to compare, otherwise `true`/`false` for whether both sides agree on the error and which service it traces back to (reusing the same error-chain logic `triage_trace` uses). This is a best-effort correlation, not a guaranteed join - the result always includes a fixed `limitations` list (clock skew, sampling mismatches, partial trace visibility, and the fact that trace-id continuity across a vendor boundary isn't guaranteed even under normal W3C Trace Context propagation). Requires a secondary backend configured via `SECONDARY_BACKEND_TYPE`/`SECONDARY_BACKEND_URL` (see [configuration table](#all-configuration-options)); raises a clear error otherwise.
 
 **`get_llm_usage`**
 
@@ -935,11 +945,10 @@ export BACKEND_API_KEY=your_key_here
 
 ## Roadmap
 
-One idea is deliberately **not** built yet — it's being deferred until it gets real usage feedback against the six backends already shipped, rather than guessed at up front:
+Both ideas that were previously listed here as deferred are now **shipped**:
 
-- **Cross-backend correlation** — querying multiple configured backends in a single call and correlating results across them (e.g. a Datadog trace and its downstream Sentry error, joined).
-
-Agent-native triage — tools that flag a likely root cause rather than just returning raw trace data — is **shipped**: see `triage_trace` in the [Tools Reference](#tools-reference) above.
+- Agent-native triage — tools that flag a likely root cause rather than just returning raw trace data: see `triage_trace` in the [Tools Reference](#tools-reference) above.
+- Cross-backend correlation — querying a second, independently-configured backend and correlating results against it: see `correlate_trace` above. This ships as a best-effort, heuristic correlation (direct `trace_id` match, or a time-window/service-overlap fallback) rather than a guaranteed schema-level join, per the research behind it — trace-id continuity across a vendor boundary is not guaranteed even under normal W3C Trace Context propagation.
 
 Beyond that, the next backends under research (in order, not yet started): **New Relic**, **Honeycomb**. (Grafana Cloud is not on this list — it already ships today via Tempo's Basic Auth path; see [Grafana Tempo](#backend-specific-setup) above.)
 

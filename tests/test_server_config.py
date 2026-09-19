@@ -136,6 +136,101 @@ class TestApplyCliOverridesUrl:
         assert str(config.backend.url) == "http://localhost:16686/"
 
 
+class TestSecondaryBackendFromEnv:
+    """BackendConfig.from_env_optional() (used by ServerConfig.from_env()
+    for correlate_trace's optional secondary backend) - unlike the always-
+    required primary backend's from_env(), an unset SECONDARY_BACKEND_TYPE
+    must produce None, not a jaeger/localhost default."""
+
+    def test_unset_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SECONDARY_BACKEND_TYPE", raising=False)
+
+        config = ServerConfig.from_env()
+
+        assert config.secondary_backend is None
+
+    def test_blank_type_is_treated_the_same_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Regression: .env.example ships `SECONDARY_BACKEND_TYPE=` (an
+        empty string once dotenv loads it, not an absent key) - it must
+        not be treated as "opted in with an empty type," which would raise
+        and crash server startup for anyone who leaves the example as-is."""
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "")
+        monkeypatch.delenv("SECONDARY_BACKEND_URL", raising=False)
+
+        config = ServerConfig.from_env()
+
+        assert config.secondary_backend is None
+
+    def test_whitespace_only_type_is_treated_the_same_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "   ")
+        monkeypatch.delenv("SECONDARY_BACKEND_URL", raising=False)
+
+        config = ServerConfig.from_env()
+
+        assert config.secondary_backend is None
+
+    def test_parses_a_full_config_when_type_is_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "sentry")
+        monkeypatch.setenv("SECONDARY_BACKEND_URL", "https://sentry.io")
+        monkeypatch.setenv("SECONDARY_BACKEND_API_KEY", "sec-key")
+        monkeypatch.setenv("SECONDARY_BACKEND_SENTRY_ORG", "sec-org")
+        monkeypatch.setenv("SECONDARY_BACKEND_TIMEOUT", "12")
+
+        config = ServerConfig.from_env()
+
+        assert config.secondary_backend is not None
+        assert config.secondary_backend.type == "sentry"
+        assert str(config.secondary_backend.url) == "https://sentry.io/"
+        assert config.secondary_backend.api_key == "sec-key"
+        assert config.secondary_backend.sentry_org == "sec-org"
+        assert config.secondary_backend.timeout == 12.0
+
+    def test_invalid_type_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "not-a-real-backend")
+        monkeypatch.setenv("SECONDARY_BACKEND_URL", "https://example.com")
+
+        with pytest.raises(ValueError, match="Invalid SECONDARY_BACKEND_TYPE"):
+            ServerConfig.from_env()
+
+    def test_type_set_without_url_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "sentry")
+        monkeypatch.delenv("SECONDARY_BACKEND_URL", raising=False)
+
+        with pytest.raises(ValueError, match="SECONDARY_BACKEND_URL is required"):
+            ServerConfig.from_env()
+
+    def test_invalid_timeout_falls_back_to_default_rather_than_raising(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "sentry")
+        monkeypatch.setenv("SECONDARY_BACKEND_URL", "https://sentry.io")
+        monkeypatch.setenv("SECONDARY_BACKEND_TIMEOUT", "not-a-number")
+
+        with caplog.at_level(logging.WARNING):
+            config = ServerConfig.from_env()
+
+        assert config.secondary_backend is not None
+        assert config.secondary_backend.timeout == 30.0
+        assert any("SECONDARY_BACKEND_TIMEOUT" in r.message for r in caplog.records)
+
+    def test_does_not_affect_the_primary_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", "http://localhost:16686")
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "datadog")
+        monkeypatch.setenv("SECONDARY_BACKEND_URL", "https://api.datadoghq.com")
+        monkeypatch.setenv("SECONDARY_BACKEND_API_KEY", "sec-api-key")
+        monkeypatch.setenv("SECONDARY_BACKEND_APP_KEY", "sec-app-key")
+
+        config = ServerConfig.from_env()
+
+        assert config.backend.type == "jaeger"
+        assert config.secondary_backend is not None
+        assert config.secondary_backend.type == "datadog"
+        assert config.secondary_backend.app_key == "sec-app-key"
+
+
 class TestApplyCliOverridesSlowRequestThreshold:
     def test_valid_value_is_applied(self) -> None:
         config = _server_config()

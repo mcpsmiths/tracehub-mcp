@@ -862,3 +862,38 @@ class TriageResult(BaseModel):
         "children) across the whole trace, capped at 10 entries."
     )
     error_chain: list[TriagedSpanSummary] | None
+
+
+class CorrelationMatch(BaseModel):
+    """One candidate match found in the secondary backend for
+    correlate_trace's primary trace_id."""
+
+    secondary_trace_id: str
+    correlation_method: Literal["trace_id_match", "time_window_heuristic"]
+    confidence: Literal["high", "low"]
+    service_overlap: list[str] = Field(
+        description="Service names present in both the primary trace and "
+        "this candidate secondary trace."
+    )
+    root_cause_consistent: bool | None = Field(
+        description="None when neither trace has an error span to compare "
+        "(nothing to confirm or refute). Otherwise True only when both "
+        "sides agree on both whether there is an error and which service "
+        "it traces back to (via the same error-chain walk triage_trace uses)."
+    )
+
+
+class CorrelationResult(BaseModel):
+    """Structured response shape for the correlate_trace tool - see
+    SearchTracesResult's docstring for why this is a real model rather than
+    a bare str.
+
+    An empty `matches` list means neither a direct trace_id match nor any
+    service-overlapping candidate was found in the secondary backend within
+    the search window - not necessarily that no correlated data exists at
+    all (see `limitations`).
+    """
+
+    primary_trace_id: str
+    matches: list[CorrelationMatch]
+    limitations: list[str]
