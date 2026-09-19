@@ -9,7 +9,9 @@ version_scheme = "pep440"
 # Files where Commitizen will update the version
 version_files = [
     "pyproject.toml:version",
-    "src/opentelemetry_mcp/__init__.py:__version__"
+    "src/opentelemetry_mcp/__init__.py:__version__",
+    "mcpb/manifest.json:version",
+    "mcpb/pyproject.toml:version"
 ]
 
 # Changelog configuration

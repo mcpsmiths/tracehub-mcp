@@ -1,6 +1,6 @@
 [project]
 name = "tracehub-mcp-mcpb-launcher"
-version = "0.4.0"
+version = "0.11.0"
 description = "MCPB launcher that resolves and runs the published tracehub-mcp PyPI package via uv"
 requires-python = ">=3.11"
 dependencies = [

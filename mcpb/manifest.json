@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "tracehub-mcp",
   "display_name": "TraceHub MCP",
-  "version": "0.4.0",
+  "version": "0.11.0",
   "description": "MCP server for querying OpenTelemetry traces across multiple observability backends (Jaeger, Tempo, Traceloop, Datadog, Sentry, and AWS X-Ray) for LLM application debugging",
   "long_description": "TraceHub MCP lets AI agents query and analyze OpenTelemetry traces from LLM applications. It parses gen_ai.* / llm.* semantic-convention attributes to enable automated debugging, cost analysis, and observability across Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry, and AWS X-Ray backends.\n\nThis bundle does not vendor the server's source: it declares the published `tracehub-mcp` PyPI package as a dependency in a bundled pyproject.toml and runs it via `uv run`, which resolves and installs the real package from PyPI at launch time.",
   "author": {
