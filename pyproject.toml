@@ -40,6 +40,14 @@ classifiers = [
 dependencies = [
     "mcp>=2.0,<3",
     "fastmcp>=4.0.5,<4.1",
+    # Pinned directly (not just transitive via mcp/fastmcp/httpx/starlette) to
+    # close CVE-2026-63374 (TLS cert-validation bypass via IDNA2003 hostname
+    # encoding) and CVE-2026-64847 (process-pool stderr-pipe DoS), both fixed
+    # in 4.14.2 - anyio has no entry in this project's own dependencies, so
+    # pip-audit flagging it was otherwise invisible to Dependabot (which only
+    # tracks direct + lockfile-pinned versions, not "whatever the resolver
+    # happens to pick" for a transitive dep with no floor here).
+    "anyio>=4.14.2",
     "pydantic>=2.12,<2.14",
     "httpx~=0.28.0",
     "python-dotenv~=1.2.2",

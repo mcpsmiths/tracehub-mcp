@@ -88,7 +88,21 @@ jobs:
                   BACKEND_TYPE: jaeger
                   BACKEND_URL: http://localhost:16686
               run: |
-                  uv run tracehub-mcp --transport http --host 127.0.0.1 --port 8765 &
+                  # --rate-limit-max-requests 0: the conformance suite runs
+                  # the full ~30-scenario active suite back-to-back against
+                  # this one server from a single client IP, which exceeds
+                  # the production default (100 req/60s) partway through and
+                  # produces false-positive 429s on later, entirely
+                  # legitimate scenarios (confirmed live: prompts-list and
+                  # dns-rebinding-protection both failed with "Rate limit
+                  # exceeded"/HTTP 429, not a real protocol or Origin-
+                  # validation gap - OriginValidationMiddleware's own DNS-
+                  # rebinding rejection passes correctly on its own).
+                  # Conformance testing protocol behavior, not
+                  # abuse-resistance, so disabling it for this ephemeral,
+                  # single-purpose CI server is correct - production
+                  # defaults are unchanged.
+                  uv run tracehub-mcp --transport http --host 127.0.0.1 --port 8765 --rate-limit-max-requests 0 &
                   echo $! > /tmp/tracehub-mcp.pid
                   for _ in $(seq 1 10); do
                     curl -s -o /dev/null http://127.0.0.1:8765/mcp && break
