@@ -31,9 +31,13 @@ def _reset_backend_global() -> Generator[None]:
     server._backend = None
 
 
-def _build_app_with_drain(drain_seconds: float = 0.0) -> StarletteWithLifespan:
+def _build_app_with_drain(
+    drain_seconds: float = 0.0, close_timeout_seconds: float = 5.0
+) -> StarletteWithLifespan:
     app = server.mcp.http_app(transport="streamable-http")
-    server._install_shutdown_drain(app, drain_seconds=drain_seconds)
+    server._install_shutdown_drain(
+        app, drain_seconds=drain_seconds, close_timeout_seconds=close_timeout_seconds
+    )
     return app
 
 
@@ -86,12 +90,13 @@ def test_shutdown_swallows_backend_close_errors() -> None:
     assert server._backend is None
 
 
-async def test_drain_and_close_backend_times_out_gracefully(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If close() hangs past _BACKEND_CLOSE_TIMEOUT_SECONDS, the helper must
-    give up rather than block shutdown forever - uvicorn places no timeout
-    of its own around lifespan.shutdown."""
+async def test_drain_and_close_backend_times_out_gracefully() -> None:
+    """If close() hangs past close_timeout_seconds, the helper must give up
+    rather than block shutdown forever - uvicorn places no timeout of its
+    own around lifespan.shutdown. Passed explicitly as a parameter (not
+    monkeypatched onto the module) - see _drain_and_close_backend's own
+    docstring for why: a real signal-timing integration test needs to set
+    this via a CLI flag in a subprocess, which monkeypatching can't reach."""
     import asyncio
 
     async def _hang() -> None:
@@ -100,8 +105,7 @@ async def test_drain_and_close_backend_times_out_gracefully(
     fake_backend = AsyncMock()
     fake_backend.close = AsyncMock(side_effect=_hang)
     server._backend = fake_backend
-    monkeypatch.setattr(server, "_BACKEND_CLOSE_TIMEOUT_SECONDS", 0.05)
 
-    await server._drain_and_close_backend(0.0)
+    await server._drain_and_close_backend(0.0, close_timeout_seconds=0.05)
 
     assert server._backend is None

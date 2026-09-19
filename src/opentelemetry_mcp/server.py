@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 # ChatGPT Apps submission pipeline) require all applicable hints to be
 # present as explicit booleans.
 _READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
-    readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True
 )
 
 
@@ -1091,13 +1091,26 @@ _LOCAL_ORIGIN_PATTERN = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$"
 class OriginValidationMiddleware(BaseHTTPMiddleware):
     """Validate the Origin header on requests to the streamable-http transport.
 
-    fastmcp 3.2.0 builds its StreamableHTTPSessionManager without passing
-    security_settings through, which leaves the upstream mcp SDK's own
+    fastmcp 3.2.0 built its StreamableHTTPSessionManager without passing
+    security_settings through at all, leaving the upstream mcp SDK's own
     DNS-rebinding/Origin protection (mcp.server.transport_security) disabled
-    by default. fastmcp exposes no kwarg to pass security_settings through,
-    so this middleware restores Origin validation directly, satisfying the
-    MCP spec's (2025-06-18 basic/transports) MUST-requirement for Streamable
-    HTTP servers to validate the Origin header.
+    by omission. Re-verified against the real installed fastmcp 4.0.5
+    (fastmcp/server/http.py:668-682, not assumed unchanged from 3.2.0): the
+    gap is now an explicit, unconditional
+    `security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False)`
+    - fastmcp's own comment there says it "owns DNS-rebinding protection via
+    HostOriginGuardMiddleware... always disable the SDK's own protection so
+    the two layers don't double-block." That replacement,
+    HostOriginGuardMiddleware, is real but stays opt-in
+    (`host_origin_protection: HostOriginProtection = False` by default,
+    fastmcp/server/http.py:556) and this codebase's own
+    `mcp.http_app(transport=..., middleware=[...])` call never sets it - so
+    fastmcp's own native alternative is never actually inserted for this
+    deployment, and the underlying SDK protection stays disabled either way.
+    This middleware remains fully necessary, unchanged, satisfying the MCP
+    spec's (2025-06-18 basic/transports) MUST-requirement for Streamable HTTP
+    servers to validate the Origin header regardless of which fastmcp
+    version is running.
 
     A request with no Origin header is allowed through unmodified: Origin can
     be absent for same-origin requests, and most MCP HTTP clients are not
@@ -1182,7 +1195,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 _BACKEND_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
-async def _drain_and_close_backend(drain_seconds: float) -> None:
+async def _drain_and_close_backend(drain_seconds: float, close_timeout_seconds: float) -> None:
     """Runs from inside the *inner* ASGI lifespan.shutdown callback that
     _install_shutdown_drain splices onto mcp.http_app()'s app - i.e. from
     inside uvicorn.Server.shutdown(), strictly before capture_signals()'s
@@ -1197,9 +1210,13 @@ async def _drain_and_close_backend(drain_seconds: float) -> None:
     in-flight connections/tasks by this point - this is a final grace
     window, not a substitute for that phase), then closes the shared
     backend HTTP client if one was ever lazily created. Bounded by
-    _BACKEND_CLOSE_TIMEOUT_SECONDS because uvicorn places no timeout of
-    its own around the lifespan.shutdown wait - an unbounded backend.close()
-    could otherwise hang process exit forever.
+    `close_timeout_seconds` because uvicorn places no timeout of its own
+    around the lifespan.shutdown wait - an unbounded backend.close() could
+    otherwise hang process exit forever. Threaded as a parameter (default
+    _BACKEND_CLOSE_TIMEOUT_SECONDS) rather than read directly from the
+    module constant so a real signal-timing integration test can force the
+    timeout-fallback branch deterministically without monkeypatching module
+    internals from outside a subprocess, which is impossible.
     """
     global _backend
 
@@ -1216,18 +1233,20 @@ async def _drain_and_close_backend(drain_seconds: float) -> None:
 
     backend_to_close, _backend = _backend, None
     try:
-        await asyncio.wait_for(backend_to_close.close(), timeout=_BACKEND_CLOSE_TIMEOUT_SECONDS)
+        await asyncio.wait_for(backend_to_close.close(), timeout=close_timeout_seconds)
         logger.info("Backend closed during shutdown drain")
     except TimeoutError:
         logger.warning(
-            f"Backend close did not finish within {_BACKEND_CLOSE_TIMEOUT_SECONDS}s "
+            f"Backend close did not finish within {close_timeout_seconds}s "
             "during shutdown, abandoning it"
         )
     except Exception as e:
         logger.warning(f"Error closing backend during shutdown: {e}")
 
 
-def _install_shutdown_drain(app: StarletteWithLifespan, drain_seconds: float) -> None:
+def _install_shutdown_drain(
+    app: StarletteWithLifespan, drain_seconds: float, close_timeout_seconds: float
+) -> None:
     """Splice _drain_and_close_backend onto the *inner* lifespan
     mcp.http_app() builds, by reassigning the mutable
     app.router.lifespan_context attribute after construction - rather
@@ -1256,7 +1275,7 @@ def _install_shutdown_drain(app: StarletteWithLifespan, drain_seconds: float) ->
             try:
                 yield
             finally:
-                await _drain_and_close_backend(drain_seconds)
+                await _drain_and_close_backend(drain_seconds, close_timeout_seconds)
 
     app.router.lifespan_context = combined_lifespan
 
@@ -1437,6 +1456,28 @@ def _backend_config_options(f: Any) -> Any:
     "for --transport http, default: 0.0/disabled, overrides "
     "SHUTDOWN_DRAIN_SECONDS env var)",
 )
+@click.option(
+    "--backend-close-timeout-seconds",
+    type=float,
+    default=_BACKEND_CLOSE_TIMEOUT_SECONDS,
+    envvar="BACKEND_CLOSE_TIMEOUT_SECONDS",
+    help="On HTTP transport, abandon closing the shared backend HTTP client "
+    "during shutdown if it does not finish within this many seconds - "
+    "uvicorn places no timeout of its own around this wait (only for "
+    f"--transport http, default: {_BACKEND_CLOSE_TIMEOUT_SECONDS}, "
+    "overrides BACKEND_CLOSE_TIMEOUT_SECONDS env var)",
+)
+@click.option(
+    "--graceful-shutdown-timeout-seconds",
+    type=int,
+    default=2,
+    envvar="GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS",
+    help="On HTTP transport, uvicorn's own bound on waiting for in-flight "
+    "connections/tasks to finish on shutdown before cancelling them - "
+    "passed straight through as uvicorn.Config(timeout_graceful_shutdown=), "
+    "which only accepts whole seconds (only for --transport http, "
+    "default: 2, overrides GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS env var)",
+)
 def main(
     ctx: click.Context,
     backend: str | None,
@@ -1462,6 +1503,8 @@ def main(
     rate_limit_window_seconds: float,
     query_cache_ttl_seconds: float | None,
     shutdown_drain_seconds: float,
+    backend_close_timeout_seconds: float,
+    graceful_shutdown_timeout_seconds: int,
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
@@ -1566,6 +1609,8 @@ def main(
                 "rate_limit_max_requests": rate_limit_max_requests,
                 "rate_limit_window_seconds": rate_limit_window_seconds,
                 "shutdown_drain_seconds": shutdown_drain_seconds,
+                "backend_close_timeout_seconds": backend_close_timeout_seconds,
+                "graceful_shutdown_timeout_seconds": graceful_shutdown_timeout_seconds,
             }
             click.echo(json.dumps(resolved, indent=2))
             return
@@ -1603,7 +1648,11 @@ def main(
                     )
                 )
             app = mcp.http_app(transport="streamable-http", middleware=middleware)
-            _install_shutdown_drain(app, drain_seconds=shutdown_drain_seconds)
+            _install_shutdown_drain(
+                app,
+                drain_seconds=shutdown_drain_seconds,
+                close_timeout_seconds=backend_close_timeout_seconds,
+            )
             uvicorn_config = uvicorn.Config(
                 app,
                 host=host,
@@ -1612,8 +1661,11 @@ def main(
                 # Preserves run_http_async's own default (lost by bypassing
                 # it) for the connection/task-draining wait uvicorn does
                 # BEFORE dispatching lifespan.shutdown - unrelated to the
-                # drain feature itself, which fires after this.
-                timeout_graceful_shutdown=2,
+                # drain feature itself, which fires after this. Exposed as
+                # --graceful-shutdown-timeout-seconds so a real signal-timing
+                # test can widen it deterministically instead of relying on
+                # this project's own default margin.
+                timeout_graceful_shutdown=graceful_shutdown_timeout_seconds,
             )
             asyncio.run(uvicorn.Server(uvicorn_config).serve())
         else:

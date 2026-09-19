@@ -89,6 +89,34 @@ def configure_tracing(service_name: str | None = None) -> bool:
     """Configure a real OTLP-exporting TracerProvider, but only if
     OTEL_EXPORTER_OTLP_ENDPOINT is actually set in the environment.
 
+    Also sets FastMCP's own ``telemetry_mode`` to ``"propagation_only"``
+    (fastmcp>=4.0's public, documented API - ``fastmcp.telemetry``) so
+    FastMCP stops creating its own native spans for the lifetime of this
+    process. Confirmed via a real end-to-end reproduction with an
+    in-memory exporter (not just source reading) that without this,
+    FastMCP's own middleware seam span PLUS its own internal
+    ``server_span()`` both survive alongside this codebase's own
+    McpServerTracingMiddleware span for the *same* logical tools/call
+    operation - three SERVER-kind spans exported for one tool call.
+    ``propagation_only`` mode still correctly parents this codebase's own
+    spans under any incoming distributed trace context carried in a
+    request's ``_meta`` (that's the whole point of the mode, per
+    fastmcp.telemetry's own docstring), it just stops FastMCP from
+    creating its own competing spans. A narrower, context-manager-scoped
+    fix (``suppress_fastmcp_telemetry()`` around just this codebase's own
+    ``call_next()``) was tried first and confirmed insufficient: FastMCP's
+    middleware seam span opens *before* any user middleware runs, so
+    nothing scoped inside this codebase's own middleware can reach back
+    far enough to suppress it - this has to be set process-wide, at the
+    point self-instrumentation is enabled.
+
+    One accepted, deliberate tradeoff: FastMCP's own server_span() is the
+    only place ``enduser.id``/``enduser.scope`` (auth) attributes would
+    have been set - suppressing it means those never appear on any span.
+    Not a live regression for this deployment today (this codebase never
+    configures ``FastMCP(auth=...)``, so those attributes are already
+    always empty regardless), but worth revisiting if that ever changes.
+
     Returns:
         True if tracing was configured, False if it was skipped (no
         endpoint configured). Callers must only register the
@@ -104,6 +132,11 @@ def configure_tracing(service_name: str | None = None) -> bool:
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
+
+    import fastmcp
+
+    fastmcp.settings.telemetry_mode = "propagation_only"
+
     logger.info(f"OTel self-instrumentation enabled, exporting spans to {endpoint}")
     return True
 

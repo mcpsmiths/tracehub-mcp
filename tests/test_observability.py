@@ -140,6 +140,40 @@ class TestConfigureTracing:
         provider = mocked.call_args.args[0]
         assert provider.resource.attributes["service.name"] == "tracehub-mcp"
 
+    def test_sets_fastmcp_telemetry_mode_to_propagation_only_when_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FastMCP's own native spans (its middleware seam span plus its
+        internal server_span()) duplicate this codebase's own
+        McpServerTracingMiddleware span for the same tools/call operation -
+        confirmed via a real end-to-end reproduction (see
+        test_double_tracing_regression.py) that this produces THREE
+        SERVER-kind spans for one tool call without this setting.
+        propagation_only still correctly parents this codebase's own spans
+        under any incoming distributed trace context - it only stops
+        FastMCP from creating its own competing spans."""
+        import fastmcp
+
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+        monkeypatch.setattr(fastmcp.settings, "telemetry_mode", "native")
+
+        with patch.object(observability.trace, "set_tracer_provider"):
+            configure_tracing()
+
+        assert fastmcp.settings.telemetry_mode == "propagation_only"
+
+    def test_does_not_touch_fastmcp_telemetry_mode_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import fastmcp
+
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+        monkeypatch.setattr(fastmcp.settings, "telemetry_mode", "native")
+
+        configure_tracing()
+
+        assert fastmcp.settings.telemetry_mode == "native"
+
 
 class TestConfigureMetrics:
     """Mirrors TestConfigureTracing exactly - configure_metrics is the

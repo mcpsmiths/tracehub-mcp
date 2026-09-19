@@ -628,10 +628,10 @@ class TestToolAnnotationsComplete:
         assert len(tools) == 17
         for t in tools:
             assert t.annotations is not None, f"{t.name} has no annotations at all"
-            assert t.annotations.readOnlyHint is True, t.name
-            assert t.annotations.destructiveHint is False, t.name
-            assert t.annotations.idempotentHint is True, t.name
-            assert t.annotations.openWorldHint is True, t.name
+            assert t.annotations.read_only_hint is True, t.name
+            assert t.annotations.destructive_hint is False, t.name
+            assert t.annotations.idempotent_hint is True, t.name
+            assert t.annotations.open_world_hint is True, t.name
 
     async def test_every_tool_has_a_distinct_human_readable_title(self) -> None:
         """Anthropic's Software Directory Policy requires readOnlyHint,

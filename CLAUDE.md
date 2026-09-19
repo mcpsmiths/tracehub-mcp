@@ -159,6 +159,8 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `OTEL_SERVICE_NAME` - Optional: Service name reported in self-instrumentation spans (default: `tracehub-mcp`)
 - `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` - Optional: Env-var equivalents of `--rate-limit-max-requests`/`--rate-limit-window-seconds` (HTTP transport only, defaults: `100`/`60.0`)
 - `SHUTDOWN_DRAIN_SECONDS` - Optional: Env-var equivalent of `--shutdown-drain-seconds` (HTTP transport only, default: `0.0`/disabled)
+- `BACKEND_CLOSE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--backend-close-timeout-seconds` (HTTP transport only, default: `5.0`)
+- `GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--graceful-shutdown-timeout-seconds` (HTTP transport only, default: `2`)
 
 **CLI Flags** (all mirror an env var above where noted; run `tracehub-mcp --help` for the full list):
 
@@ -170,6 +172,8 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `--include-args-in-spans` - Overrides `MCP_INCLUDE_ARGS_IN_SPANS`
 - `--rate-limit-max-requests <int>` / `--rate-limit-window-seconds <float>` - HTTP transport only. Per-client-IP fixed-window rate limit (defaults: 100 requests / 60s window). Set `--rate-limit-max-requests 0` to disable.
 - `--shutdown-drain-seconds <float>` - HTTP transport only. On shutdown, wait this many seconds inside the ASGI shutdown handler (after uvicorn has already finished draining in-flight connections) before closing the shared backend HTTP client (default: `0.0`/disabled).
+- `--backend-close-timeout-seconds <float>` - HTTP transport only. Abandon closing the shared backend HTTP client during shutdown if it does not finish within this many seconds - uvicorn places no timeout of its own around this wait (default: `5.0`).
+- `--graceful-shutdown-timeout-seconds <int>` - HTTP transport only. uvicorn's own bound on waiting for in-flight connections/tasks to finish on shutdown before cancelling them - passed straight through as `uvicorn.Config(timeout_graceful_shutdown=)`, which only accepts whole seconds (default: `2`).
 - `--print-config` - Print the resolved configuration as JSON and exit without starting the server (secrets reported as `*_set` booleans, never their actual value)
 
 **`tracehub-mcp doctor`** - Subcommand (not a flag) that runs startup diagnostics against the resolved backend config: config load, backend construction, `health_check()`, and a real read-only connectivity probe (`list_services`). Prints `[OK]`/`[FAIL]` per step and exits non-zero on any failure - unlike the server's own lazy backend initialization, which deliberately swallows a failed health check and keeps running. Accepts the same `--backend`/`--url`/etc. override flags as the main command, so a candidate config can be validated before committing to it.
