@@ -24,6 +24,7 @@ from starlette.responses import JSONResponse, Response
 from opentelemetry_mcp import __version__
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.datadog import DatadogBackend
+from opentelemetry_mcp.backends.honeycomb import HoneycombBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
 from opentelemetry_mcp.backends.newrelic import NewRelicBackend
 from opentelemetry_mcp.backends.sentry import SentryBackend
@@ -191,6 +192,14 @@ def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             account_id=backend_config.newrelic_account_id,
+            timeout=backend_config.timeout,
+        )
+    elif backend_config.type == "honeycomb":
+        logger.info(f"Initializing Honeycomb backend: dataset {backend_config.honeycomb_dataset}")
+        backend = HoneycombBackend(
+            url=str(backend_config.url),
+            api_key=backend_config.api_key,
+            dataset=backend_config.honeycomb_dataset,
             timeout=backend_config.timeout,
         )
     else:
@@ -1456,6 +1465,7 @@ def _print_config_backend_dict(backend_config: BackendConfig) -> dict[str, Any]:
         "tempo_instance_id": backend_config.tempo_instance_id,
         "aws_region": backend_config.aws_region,
         "newrelic_account_id": backend_config.newrelic_account_id,
+        "honeycomb_dataset": backend_config.honeycomb_dataset,
         "api_key_set": backend_config.api_key is not None,
         "app_key_set": backend_config.app_key is not None,
     }
@@ -1468,7 +1478,7 @@ def _backend_config_options(f: Any) -> Any:
     f = click.option(
         "--backend",
         type=click.Choice(
-            ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray", "newrelic"]
+            ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray", "newrelic", "honeycomb"]
         ),
         help="Backend type (overrides BACKEND_TYPE env var)",
     )(f)
@@ -1525,6 +1535,12 @@ def _backend_config_options(f: Any) -> Any:
         help="New Relic account ID, required by the New Relic backend since NerdGraph "
         "queries are user-scoped not account-scoped (overrides "
         "BACKEND_NEWRELIC_ACCOUNT_ID env var)",
+    )(f)
+    f = click.option(
+        "--honeycomb-dataset",
+        type=str,
+        help="Honeycomb dataset slug, required by the Honeycomb backend since the "
+        "Query Data API is dataset-scoped (overrides BACKEND_HONEYCOMB_DATASET env var)",
     )(f)
     return f
 
@@ -1680,6 +1696,7 @@ def main(
     environments: str | None,
     aws_region: str | None,
     newrelic_account_id: str | None,
+    honeycomb_dataset: str | None,
     print_config: bool,
     transport: str,
     host: str,
@@ -1699,7 +1716,8 @@ def main(
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
-    Supports multiple backends: Jaeger, Tempo, Traceloop, Datadog, Sentry, AWS X-Ray, and New Relic.
+    Supports multiple backends: Jaeger, Tempo, Traceloop, Datadog, Sentry, AWS X-Ray,
+    New Relic, and Honeycomb.
     Configuration can be provided via environment variables or CLI arguments.
 
     Transport options:
@@ -1746,6 +1764,7 @@ def main(
             or environments
             or aws_region
             or newrelic_account_id
+            or honeycomb_dataset
             or log_level
             or max_traces_per_query is not None
             or slow_request_threshold_ms is not None
@@ -1761,6 +1780,7 @@ def main(
                 tempo_instance_id=tempo_instance_id,
                 aws_region=aws_region,
                 newrelic_account_id=newrelic_account_id,
+                honeycomb_dataset=honeycomb_dataset,
                 environments=environments,
                 log_level=log_level,
                 max_traces_per_query=max_traces_per_query,
@@ -1912,6 +1932,7 @@ def doctor(
     environments: str | None,
     aws_region: str | None,
     newrelic_account_id: str | None,
+    honeycomb_dataset: str | None,
 ) -> None:
     """Run startup diagnostics against the resolved backend config: config
     load, backend construction, health check, and a live read-only
@@ -1936,6 +1957,7 @@ def doctor(
             or environments
             or aws_region
             or newrelic_account_id
+            or honeycomb_dataset
         ):
             config.apply_cli_overrides(
                 backend_type=backend,
@@ -1947,6 +1969,7 @@ def doctor(
                 tempo_instance_id=tempo_instance_id,
                 aws_region=aws_region,
                 newrelic_account_id=newrelic_account_id,
+                honeycomb_dataset=honeycomb_dataset,
                 environments=environments,
             )
         click.secho("[OK] Configuration loaded and validated", fg="green")

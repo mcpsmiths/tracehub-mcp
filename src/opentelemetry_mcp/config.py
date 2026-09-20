@@ -18,7 +18,9 @@ load_dotenv()
 class BackendConfig(BaseModel):
     """Configuration for OpenTelemetry trace backend."""
 
-    type: Literal["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray", "newrelic"]
+    type: Literal[
+        "jaeger", "tempo", "traceloop", "datadog", "sentry", "xray", "newrelic", "honeycomb"
+    ]
     url: HttpUrl
     api_key: str | None = Field(default=None, exclude=True)
     app_key: str | None = Field(
@@ -47,6 +49,12 @@ class BackendConfig(BaseModel):
         exclude=True,
         description="New Relic account ID, required since NerdGraph queries are "
         "user-scoped not account-scoped (New Relic backend only)",
+    )
+    honeycomb_dataset: str | None = Field(
+        default=None,
+        exclude=True,
+        description="Honeycomb dataset slug, required since the Query Data API is "
+        "dataset-scoped (Honeycomb backend only)",
     )
     timeout: float = Field(default=30.0, gt=0, le=300)
     environments: list[str] = Field(default_factory=lambda: ["prd"])
@@ -126,10 +134,11 @@ class BackendConfig(BaseModel):
             "sentry",
             "xray",
             "newrelic",
+            "honeycomb",
         ]:
             raise ValueError(
                 f"Invalid {prefix}TYPE: {backend_type}. "
-                "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray, newrelic"
+                "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray, newrelic, honeycomb"
             )
         if not backend_url:
             raise ValueError(f"{prefix}URL is required when {prefix}TYPE is set")
@@ -156,6 +165,7 @@ class BackendConfig(BaseModel):
             tempo_instance_id=os.getenv(f"{prefix}TEMPO_INSTANCE_ID"),
             aws_region=os.getenv(f"{prefix}AWS_REGION"),
             newrelic_account_id=os.getenv(f"{prefix}NEWRELIC_ACCOUNT_ID"),
+            honeycomb_dataset=os.getenv(f"{prefix}HONEYCOMB_DATASET"),
             timeout=timeout,
             environments=environments,
         )
@@ -239,6 +249,7 @@ class ServerConfig(BaseModel):
         tempo_instance_id: str | None = None,
         aws_region: str | None = None,
         newrelic_account_id: str | None = None,
+        honeycomb_dataset: str | None = None,
         environments: str | None = None,
         log_level: str | None = None,
         max_traces_per_query: int | None = None,
@@ -286,10 +297,12 @@ class ServerConfig(BaseModel):
                 "sentry",
                 "xray",
                 "newrelic",
+                "honeycomb",
             ]:
                 raise ValueError(
                     f"Invalid backend type: {backend_type}. "
-                    "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray, newrelic"
+                    "Must be one of: jaeger, tempo, traceloop, datadog, sentry, xray, newrelic, "
+                    "honeycomb"
                 )
             self.backend.type = backend_type  # type: ignore
 
@@ -322,6 +335,9 @@ class ServerConfig(BaseModel):
 
         if newrelic_account_id:
             self.backend.newrelic_account_id = newrelic_account_id
+
+        if honeycomb_dataset:
+            self.backend.honeycomb_dataset = honeycomb_dataset
 
         if environments:
             self.backend.environments = [

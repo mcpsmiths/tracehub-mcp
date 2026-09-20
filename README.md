@@ -86,8 +86,9 @@ See [MCP Client Setup](#mcp-client-setup) for Cursor, Windsurf, VS Code, and Gem
 - **[Sentry](https://sentry.io/)** — cloud or self-hosted, requires an auth token and an organization slug.
 - **[AWS X-Ray](https://aws.amazon.com/xray/)** — SigV4-signed via `boto3`, requires an AWS region and standard AWS credentials (not an API key). Because OTel span attributes land in unindexed X-Ray segment *metadata* by default (only *annotations* are queryable), native server-side filtering is narrower here than for the other backends — see the [Backend Support Matrix](#backend-support-matrix).
 - **[New Relic](https://newrelic.com/)** — NerdGraph GraphQL API, requires a User API key (not an Ingest/License key) and an account ID. **Built without a live account to verify against** — see the [New Relic setup section](#backend-specific-setup) below and the module docstring in [backends/newrelic.py](src/opentelemetry_mcp/backends/newrelic.py) for exactly which assumptions are unverified.
+- **[Honeycomb](https://www.honeycomb.io/)** — Query Data API, requires a Configuration Key and a dataset slug. **Built without a live account to verify against**, and the research behind it found the programmatic Query Data API (the only way to actually run a query and get results back) is documented as Enterprise-plan exclusive — see the [Honeycomb setup section](#backend-specific-setup) below and the module docstring in [backends/honeycomb.py](src/opentelemetry_mcp/backends/honeycomb.py).
 
-All seven implement the same `BaseBackend` interface, so every MCP tool works identically regardless of which one you point the server at. See [Configuration](#configuration) for per-backend setup.
+All eight implement the same `BaseBackend` interface, so every MCP tool works identically regardless of which one you point the server at. See [Configuration](#configuration) for per-backend setup.
 
 ---
 
@@ -171,15 +172,16 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 
 | Variable                 | Type    | Default  | Description                                                          |
 | ------------------------ | ------- | -------- | ---------------------------------------------------------------------|
-| `BACKEND_TYPE`           | string  | `jaeger` | Backend type: `jaeger`, `tempo`, `traceloop`, `datadog`, `sentry`, `xray`, or `newrelic` |
+| `BACKEND_TYPE`           | string  | `jaeger` | Backend type: `jaeger`, `tempo`, `traceloop`, `datadog`, `sentry`, `xray`, `newrelic`, or `honeycomb` |
 | `BACKEND_URL`            | URL     | -        | Backend API endpoint (required; decorative-only placeholder for X-Ray) |
-| `BACKEND_API_KEY`        | string  | -        | API key/auth token (required for Traceloop, Datadog, Sentry, and New Relic; unused by X-Ray) |
+| `BACKEND_API_KEY`        | string  | -        | API key/auth token (required for Traceloop, Datadog, Sentry, New Relic, and Honeycomb; unused by X-Ray) |
 | `BACKEND_APP_KEY`        | string  | -        | Application key (Datadog only, in addition to `BACKEND_API_KEY`)     |
 | `BACKEND_TEMPO_INSTANCE_ID` | string | -     | Grafana Cloud stack/instance ID (Tempo only, enables Basic Auth in addition to `BACKEND_API_KEY`) |
 | `BACKEND_SENTRY_ORG`     | string  | -        | Organization slug (required for Sentry)                             |
 | `BACKEND_SENTRY_PROJECT` | string  | -        | Project slug (optional for Sentry, narrows queries to one project)   |
 | `BACKEND_AWS_REGION`     | string  | -        | AWS region, e.g. `us-east-1` (required for X-Ray)                    |
 | `BACKEND_NEWRELIC_ACCOUNT_ID` | string | -   | New Relic account ID (required for New Relic - NerdGraph queries are user-scoped, not account-scoped) |
+| `BACKEND_HONEYCOMB_DATASET` | string | -     | Honeycomb dataset slug (required for Honeycomb - the Query Data API is dataset-scoped) |
 | `BACKEND_ENVIRONMENTS`   | string  | `prd`    | Comma-separated environments (Traceloop only)                        |
 | `BACKEND_TIMEOUT`        | float   | `30`     | Request timeout in seconds                                           |
 | `SECONDARY_BACKEND_TYPE` / `SECONDARY_BACKEND_URL` / ... | string/URL | unset (opt-in) | A second, independently-configured backend for `correlate_trace` (cross-backend correlation) - every `BACKEND_*` variable above has a `SECONDARY_BACKEND_*` equivalent. Env-var only, no CLI flags. Unset means `correlate_trace` raises a clear error if called |
@@ -320,6 +322,24 @@ BACKEND_NEWRELIC_ACCOUNT_ID=1234567
 New Relic requires a **User** API key (not an Ingest or License key, which cannot query) *and* an account ID — a User key is user-scoped, not account-scoped, so every NerdGraph query here states which account to query explicitly. Search uses NRQL (`SELECT * FROM Span WHERE ...`); `get_trace` uses NerdGraph's native `distributedTracing.trace` lookup, like Sentry, rather than reconstructing a trace from search results.
 
 > **Built without a live New Relic account to verify against.** Two things a real account is needed to confirm: the exact shape of OTel span attributes inside `distributedTracing.trace`'s GraphQL response (assumed to be a flat, directly-keyed object), and the account's actual Span-data retention window (a conservative 7-day default is used pending confirmation). See the module docstring in [backends/newrelic.py](src/opentelemetry_mcp/backends/newrelic.py) for the complete list of unverified assumptions before relying on this backend in production.
+
+</details>
+
+<details>
+<summary><b>Honeycomb</b></summary>
+
+```bash
+BACKEND_TYPE=honeycomb
+# US instance (default): https://api.honeycomb.io
+# EU instance:            https://api.eu1.honeycomb.io
+BACKEND_URL=https://api.honeycomb.io
+BACKEND_API_KEY=your_configuration_key_here
+BACKEND_HONEYCOMB_DATASET=your-dataset-slug
+```
+
+Honeycomb requires a **Configuration Key** (not an Ingest or Management key) with "Manage Queries and Columns" and "Run Queries" permissions, *and* a dataset slug — the Query Data API is dataset-scoped. Search runs Honeycomb's 3-step async query flow (create a query spec, run it, poll for the result) rather than a text query language like NRQL/TraceQL; `get_trace` searches by `trace.trace_id` since no dedicated single-trace lookup endpoint is documented.
+
+> **Go/no-go risk, not just an unverified detail.** The research behind this backend found the programmatic Query Data API — create-query-result + get-query-result, the *only* way to actually run a query and get data back — is documented as **Enterprise-plan exclusive**; Free and Pro accounts can build a query specification via the API but never execute it. This backend raises a clear `HoneycombEnterpriseRequiredError` if a 402/403 is returned, but the exact status code a non-Enterprise account gets back was never confirmed live, and this backend was built entirely without a live account (Enterprise or otherwise). See the module docstring in [backends/honeycomb.py](src/opentelemetry_mcp/backends/honeycomb.py) for the complete list of unverified assumptions - including how raw per-span rows are extracted from Honeycomb's aggregation-oriented Query API - before relying on this backend in production.
 
 </details>
 
@@ -596,20 +616,21 @@ tracehub-mcp exposes **19 MCP tools**:
 
 ### Backend Support Matrix
 
-| Feature          | Jaeger | Tempo | Traceloop | Datadog | Sentry | AWS X-Ray | New Relic |
-| ---------------- | :----: | :---: | :-------: | :-----: | :----: | :-------: | :-------: |
-| Search traces    |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓‡   |    ✓†     |    ✓†     |
-| Search spans     |  ✓\*   |   ✓   |     ✓     |    ✓    |   ✓    |    ✓†     |    ✓      |
-| Get trace by ID  |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓    |    ✓      |    ✓‡     |
-| Advanced filters |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓§     |    ✓      |
-| Error traces     |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓      |    ✓      |
-| All LLM tools    |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓      |   ✓¶      |
+| Feature          | Jaeger | Tempo | Traceloop | Datadog | Sentry | AWS X-Ray | New Relic | Honeycomb♦ |
+| ---------------- | :----: | :---: | :-------: | :-----: | :----: | :-------: | :-------: | :--------: |
+| Search traces    |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓‡   |    ✓†     |    ✓†     |    ✓†      |
+| Search spans     |  ✓\*   |   ✓   |     ✓     |    ✓    |   ✓    |    ✓†     |    ✓      |    ✓       |
+| Get trace by ID  |   ✓    |   ✓   |     ✓     |   ✓†    |   ✓    |    ✓      |    ✓‡     |    ✓†      |
+| Advanced filters |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓§     |    ✓      |    ✓       |
+| Error traces     |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓      |    ✓      |    ✓       |
+| All LLM tools    |   ✓    |   ✓   |     ✓     |    ✓    |   ✓    |    ✓      |   ✓¶      |   ✓¶       |
 
 <sub>\* Jaeger requires the `service_name` parameter for span search.</sub><br>
-<sub>† Datadog, AWS X-Ray, and New Relic have no trace-level *search* API (X-Ray's `BatchGetTraces` fetches by exact ID); traces are reconstructed by searching (spans, X-Ray trace summaries, or NRQL Span events) and hydrating, with every result re-verified against the exact ID requested.</sub><br>
-<sub>‡ Sentry and New Relic both have a native trace-lookup endpoint (unlike Datadog), so `get_trace` calls it directly; `search_traces` still discovers candidate trace IDs via a span/NRQL search first, since both backends' search surface is itself span-centric.</sub><br>
+<sub>† Datadog, AWS X-Ray, New Relic, and Honeycomb have no trace-level *search* API (X-Ray's `BatchGetTraces` fetches by exact ID); traces are reconstructed by searching (spans, X-Ray trace summaries, NRQL Span events, or Honeycomb breakdown groups) and hydrating, with every result re-verified against the exact ID requested.</sub><br>
+<sub>‡ Sentry and New Relic both have a native trace-lookup endpoint (unlike Datadog and Honeycomb), so `get_trace` calls it directly; `search_traces` still discovers candidate trace IDs via a span/NRQL search first, since both backends' search surface is itself span-centric.</sub><br>
 <sub>§ AWS X-Ray natively filters only service name, duration, and error/fault/throttle-derived status — OTel attributes (including all `gen_ai.*` fields) land in unindexed segment *metadata* by default, not indexed *annotations*, so they're always applied client-side rather than pushed down to `FilterExpression`.</sub><br>
-<sub>¶ `search_spans` reads `gen_ai.*` attributes directly off NRQL's well-documented flat row shape. `search_traces`/`get_trace` additionally rely on an unverified assumption about the shape of the `attributes` field inside NerdGraph's `distributedTracing.trace` response - `search_traces` overlays the original NRQL search row's attributes back onto the hydrated result specifically to degrade gracefully if that assumption turns out to be wrong; see the New Relic setup section above.</sub>
+<sub>¶ New Relic: `search_spans` reads `gen_ai.*` attributes directly off NRQL's well-documented flat row shape; `search_traces`/`get_trace` additionally rely on an unverified assumption about the shape of the `attributes` field inside NerdGraph's `distributedTracing.trace` response, mitigated by overlaying the original search row's attributes back onto the hydrated result. Honeycomb: `gen_ai.*` attributes are extracted via the same breakdown-column technique used for every other field (module docstring point 2), an equally unverified extraction method.</sub><br>
+<sub>♦ Honeycomb's entire "Search"/"Get trace by ID" row of checkmarks above depends on the Query Data API, which the research behind this backend found is documented as **Enterprise-plan exclusive** - a Free/Pro account may not be able to exercise any of this at all. See the Honeycomb setup section above.</sub>
 
 ### Key Tool Details
 
@@ -971,7 +992,7 @@ Both ideas that were previously listed here as deferred are now **shipped**:
 - Agent-native triage — tools that flag a likely root cause rather than just returning raw trace data: see `triage_trace` in the [Tools Reference](#tools-reference) above.
 - Cross-backend correlation — querying a second, independently-configured backend and correlating results against it: see `correlate_trace` above. This ships as a best-effort, heuristic correlation (direct `trace_id` match, or a time-window/service-overlap fallback) rather than a guaranteed schema-level join, per the research behind it — trace-id continuity across a vendor boundary is not guaranteed even under normal W3C Trace Context propagation.
 
-New Relic has since **shipped** as a 7th backend, built entirely from research/documentation without a live account to verify against — see the [New Relic setup section](#backend-specific-setup) for exactly what's unverified before relying on it in production. Beyond that, the next backend under research (not yet started): **Honeycomb**. (Grafana Cloud is not on this list — it already ships today via Tempo's Basic Auth path; see [Grafana Tempo](#backend-specific-setup) above.)
+New Relic and Honeycomb have since **shipped** as the 7th and 8th backends, both built entirely from research/documentation without a live account to verify against — see their own [setup sections](#backend-specific-setup) for exactly what's unverified before relying on either in production; Honeycomb in particular carries a real go/no-go risk (its programmatic Query Data API is documented as Enterprise-plan exclusive). There is no further backend currently under research. (Grafana Cloud was never on this list — it already ships today via Tempo's Basic Auth path; see [Grafana Tempo](#backend-specific-setup) above.)
 
 Carried over from upstream's older roadmap, re-prioritized behind the above rather than dropped: a dedicated model-vs-model comparison tool (today's `get_llm_model_stats` and `compare_time_windows` cover per-model stats and time-window diffing separately, but not a single tool that diffs two specific models directly), broader prompt-pattern analysis across templates rather than just version-over-version for one prompt (`get_prompt_version_stats` already covers the latter), MCP resources for common queries, and SigNoz/ClickHouse backend support. Cost calculation with built-in pricing tables and a query-result caching layer are **shipped**, not pending: every usage-reporting tool (e.g. `investigate_cost_spike` in the [Tools Reference](#tools-reference)) returns a `cost_usd`/`cost_usd_is_partial` pair backed by a vendored litellm pricing table (`src/opentelemetry_mcp/pricing/`), and query results are cached with in-flight request coalescing via the `QUERY_CACHE_TTL_SECONDS` env var (see the [configuration table](#all-configuration-options) above).
 

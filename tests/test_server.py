@@ -26,6 +26,7 @@ from opentelemetry_mcp import server
 from opentelemetry_mcp.attributes import HealthCheckResponse
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.datadog import DatadogBackend
+from opentelemetry_mcp.backends.honeycomb import HoneycombBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
 from opentelemetry_mcp.backends.newrelic import NewRelicBackend
 from opentelemetry_mcp.backends.sentry import SentryBackend
@@ -47,6 +48,7 @@ FAKE_SENTRY_ORG = "fake-org"
 FAKE_SENTRY_PROJECT = "fake-project"
 FAKE_TEMPO_INSTANCE_ID = "123456"
 FAKE_NEWRELIC_ACCOUNT_ID = "7654321"
+FAKE_HONEYCOMB_DATASET = "my-dataset"
 
 
 def _config(**overrides: object) -> ServerConfig:
@@ -83,7 +85,7 @@ def reset_server_globals() -> Generator[None]:
 
 
 class TestCreateBackend:
-    """_create_backend is a pure factory - verify each of the 7 backend
+    """_create_backend is a pure factory - verify each of the 8 backend
     types produces the right class with the right constructor args threaded
     through, plus the ValueError branch for an unsupported type."""
 
@@ -179,6 +181,21 @@ class TestCreateBackend:
         assert backend.api_key == FAKE_API_KEY
         assert backend.account_id == int(FAKE_NEWRELIC_ACCOUNT_ID)
         assert backend.timeout == 14.0
+
+    def test_honeycomb(self) -> None:
+        config = _config(
+            type="honeycomb",
+            url=HttpUrl("https://api.honeycomb.io"),
+            api_key=FAKE_API_KEY,
+            honeycomb_dataset=FAKE_HONEYCOMB_DATASET,
+            timeout=16.0,
+        )
+        backend = server._create_backend(config)
+
+        assert isinstance(backend, HoneycombBackend)
+        assert backend.api_key == FAKE_API_KEY
+        assert backend.dataset == FAKE_HONEYCOMB_DATASET
+        assert backend.timeout == 16.0
 
     def test_unsupported_backend_type_raises(self) -> None:
         config = _config(type="jaeger")
@@ -957,6 +974,7 @@ class TestMainCli:
             tempo_instance_id=FAKE_TEMPO_INSTANCE_ID,
             aws_region=None,
             newrelic_account_id=None,
+            honeycomb_dataset=None,
             environments="prd,staging",
             log_level=None,
             max_traces_per_query=None,
