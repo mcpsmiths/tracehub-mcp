@@ -186,10 +186,14 @@ jobs:
                     fi
                     # Any real HTTP response (curl's own %{http_code}, even
                     # a 4xx) proves uvicorn bound the port and the ASGI app
-                    # is serving - only "000" (curl's own sentinel for a
-                    # refused/timed-out connection) means it isn't up yet.
-                    status_code="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18000/mcp 2>/dev/null || echo 000)"
-                    if [ "$status_code" != "000" ]; then
+                    # is serving. Branch on curl's own exit status, not on
+                    # comparing the captured %{http_code} string against a
+                    # sentinel: curl still writes "000" via -w on a refused
+                    # connection *and* exits non-zero, so a naive `||
+                    # echo 000` fallback on top of that concatenates into
+                    # "000000" - which is != "000" and was wrongly treated
+                    # as a real status code (confirmed live in CI).
+                    if status_code="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18000/mcp 2>/dev/null)"; then
                       echo "HTTP transport is up and answering (got status ${status_code} from /mcp) after ${i} attempt(s)"
                       docker logs smoke-test
                       docker rm -f smoke-test
