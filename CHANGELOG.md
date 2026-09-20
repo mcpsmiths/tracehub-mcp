@@ -1,3 +1,14 @@
+## v0.12.1 (2026-09-20)
+
+### Fix
+
+- **ci**: skip the smoke-test's execution check on non-executable arches
+- **ci**: pin the smoke-test container's --platform explicitly
+- **ci**: scope the Trivy gate to actionable findings, fix 2 real CVEs
+- **ci**: stop the smoke-test step misreading a failed curl as success
+- **tests**: resolve mypy errors CI's stricter `mypy .` check caught
+- resolve 46 findings from a full-repo security/correctness audit
+
 ## v0.12.0 (2026-09-20)
 
 ### Feat
