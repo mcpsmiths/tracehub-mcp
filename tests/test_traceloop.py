@@ -516,8 +516,9 @@ class TestStartTimeIsUtcAware:
 
         spans = await backend.search_spans(SpanQuery(limit=10))
 
-        assert spans[0].start_time.tzinfo is not None
-        assert spans[0].start_time.utcoffset().total_seconds() == 0
+        offset = spans[0].start_time.utcoffset()
+        assert offset is not None
+        assert offset.total_seconds() == 0
 
     async def test_search_traces_root_span_start_time_is_utc_aware(self) -> None:
         # _convert_root_span_to_trace (used by both search_traces and
@@ -552,7 +553,9 @@ class TestStartTimeIsUtcAware:
 
         assert len(traces) == 1
         assert traces[0].start_time.tzinfo is not None
-        assert traces[0].start_time.utcoffset().total_seconds() == 0
+        offset = traces[0].start_time.utcoffset()
+        assert offset is not None
+        assert offset.total_seconds() == 0
 
 
 class TestGetTraceEscapesTraceId:

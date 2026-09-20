@@ -504,7 +504,7 @@ async def test_get_service_operations_escapes_service_name_in_query() -> None:
             captured_params.update(params or {})
             return _FakeResponse({"traces": []})
 
-    backend._client = _CapturingClient()
+    backend._client = _CapturingClient()  # type: ignore[assignment]
 
     malicious_service_name = 'x" || resource.service.name =~ ".*'
     await backend.get_service_operations(malicious_service_name)
@@ -580,7 +580,7 @@ async def test_search_traces_applies_unconvertible_status_filter_client_side() -
         async def get(self, url: str, *args: Any, **kwargs: Any) -> Any:
             return self._responses.pop(0)
 
-    backend._client = _SequencedClient()
+    backend._client = _SequencedClient()  # type: ignore[assignment]
 
     query = TraceQuery(
         limit=10,
@@ -616,7 +616,7 @@ async def test_get_trace_url_escapes_trace_id() -> None:
             captured_urls.append(url)
             return _FakeResponse(_minimal_otlp_trace("deadbeef", status_code=1))
 
-    backend._client = _CapturingClient()
+    backend._client = _CapturingClient()  # type: ignore[assignment]
 
     await backend.get_trace(malicious_trace_id)
 
@@ -648,7 +648,7 @@ async def test_search_traces_escapes_trace_id_from_search_result_in_fetch_url() 
                 return _FakeResponse({"traces": [{"traceID": tricky_trace_id}]})
             return _FakeResponse(_minimal_otlp_trace(tricky_trace_id, status_code=1))
 
-    backend._client = _CapturingClient()
+    backend._client = _CapturingClient()  # type: ignore[assignment]
 
     await backend.search_traces(TraceQuery(limit=10))
 
@@ -674,7 +674,7 @@ async def test_search_traces_raises_when_all_trace_fetches_fail() -> None:
                 return _FakeResponse({"traces": [{"traceID": "aaaa"}, {"traceID": "bbbb"}]})
             raise httpx.ConnectError("connection refused")
 
-    backend._client = _AllFetchesFailClient()
+    backend._client = _AllFetchesFailClient()  # type: ignore[assignment]
 
     with pytest.raises(RuntimeError, match="per-trace fetch"):
         await backend.search_traces(TraceQuery(limit=10))
@@ -697,7 +697,7 @@ async def test_search_spans_raises_when_all_trace_fetches_fail() -> None:
                 return _FakeResponse({"traces": [{"traceID": "aaaa"}, {"traceID": "bbbb"}]})
             raise httpx.ConnectError("connection refused")
 
-    backend._client = _AllFetchesFailClient()
+    backend._client = _AllFetchesFailClient()  # type: ignore[assignment]
 
     with pytest.raises(RuntimeError, match="per-trace fetch"):
         await backend.search_spans(SpanQuery(limit=10))

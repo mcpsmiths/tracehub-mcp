@@ -880,6 +880,7 @@ class TestRunSearchDynamicBreakdowns:
         )
 
         backend._run_query.assert_awaited_once()
+        assert backend._run_query.await_args is not None
         breakdowns = backend._run_query.await_args.kwargs["breakdowns"]
         assert "gen_ai.request.temperature" in breakdowns
 
@@ -901,6 +902,7 @@ class TestRunSearchDynamicBreakdowns:
             limit=10,
         )
 
+        assert backend._run_query.await_args is not None
         breakdowns = backend._run_query.await_args.kwargs["breakdowns"]
         assert breakdowns.count("service.name") == 1
 
