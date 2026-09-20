@@ -3,8 +3,10 @@
 import base64
 import json
 import logging
-from datetime import datetime
+import re
+from datetime import UTC, datetime
 from typing import Any, Literal
+from urllib.parse import quote
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes, SpanEvent
 from opentelemetry_mcp.backends.base import BaseBackend
@@ -20,6 +22,17 @@ from opentelemetry_mcp.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A mapped TraceQL span-attribute field name must look like a plain dotted
+# identifier. Filter.field (models.py) is an unvalidated `str` reachable from
+# any MCP tool call, and unlike the filter *value* (escaped via
+# `_escape_traceql_value`), the field name is spliced directly into the
+# query in `_filter_to_traceql`'s span-attribute branch - so a field like
+# `x" || resource.service.name =~ ".*` would inject arbitrary structure into
+# the query. Reject anything that doesn't match this allowlist pattern
+# instead (mirrors datadog.py's `_VALID_DD_FIELD_RE` / sentry.py's
+# `_VALID_SENTRY_FIELD_RE`).
+_VALID_TRACEQL_FIELD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
 
 
 class TempoBackend(BaseBackend):
@@ -100,6 +113,8 @@ class TempoBackend(BaseBackend):
 
         Raises:
             httpx.HTTPError: If API request fails
+            RuntimeError: If every per-trace hydration fetch fails (likely a
+                Tempo outage rather than a genuine "no traces matched" result)
         """
         # Get all filters (converted + explicit)
         all_filters = query.get_all_filters()
@@ -109,14 +124,22 @@ class TempoBackend(BaseBackend):
         native_filters = [f for f in all_filters if f.operator in supported_operators]
         client_filters = [f for f in all_filters if f.operator not in supported_operators]
 
+        # Build TraceQL query from native filters. A filter's operator can be
+        # globally "native" per get_supported_operators() (e.g. NOT_EQUALS)
+        # yet still fail to convert for its specific field/value (e.g.
+        # status NOT_EQUALS some value other than "ERROR"/"OK") -
+        # reclassify those as client-side too, instead of letting
+        # _filter_to_traceql silently drop them from the query with no
+        # warning and no fallback.
+        traceql, unconvertible_filters = self._build_traceql_from_filters(native_filters, query)
+        client_filters = client_filters + unconvertible_filters
+
         if client_filters:
             logger.info(
                 f"Will apply {len(client_filters)} filters client-side: "
                 f"{[f.operator.value for f in client_filters]}"
             )
 
-        # Build TraceQL query from native filters
-        traceql = self._build_traceql_from_filters(native_filters, query)
         logger.debug(f"Executing TraceQL: {traceql}")
 
         params: dict[str, str | int] = {"q": traceql, "limit": query.limit}
@@ -153,18 +176,38 @@ class TempoBackend(BaseBackend):
                 f"results to avoid excessive API calls"
             )
 
+        attempted_fetches = 0
+        failed_fetches = 0
+        last_fetch_error: Exception | None = None
+
         for trace_result in trace_results[:max_traces_to_fetch]:
             trace_id = trace_result.get("traceID")
             if trace_id:
+                attempted_fetches += 1
                 try:
-                    trace_response = await self.client.get(f"/api/traces/{trace_id}")
+                    trace_response = await self.client.get(
+                        f"/api/traces/{quote(trace_id, safe='')}"
+                    )
                     trace_response.raise_for_status()
                     trace_data = trace_response.json()
                     trace = self._parse_tempo_trace(trace_data, trace_id_hex=trace_id)
                     if trace:
                         traces.append(trace)
                 except Exception as e:
+                    failed_fetches += 1
+                    last_fetch_error = e
                     logger.warning(f"Failed to fetch trace {trace_id}: {e}")
+
+        # A total outage of /api/traces/{id} (while /api/search still works)
+        # must not look identical to a genuine "no traces matched" result -
+        # if every attempted per-trace fetch failed, surface it as an error
+        # instead of silently returning an empty list.
+        if attempted_fetches > 0 and failed_fetches == attempted_fetches:
+            raise RuntimeError(
+                f"All {attempted_fetches} per-trace fetch(es) to Tempo's "
+                "/api/traces/{trace_id} endpoint failed - this looks like a "
+                "Tempo outage, not a genuine 'no traces matched' result"
+            ) from last_fetch_error
 
         # Apply client-side filters
         if client_filters:
@@ -186,6 +229,8 @@ class TempoBackend(BaseBackend):
 
         Raises:
             httpx.HTTPError: If API request fails
+            RuntimeError: If every per-trace hydration fetch fails (likely a
+                Tempo outage rather than a genuine "no traces matched" result)
         """
         # Get all filters (converted + explicit)
         all_filters = query.get_all_filters()
@@ -214,12 +259,6 @@ class TempoBackend(BaseBackend):
         ]
         client_filters = [f for f in all_filters if f not in native_filters]
 
-        if client_filters:
-            logger.info(
-                f"Will apply {len(client_filters)} span filters client-side: "
-                f"{[(f.field, f.operator.value) for f in client_filters]}"
-            )
-
         # Build TraceQL query from native filters
         # Convert SpanQuery to TraceQuery for TraceQL building
         trace_query = TraceQuery(
@@ -238,7 +277,20 @@ class TempoBackend(BaseBackend):
             filters=query.filters,
         )
 
-        traceql = self._build_traceql_from_filters(native_filters, trace_query)
+        # See search_traces for why a globally-"native" operator can still
+        # fail to convert for a specific field/value and must fall back to
+        # client-side filtering rather than being silently dropped.
+        traceql, unconvertible_filters = self._build_traceql_from_filters(
+            native_filters, trace_query
+        )
+        client_filters = client_filters + unconvertible_filters
+
+        if client_filters:
+            logger.info(
+                f"Will apply {len(client_filters)} span filters client-side: "
+                f"{[(f.field, f.operator.value) for f in client_filters]}"
+            )
+
         logger.debug(f"Executing TraceQL for spans: {traceql}")
 
         params: dict[str, str | int] = {"q": traceql, "limit": trace_query.limit}
@@ -274,18 +326,36 @@ class TempoBackend(BaseBackend):
             )
 
         all_spans: list[SpanData] = []
+        attempted_fetches = 0
+        failed_fetches = 0
+        last_fetch_error: Exception | None = None
+
         for trace_result in trace_results[:max_traces_to_fetch]:
             trace_id = trace_result.get("traceID")
             if trace_id:
+                attempted_fetches += 1
                 try:
-                    trace_response = await self.client.get(f"/api/traces/{trace_id}")
+                    trace_response = await self.client.get(
+                        f"/api/traces/{quote(trace_id, safe='')}"
+                    )
                     trace_response.raise_for_status()
                     trace_data = trace_response.json()
                     trace = self._parse_tempo_trace(trace_data, trace_id_hex=trace_id)
                     if trace:
                         all_spans.extend(trace.spans)
                 except Exception as e:
+                    failed_fetches += 1
+                    last_fetch_error = e
                     logger.warning(f"Failed to fetch trace {trace_id}: {e}")
+
+        # See search_traces for why an all-failed per-trace hydration must
+        # raise rather than silently returning an empty span list.
+        if attempted_fetches > 0 and failed_fetches == attempted_fetches:
+            raise RuntimeError(
+                f"All {attempted_fetches} per-trace fetch(es) to Tempo's "
+                "/api/traces/{trace_id} endpoint failed - this looks like a "
+                "Tempo outage, not a genuine 'no traces matched' result"
+            ) from last_fetch_error
 
         # Apply client-side filters to spans
         if client_filters:
@@ -296,7 +366,11 @@ class TempoBackend(BaseBackend):
 
     async def get_trace(self, trace_id: str) -> TraceData:
         """Get a specific trace by ID from Tempo."""
-        response = await self.client.get(f"/api/traces/{trace_id}")
+        # trace_id is an unvalidated MCP tool argument and is a URL *path*
+        # segment here - path-escape it before interpolating (mirrors
+        # sentry.py's identical quote(trace_id, safe="") at its own
+        # /trace/{id}/ path-segment call site).
+        response = await self.client.get(f"/api/traces/{quote(trace_id, safe='')}")
         response.raise_for_status()
         data = response.json()
         # Pass trace_id_hex to ensure consistent trace ID format (hex instead of base64)
@@ -360,8 +434,13 @@ class TempoBackend(BaseBackend):
         """
         logger.debug(f"Getting operations for service: {service_name}")
 
-        # Use TraceQL to find operations
-        traceql = f'{{ resource.service.name = "{service_name}" }}'
+        # Use TraceQL to find operations. service_name is an unvalidated MCP
+        # tool argument - escape it before interpolating into the query
+        # value (mirrors datadog.py's/sentry.py's _escape_dd_query_value/
+        # _escape_sentry_query_value at their own get_service_operations
+        # call sites) so a crafted value can't inject additional TraceQL
+        # structure.
+        traceql = f'{{ resource.service.name = "{self._escape_traceql_value(service_name)}" }}'
         params: dict[str, str | int] = {"q": traceql, "limit": 100}
 
         response = await self.client.get("/api/search", params=params)
@@ -369,11 +448,16 @@ class TempoBackend(BaseBackend):
 
         data = response.json()
 
-        # Extract unique operation names
+        # Extract unique operation names. The query above matches if
+        # service_name appears ANYWHERE in the trace (any span), not just at
+        # the root - so unconditionally trusting rootServiceName/
+        # rootTraceName would misattribute another service's root operation
+        # to this one. Only count a trace's root operation when its actual
+        # root service matches the one being queried.
         operations = set()
         trace_results = data if isinstance(data, list) else data.get("traces", [])
         for trace_result in trace_results:
-            if "rootServiceName" in trace_result:
+            if trace_result.get("rootServiceName") == service_name:
                 operations.add(trace_result.get("rootTraceName", ""))
 
         return list(operations)
@@ -405,7 +489,9 @@ class TempoBackend(BaseBackend):
                 error=str(e),
             )
 
-    def _build_traceql_from_filters(self, filters: list[Filter], query: TraceQuery) -> str:
+    def _build_traceql_from_filters(
+        self, filters: list[Filter], query: TraceQuery
+    ) -> tuple[str, list[Filter]]:
         """Build TraceQL query from Filter objects.
 
         Args:
@@ -413,21 +499,53 @@ class TempoBackend(BaseBackend):
             query: Original query (for time range)
 
         Returns:
-            TraceQL query string
+            Tuple of (TraceQL query string, filters that could not be
+            converted to a TraceQL condition). A filter's operator can be
+            globally "native" per get_supported_operators() yet still be
+            unconvertible for its specific field/value (see
+            _filter_to_traceql's status handling) - callers must apply the
+            returned filters client-side instead of treating them as
+            silently dropped.
         """
         conditions = []
+        unconvertible: list[Filter] = []
 
         for filter_obj in filters:
             condition = self._filter_to_traceql(filter_obj)
             if condition:
                 conditions.append(condition)
+            else:
+                unconvertible.append(filter_obj)
 
         # If no filters, match all traces
         if not conditions:
-            return "{}"
+            return "{}", unconvertible
 
         # Combine with AND logic
-        return "{ " + " && ".join(conditions) + " }"
+        return "{ " + " && ".join(conditions) + " }", unconvertible
+
+    def _escape_traceql_value(self, value: str) -> str:
+        """Escape a value for safe interpolation into a double-quoted
+        TraceQL string literal.
+
+        Mirrors the Datadog/Sentry backends' query-value escaping
+        (_escape_dd_query_value/_escape_sentry_query_value) - Filter.value
+        (and, for get_service_operations, service_name) is an unvalidated
+        value reachable from any MCP tool call and is otherwise spliced
+        unescaped into a quoted TraceQL string, so a crafted value like
+        `x" || resource.service.name =~ ".*` could break out of the
+        intended condition and inject arbitrary TraceQL structure. Always
+        escapes backslashes before quotes (in that order), so an escaped
+        quote isn't itself un-escaped by a trailing backslash.
+
+        Args:
+            value: Raw string value to interpolate
+
+        Returns:
+            The value with backslashes and double quotes escaped, ready to
+            be wrapped in the surrounding double quotes by the caller
+        """
+        return value.replace("\\", "\\\\").replace('"', '\\"')
 
     def _filter_to_traceql(self, filter_obj: Filter) -> str | None:
         """Convert a single Filter to TraceQL condition.
@@ -457,21 +575,45 @@ class TempoBackend(BaseBackend):
                     return "status = error"
                 elif value == "OK":
                     return "status = ok"
+            elif operator == FilterOperator.NOT_EQUALS:
+                # has_error=False (models.py's _convert_params_to_filters)
+                # produces exactly this NOT_EQUALS "ERROR" filter - map it
+                # to the TraceQL negation of the EQUALS condition above,
+                # matching that equivalent, rather than falling through to
+                # `return None` below (which used to drop the filter
+                # silently: search_traces(has_error=False) returned
+                # unfiltered results with no warning, as if the filter
+                # never existed).
+                if value == "ERROR":
+                    return "status != error"
+                elif value == "OK":
+                    return "status != ok"
+            # Any other operator, or an unrecognized status value, is
+            # genuinely unhandled here - returning None (rather than
+            # guessing) lets _build_traceql_from_filters reclassify this
+            # filter as client-side instead of silently dropping it.
             return None
         else:
-            # Assume it's a span attribute
+            # Assume it's a span attribute. Reject a field name that isn't a
+            # plain dotted identifier instead of interpolating it unchecked
+            # (see _VALID_TRACEQL_FIELD_RE).
+            if not _VALID_TRACEQL_FIELD_RE.match(field):
+                logger.warning(
+                    f"Rejecting filter with unsafe/invalid TraceQL field name: {field!r}"
+                )
+                return None
             traceql_field = f"span.{field}"
 
         # Build condition based on operator
         if operator == FilterOperator.EQUALS:
             if filter_obj.value_type == FilterType.STRING:
-                return f'{traceql_field} = "{value}"'
+                return f'{traceql_field} = "{self._escape_traceql_value(str(value))}"'
             else:
                 return f"{traceql_field} = {value}"
 
         elif operator == FilterOperator.NOT_EQUALS:
             if filter_obj.value_type == FilterType.STRING:
-                return f'{traceql_field} != "{value}"'
+                return f'{traceql_field} != "{self._escape_traceql_value(str(value))}"'
             else:
                 return f"{traceql_field} != {value}"
 
@@ -496,15 +638,24 @@ class TempoBackend(BaseBackend):
             return f"{traceql_field} <= {value}"
 
         elif operator == FilterOperator.CONTAINS:
-            # Use regex for contains
-            return f'{traceql_field} =~ ".*{value}.*"'
+            # Use regex for contains. Escape regex metacharacters in the
+            # value first, so a literal character like '.' in "gpt-4.5"
+            # matches literally rather than "any character" (CONTAINS is
+            # documented as a substring match, not a regex match), then
+            # escape the result for safe interpolation into the surrounding
+            # double-quoted TraceQL string literal - the same two-layer
+            # escaping as the EQUALS/NOT_EQUALS string branches above.
+            escaped_value = self._escape_traceql_value(re.escape(str(value)))
+            return f'{traceql_field} =~ ".*{escaped_value}.*"'
 
         elif operator == FilterOperator.IN:
             # Build OR condition
             if not values:
                 return None
             if filter_obj.value_type == FilterType.STRING:
-                or_conditions = [f'{traceql_field} = "{v}"' for v in values]
+                or_conditions = [
+                    f'{traceql_field} = "{self._escape_traceql_value(str(v))}"' for v in values
+                ]
             else:
                 or_conditions = [f"{traceql_field} = {v}" for v in values]
             return "(" + " || ".join(or_conditions) + ")"
@@ -535,7 +686,8 @@ class TempoBackend(BaseBackend):
         if not filters:
             # Empty query - match all traces
             return "{}"
-        return self._build_traceql_from_filters(filters, query)
+        traceql, _unconvertible_filters = self._build_traceql_from_filters(filters, query)
+        return traceql
 
     def _parse_tempo_trace(
         self, trace_data: dict[str, Any], trace_id_hex: str | None = None
@@ -640,7 +792,7 @@ class TempoBackend(BaseBackend):
             start_time_ns = int(span_data.get("startTimeUnixNano", 0))
             end_time_ns = int(span_data.get("endTimeUnixNano", 0))
 
-            start_time = datetime.fromtimestamp(start_time_ns / 1_000_000_000)
+            start_time = datetime.fromtimestamp(start_time_ns / 1_000_000_000, tz=UTC)
             duration_ns = end_time_ns - start_time_ns
             duration_ms = duration_ns / 1_000_000
 

@@ -2266,13 +2266,13 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = ">=4.14.2" },
-    { name = "boto3", specifier = ">=1.40,<2" },
+    { name = "boto3", specifier = ">=1.43.97,<2" },
     { name = "click", specifier = ">=8.3,<8.6" },
     { name = "fastmcp", specifier = ">=4.0.5,<4.1" },
     { name = "httpx", specifier = "~=0.28.0" },
-    { name = "mcp", specifier = ">=2.0,<3" },
-    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.30,<2" },
-    { name = "opentelemetry-sdk", specifier = ">=1.30,<2" },
+    { name = "mcp", specifier = ">=2.2.0,<3" },
+    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.44.0,<2" },
+    { name = "opentelemetry-sdk", specifier = ">=1.44.0,<2" },
     { name = "opentelemetry-semantic-conventions", specifier = ">=0.60b0" },
     { name = "opentelemetry-semantic-conventions-ai", specifier = ">=0.4.13" },
     { name = "pydantic", specifier = ">=2.12,<2.14" },

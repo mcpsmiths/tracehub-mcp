@@ -174,6 +174,44 @@ class TestBuildDatadogQuery:
         )
         assert backend._filter_to_dd_query(f) == '-@gen_ai.system:"openai"'
 
+    def test_equals_boolean_true_emits_bare_literal(self) -> None:
+        """Regression test: bool is an int subclass in Python, so
+        isinstance(value, int | float) matched a bool before the scale
+        multiplication demoted it to a plain int - producing
+        @gen_ai.request.is_streaming:"1" (quoted string "1") instead of
+        Datadog's bare true boolean literal syntax, per CLAUDE.md's own
+        documented boolean filter example. That would never match the
+        actual boolean-literal attribute value in a real query."""
+        backend = _backend()
+        f = Filter(
+            field="gen_ai.request.is_streaming",
+            operator=FilterOperator.EQUALS,
+            value=True,
+            value_type=FilterType.BOOLEAN,
+        )
+        assert backend._filter_to_dd_query(f) == "@gen_ai.request.is_streaming:true"
+
+    def test_equals_boolean_false_emits_bare_literal(self) -> None:
+        backend = _backend()
+        f = Filter(
+            field="gen_ai.request.is_streaming",
+            operator=FilterOperator.EQUALS,
+            value=False,
+            value_type=FilterType.BOOLEAN,
+        )
+        assert backend._filter_to_dd_query(f) == "@gen_ai.request.is_streaming:false"
+
+    def test_not_equals_boolean_emits_bare_literal(self) -> None:
+        """Same bool-coercion bug as EQUALS, but in the NOT_EQUALS branch."""
+        backend = _backend()
+        f = Filter(
+            field="gen_ai.request.is_streaming",
+            operator=FilterOperator.NOT_EQUALS,
+            value=True,
+            value_type=FilterType.BOOLEAN,
+        )
+        assert backend._filter_to_dd_query(f) == "-@gen_ai.request.is_streaming:true"
+
     def test_status_error_equals(self) -> None:
         backend = _backend()
         f = Filter(
@@ -270,6 +308,41 @@ class TestBuildDatadogQuery:
         )
         assert backend._filter_to_dd_query(f) == (
             '(@gen_ai.system:"openai" OR @gen_ai.system:"anthropic")'
+        )
+
+    def test_in_converts_duration_values_ms_to_ns(self) -> None:
+        """Regression test: unlike EQUALS/NOT_EQUALS/GT/GTE/LT/LTE, the IN
+        operator never applied the ms->ns scale conversion for @duration,
+        so a filter intended as 1000ms/5000ms (this codebase's ms
+        convention) was interpolated as literal "1000"/"5000", which
+        Datadog reads as nanoseconds - off by a factor of 1,000,000."""
+        backend = _backend()
+        f = Filter(
+            field="duration",
+            operator=FilterOperator.IN,
+            values=[1000, 5000],
+            value_type=FilterType.NUMBER,
+        )
+        assert backend._filter_to_dd_query(f) == (
+            '(@duration:"1000000000" OR @duration:"5000000000")'
+        )
+
+    def test_in_boolean_values_emit_bare_literals(self) -> None:
+        """Regression test: the IN operator's value formatting never had
+        the EQUALS/NOT_EQUALS bool guard - isinstance(True, int | float) is
+        True (bool is an int subclass), so a boolean value list was demoted
+        to quoted "1"/"0" strings instead of Datadog's bare true/false
+        boolean literal syntax, the exact same class of bug EQUALS/
+        NOT_EQUALS were fixed for."""
+        backend = _backend()
+        f = Filter(
+            field="gen_ai.request.is_streaming",
+            operator=FilterOperator.IN,
+            values=[True, False],
+            value_type=FilterType.BOOLEAN,
+        )
+        assert backend._filter_to_dd_query(f) == (
+            "(@gen_ai.request.is_streaming:true OR @gen_ai.request.is_streaming:false)"
         )
 
     def test_build_dd_query_empty_defaults_to_wildcard(self) -> None:

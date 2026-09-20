@@ -21,18 +21,20 @@ _BASE_TIME = datetime(2024, 1, 1, tzinfo=UTC)
 def _span(
     span_id: str,
     *,
+    parent_span_id: str | None = None,
     service_name: str = "svc-a",
     status: Literal["OK", "ERROR", "UNSET"] = "OK",
+    duration_ms: float = 100.0,
     attributes: dict[str, Any] | None = None,
 ) -> SpanData:
     return SpanData(
         trace_id="t1",
         span_id=span_id,
-        parent_span_id=None,
+        parent_span_id=parent_span_id,
         operation_name=f"op-{span_id}",
         service_name=service_name,
         start_time=_BASE_TIME,
-        duration_ms=100.0,
+        duration_ms=duration_ms,
         status=status,
         attributes=SpanAttributes.model_validate(attributes or {}),
     )
@@ -148,6 +150,26 @@ class TestRootCauseConsistency:
         result = await correlate_trace(primary, secondary, "t1")
 
         assert result.matches[0].root_cause_consistent is False
+
+
+class TestUnreachableErrorDetection:
+    async def test_error_in_a_disconnected_cycle_is_still_detected(self) -> None:
+        # a's parent is b and b's parent is a - both present, so no
+        # root-first walk (including find_all_error_chains from a real
+        # root) can discover this cluster at all. Before this fix,
+        # _error_signal would report has_error=False for a trace that
+        # genuinely contains an ERROR span.
+        root = _span("root", service_name="svc-a", status="OK")
+        a = _span("a", parent_span_id="b", service_name="svc-a", status="ERROR")
+        b = _span("b", parent_span_id="a", service_name="svc-a", status="OK")
+        primary = _backend()
+        primary.get_trace.return_value = _trace([root, a, b])
+        secondary = _backend()
+        secondary.get_trace.return_value = _trace([_span("s1", service_name="svc-a", status="OK")])
+
+        result = await correlate_trace(primary, secondary, "t1")
+
+        assert result.matches[0].root_cause_consistent is False  # primary errors, secondary doesn't
 
 
 class TestHeuristicFallback:

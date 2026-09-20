@@ -19,6 +19,7 @@ import httpx
 import pytest
 
 from opentelemetry_mcp.backends.honeycomb import (
+    _MAX_QUERY_ROWS,
     HoneycombBackend,
     HoneycombEnterpriseRequiredError,
     _RateLimiter,
@@ -850,3 +851,118 @@ class TestRunQueryFullFlow:
 
         assert len(result) == 1
         assert result[0].span_id == "s1"
+
+
+class TestRunSearchDynamicBreakdowns:
+    """Regression for the fix described in _run_search's own docstring:
+    filtering on an attribute outside the fixed _SEARCH_BREAKDOWNS/
+    _GEN_AI_BREAKDOWNS allowlist (e.g. gen_ai.request.temperature) must
+    still get that column back in the result rows, since Honeycomb's Query
+    API only ever returns data for columns actually requested as
+    breakdowns - regardless of what the server-side filter matched on."""
+
+    async def test_filter_on_non_breakdown_column_is_added_to_breakdowns(self) -> None:
+        backend = _backend()
+        backend._run_query = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        await backend._run_search(
+            [
+                Filter(
+                    field="gen_ai.request.temperature",
+                    operator=FilterOperator.GT,
+                    value=0.5,
+                    value_type=FilterType.NUMBER,
+                )
+            ],
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 2, tzinfo=UTC),
+            limit=10,
+        )
+
+        backend._run_query.assert_awaited_once()
+        breakdowns = backend._run_query.await_args.kwargs["breakdowns"]
+        assert "gen_ai.request.temperature" in breakdowns
+
+    async def test_filter_on_already_present_breakdown_column_is_not_duplicated(self) -> None:
+        backend = _backend()
+        backend._run_query = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        await backend._run_search(
+            [
+                Filter(
+                    field="service.name",
+                    operator=FilterOperator.EQUALS,
+                    value="svc",
+                    value_type=FilterType.STRING,
+                )
+            ],
+            datetime(2024, 1, 1, tzinfo=UTC),
+            datetime(2024, 1, 2, tzinfo=UTC),
+            limit=10,
+        )
+
+        breakdowns = backend._run_query.await_args.kwargs["breakdowns"]
+        assert breakdowns.count("service.name") == 1
+
+    async def test_dynamically_added_breakdown_column_surfaces_in_parsed_span(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
+        """End-to-end: the extra breakdown column must actually come back
+        on the row and land in SpanData.attributes, not just be present in
+        the outgoing query spec."""
+        backend = _backend()
+        row = _query_row("t1", "s1", **{"gen_ai.request.temperature": 0.7})
+        backend._client = fake_json_client(
+            {"id": "query-1"},
+            {"id": "result-1"},
+            {"complete": True, "data": {"results": [row]}},
+        )
+
+        result = await backend.search_spans(
+            SpanQuery(
+                limit=10,
+                filters=[
+                    Filter(
+                        field="gen_ai.request.temperature",
+                        operator=FilterOperator.GT,
+                        value=0.5,
+                        value_type=FilterType.NUMBER,
+                    )
+                ],
+            )
+        )
+
+        assert len(result) == 1
+        assert result[0].attributes.gen_ai_request_temperature == 0.7
+
+
+class TestBatchFetchTraceRowsCapWarning:
+    """Regression: a trace that loses only SOME (not all) of its spans to
+    the _MAX_QUERY_ROWS hydration cap previously had no warning signal -
+    only a trace that lost every span was caught elsewhere (as "no spans
+    found"). A partially-truncated trace can silently look healthy (missing
+    error span) or faster than it was (missing longest span)."""
+
+    async def test_hitting_the_row_cap_logs_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend = _backend()
+        backend._run_search = AsyncMock(  # type: ignore[method-assign]
+            return_value=[_query_row("t1", f"s{i}") for i in range(_MAX_QUERY_ROWS)]
+        )
+
+        with caplog.at_level("WARNING"):
+            await backend._batch_fetch_trace_rows(["t1"])
+
+        assert any(
+            "maximum" in r.message and str(_MAX_QUERY_ROWS) in r.message for r in caplog.records
+        )
+
+    async def test_below_the_cap_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        backend = _backend()
+        backend._run_search = AsyncMock(return_value=[_query_row("t1", "s1")])  # type: ignore[method-assign]
+
+        with caplog.at_level("WARNING"):
+            await backend._batch_fetch_trace_rows(["t1"])
+
+        assert caplog.records == []

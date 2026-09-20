@@ -29,10 +29,30 @@ class TTLCoalescingCache:
         self._entries: dict[Hashable, tuple[float, Any]] = {}
         self._inflight: dict[Hashable, asyncio.Future[Any]] = {}
         self._lock = asyncio.Lock()
+        self._last_swept = self._clock()
+
+    def _sweep_expired_locked(self, now: float) -> None:
+        """Drop expired entries. Caller must already hold self._lock.
+
+        Amortized rather than per-call: an entry that's simply never
+        queried again after expiry would otherwise sit in `_entries`
+        forever (only a hit on the exact same key ever replaces it), an
+        unbounded-growth risk for a long-running server with a large or
+        ever-changing key space (e.g. one key per distinct search filter
+        combination). Runs at most once per ttl_seconds, not on every call,
+        so this stays O(1) amortized rather than O(len(_entries)) per call.
+        """
+        if now - self._last_swept < self._ttl_seconds:
+            return
+        self._last_swept = now
+        expired = [key for key, (expires_at, _) in self._entries.items() if expires_at <= now]
+        for key in expired:
+            del self._entries[key]
 
     async def get_or_compute(self, key: Hashable, compute: Callable[[], Awaitable[Any]]) -> Any:
         now = self._clock()
         async with self._lock:
+            self._sweep_expired_locked(now)
             cached = self._entries.get(key)
             if cached is not None and cached[0] > now:
                 return cached[1]
@@ -55,7 +75,20 @@ class TTLCoalescingCache:
 
         try:
             result = await compute()
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
+            # asyncio.CancelledError is a BaseException, not an Exception,
+            # since Python 3.8 - `except Exception` alone would silently
+            # skip this whole block for a cancelled leader (e.g. an MCP
+            # request cancelled by the client, or a timeout), leaving
+            # `future` forever pending and `key` forever in `_inflight`.
+            # Every follower already coalesced onto it (line 54's `await
+            # future`) - and every future caller, since the poisoned entry
+            # is never popped - would then hang indefinitely on this exact
+            # key. Explicitly catching it here (rather than bare
+            # `BaseException`, which would also swallow SystemExit/
+            # KeyboardInterrupt) ensures followers instead see the same
+            # CancelledError propagate into their own await, an honest
+            # "this shared computation never completed" outcome.
             future.set_exception(exc)
             future.exception()  # mark retrieved: avoids an "exception never
             # retrieved" asyncio warning when no coalesced caller ever
@@ -70,5 +103,11 @@ class TTLCoalescingCache:
             future.set_result(result)
             return result
 
-    def clear(self) -> None:
-        self._entries.clear()
+    async def clear(self) -> None:
+        # Every other read/write of _entries/_inflight in this class holds
+        # self._lock first - clear() skipping it could interleave with a
+        # concurrent get_or_compute() call and drop an entry that call is
+        # mid-write into (e.g. clear() during shutdown racing a request
+        # that's still in flight).
+        async with self._lock:
+            self._entries.clear()

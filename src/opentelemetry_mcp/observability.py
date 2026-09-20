@@ -267,8 +267,21 @@ class McpServerTracingMiddleware(Middleware):
                 ]
 
         start_time = time.perf_counter()
+        # record_exception/set_status_on_exception=False: the SDK's own
+        # default behavior on an exception propagating out of this `with`
+        # block is to add an "exception" span event AND overwrite the
+        # span's status - both built from the raw, unredacted
+        # str(exception) - which would silently undo _record_error's own
+        # redacted Status() below the moment the caught exception is
+        # re-raised. _record_error already sets error.type and a redacted
+        # Status for every failure, so the SDK's own duplicate, unredacted
+        # write must be disabled rather than just outrun.
         with self._tracer.start_as_current_span(
-            span_name, kind=SpanKind.SERVER, attributes=attributes
+            span_name,
+            kind=SpanKind.SERVER,
+            attributes=attributes,
+            record_exception=False,
+            set_status_on_exception=False,
         ) as span:
             try:
                 result = await call_next(context)
@@ -296,7 +309,12 @@ class McpServerTracingMiddleware(Middleware):
     @staticmethod
     def _record_error(span: Span, error: Exception) -> None:
         span.set_attribute("error.type", type(error).__name__)
-        span.set_status(Status(StatusCode.ERROR, str(error)))
+        # Unlike gen_ai.tool.call.arguments/.result, this runs
+        # unconditionally on every failed tool call regardless of
+        # include_args - so the exception message must always be
+        # redacted, not just gated behind that flag, since a backend can
+        # raise with a credential-shaped string embedded in its message.
+        span.set_status(Status(StatusCode.ERROR, _redact_secrets(str(error))))
 
     @staticmethod
     def _session_id(context: MiddlewareContext[Any]) -> str | None:

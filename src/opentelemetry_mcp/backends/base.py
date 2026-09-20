@@ -398,8 +398,21 @@ class BaseBackend(ABC):
 
     async def close(self) -> None:
         """Close HTTP client connections."""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        while self._client is not None:
+            client_to_close = self._client
+            await client_to_close.aclose()
+            # httpx flips is_closed to True synchronously as the very
+            # first line inside aclose(), before the real await below it -
+            # a concurrent caller of the `client` property (a sync getter,
+            # so it can't take a lock against this async method) can
+            # observe that flag mid-close, build a replacement client, and
+            # assign it to self._client while we're still awaiting. Only
+            # clear self._client if it's still the exact object we just
+            # closed; otherwise a replacement snuck in - loop and close
+            # that one too, rather than silently overwriting the
+            # reference and leaking an open client that never gets closed.
+            if self._client is client_to_close:
+                self._client = None
+                break
         if self._query_cache is not None:
-            self._query_cache.clear()
+            await self._query_cache.clear()

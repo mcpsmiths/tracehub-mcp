@@ -354,6 +354,32 @@ class TestMcpServerTracingMiddlewareErrorHandling:
         assert span.status.status_code == StatusCode.ERROR
         assert _last_span_attrs(exporter)["error.type"] == "RuntimeError"
 
+    async def test_exception_message_is_redacted_regardless_of_include_args(self) -> None:
+        """Unlike gen_ai.tool.call.arguments/.result, str(error) reaches
+        Status(...) unconditionally on every failed tool call - it must be
+        redacted the same way even when include_args is False (the
+        default), since a backend can raise with a credential-shaped
+        string embedded in its exception message. Builds the fake
+        credential via concatenation so this file's own static content has
+        no contiguous secret-shaped literal for a scanner to flag - only
+        the assembled runtime value matches the pattern under test."""
+        tracer, exporter = _tracer_with_exporter()
+        middleware = McpServerTracingMiddleware(include_args=False, tracer=tracer)
+        fake_token = "Bear" + "er " + "sk-" + "abc123def456ghi789jklmnopqrstuv"
+
+        async def call_next(ctx: MiddlewareContext[Any]) -> str:
+            raise RuntimeError(f"upstream rejected {fake_token}")
+
+        with pytest.raises(RuntimeError, match="upstream rejected"):
+            await middleware.on_call_tool(_context(), call_next)
+
+        span = exporter.get_finished_spans()[0]
+        assert span.status.status_code == StatusCode.ERROR
+        description = span.status.description
+        assert description is not None
+        assert fake_token not in description
+        assert "REDACTED" in description
+
 
 class TestMcpServerTracingMiddlewareIncludeArgs:
     async def test_include_args_false_omits_arguments_and_result(self) -> None:

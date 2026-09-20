@@ -496,6 +496,11 @@ class SentryBackend(BaseBackend):
     async def list_services(self) -> list[str]:
         """List all available projects (Sentry's analog of "services").
 
+        Follows Sentry's Link-header cursor pagination - see
+        `_search_events_raw`'s docstring for the mechanism - so an org with
+        more projects than fit on one page doesn't get a silently truncated
+        service list.
+
         Returns:
             List of project slugs
 
@@ -504,22 +509,42 @@ class SentryBackend(BaseBackend):
         """
         logger.debug("Listing services (Sentry projects)")
 
-        response = await self.client.get(f"/api/0/organizations/{self.org_slug}/projects/")
-        response.raise_for_status()
-        data = response.json()
+        slugs: set[str] = set()
+        cursor: str | None = None
 
-        if not isinstance(data, list):
-            logger.warning(
-                f"Sentry projects response was not a list (got {type(data).__name__}); "
-                "treating as empty"
+        for _ in range(_MAX_SEARCH_PAGES):
+            params: dict[str, Any] = {}
+            if cursor:
+                params["cursor"] = cursor
+
+            response = await self.client.get(
+                f"/api/0/organizations/{self.org_slug}/projects/", params=params
             )
-            return []
+            response.raise_for_status()
+            data = response.json()
 
-        slugs = {
-            item["slug"]
-            for item in data
-            if isinstance(item, dict) and isinstance(item.get("slug"), str) and item["slug"]
-        }
+            if not isinstance(data, list):
+                logger.warning(
+                    f"Sentry projects response was not a list (got {type(data).__name__}); "
+                    "treating as empty"
+                )
+                break
+
+            slugs.update(
+                item["slug"]
+                for item in data
+                if isinstance(item, dict) and isinstance(item.get("slug"), str) and item["slug"]
+            )
+
+            cursor = self._next_cursor_from_links(response.links)
+            if not cursor:
+                break
+        else:
+            logger.warning(
+                f"Stopped listing Sentry projects after {_MAX_SEARCH_PAGES} pages "
+                "with more results available; results may be incomplete"
+            )
+
         return sorted(slugs)
 
     async def get_service_operations(self, service_name: str) -> list[str]:
@@ -576,6 +601,11 @@ class SentryBackend(BaseBackend):
     async def _get_operations_via_attribute_values(self, service_name: str) -> list[str] | None:
         """Try the trace-item attribute-values endpoint for span.op values.
 
+        Follows Sentry's Link-header cursor pagination - see
+        `_search_events_raw`'s docstring for the mechanism - so an account
+        with more than one page's worth of distinct span.op values doesn't
+        get silently truncated results.
+
         Args:
             service_name: Project slug to scope the query to
 
@@ -583,40 +613,61 @@ class SentryBackend(BaseBackend):
             Sorted list of operation names, or None if the endpoint is
             unavailable/unexpected-shaped (caller should fall back)
         """
-        try:
-            response = await self.client.get(
-                f"/api/0/organizations/{self.org_slug}/trace-items/attributes/span.op/values/",
-                params={
-                    "project": service_name,
-                    "dataset": "spans",
-                    "per_page": 100,
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
-        except Exception as e:
-            logger.info(
-                f"Sentry attribute-values endpoint unavailable ({e}); "
-                "falling back to sampling recent spans"
-            )
-            return None
-
-        # Response shape isn't pinned down by public docs - accept either a
-        # bare list of strings or a list of dicts carrying a "value" key,
-        # and degrade to the sampling fallback for anything else.
-        if not isinstance(data, list):
-            logger.info(
-                "Sentry attribute-values response was not a list "
-                f"(got {type(data).__name__}); falling back to sampling"
-            )
-            return None
-
         values: set[str] = set()
-        for entry in data:
-            if isinstance(entry, str) and entry:
-                values.add(entry)
-            elif isinstance(entry, dict) and isinstance(entry.get("value"), str) and entry["value"]:
-                values.add(entry["value"])
+        cursor: str | None = None
+
+        for _ in range(_MAX_SEARCH_PAGES):
+            params: dict[str, Any] = {
+                "project": service_name,
+                "dataset": "spans",
+                "per_page": 100,
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            try:
+                response = await self.client.get(
+                    f"/api/0/organizations/{self.org_slug}/trace-items/attributes/span.op/values/",
+                    params=params,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except Exception as e:
+                logger.info(
+                    f"Sentry attribute-values endpoint unavailable ({e}); "
+                    "falling back to sampling recent spans"
+                )
+                return None
+
+            # Response shape isn't pinned down by public docs - accept either a
+            # bare list of strings or a list of dicts carrying a "value" key,
+            # and degrade to the sampling fallback for anything else.
+            if not isinstance(data, list):
+                logger.info(
+                    "Sentry attribute-values response was not a list "
+                    f"(got {type(data).__name__}); falling back to sampling"
+                )
+                return None
+
+            for entry in data:
+                if isinstance(entry, str) and entry:
+                    values.add(entry)
+                elif (
+                    isinstance(entry, dict)
+                    and isinstance(entry.get("value"), str)
+                    and entry["value"]
+                ):
+                    values.add(entry["value"])
+
+            cursor = self._next_cursor_from_links(response.links)
+            if not cursor:
+                break
+        else:
+            logger.warning(
+                f"Stopped paginating Sentry attribute-values for {service_name!r} after "
+                f"{_MAX_SEARCH_PAGES} pages with more results available; "
+                "results may be incomplete"
+            )
 
         if not values:
             return None
@@ -872,6 +923,47 @@ class SentryBackend(BaseBackend):
             return f"{value}ms" if is_duration_field else str(value)
         return self._escape_sentry_query_value(str(value))
 
+    def _status_equals_condition(self, value: Any, is_duration: bool) -> str:
+        """Build a Sentry query term for `status == value` on the mapped
+        `span.status` field, applying this codebase's OK/ERROR/UNSET
+        canonicalization - shared by the EQUALS branch and the IN operator
+        (see `_filter_to_sentry_query`) so both go through the exact same
+        translation instead of the IN branch building a raw literal term.
+
+        Sentry's real `span.status` values are lowercase strings (e.g.
+        `ok`, `unknown`, `internal_error`), not this codebase's internal
+        "OK"/"ERROR"/"UNSET" vocabulary, so a literal `value == "ERROR"`
+        would never match real data.
+
+        For `value == "ERROR"` specifically, this also has to avoid
+        conflating an errored span with one that simply never had a status
+        set: `_infer_status` (this file) already treats a raw status of
+        `"unknown"` (along with `""`/`"unset"`) as UNSET, not ERROR, since
+        an OTel span with no explicitly-set status is not the same claim as
+        one that explicitly failed. Sentry's OTel ingestion is understood
+        to map an unset OTel span status onto the literal string
+        `"unknown"` (matching `_infer_status`'s own assumption - unverified
+        against a live account, see the module docstring), so a genuine-
+        error query must explicitly exclude `"unknown"` too, not just
+        `"ok"` - simply negating `"ok"` alone (the pre-existing behavior)
+        would conflate every UNSET span into "ERROR".
+
+        Args:
+            value: The literal status value ("OK", "ERROR", or anything
+                else, which is passed through to a plain quoted comparison)
+            is_duration: Unused for status but threaded through for the
+                non-status fallback's formatting
+
+        Returns:
+            A self-contained (parenthesized where it contains an internal
+            AND/OR) Sentry query term
+        """
+        if value == "ERROR":
+            return "(!span.status:ok AND !span.status:unknown)"
+        if value == "OK":
+            return "span.status:ok"
+        return f"span.status:{self._format_query_value(value, is_duration)}"
+
     def _filter_to_sentry_query(self, filter_obj: Filter) -> str | None:
         """Convert a single Filter to a Sentry search syntax condition.
 
@@ -892,15 +984,22 @@ class SentryBackend(BaseBackend):
         is_duration = field == "span.duration"
 
         if operator == FilterOperator.EQUALS:
-            if field == "span.status" and value == "ERROR":
-                return "!span.status:ok"
-            if field == "span.status" and value == "OK":
-                return "span.status:ok"
+            if field == "span.status":
+                return self._status_equals_condition(value, is_duration)
             return f"{field}:{self._format_query_value(value, is_duration)}"
 
         elif operator == FilterOperator.NOT_EQUALS:
             if field == "span.status" and value == "ERROR":
-                return "span.status:ok"
+                # Complement of the genuinely-errored set built by
+                # _status_equals_condition("ERROR"): OK or explicitly unset.
+                return "(span.status:ok OR span.status:unknown)"
+            if field == "span.status" and value == "OK":
+                # "not ok" is exactly ERROR ∪ UNSET here - the same broad
+                # superset _status_equals_condition deliberately avoids for
+                # EQUALS "ERROR", but it's the *correct* answer for this
+                # combo since UNSET is supposed to be included alongside
+                # ERROR when excluding OK.
+                return "!span.status:ok"
             return f"!{field}:{self._format_query_value(value, is_duration)}"
 
         elif operator in (
@@ -939,7 +1038,14 @@ class SentryBackend(BaseBackend):
             # for special characters within it, so this uses the same
             # OR-of-quoted-terms form as the Datadog backend instead, which
             # goes through the same escaping helper as everything else.
-            or_terms = [f"{field}:{self._format_query_value(v, is_duration)}" for v in values]
+            # For the status field specifically, each value must go through
+            # the same OK/ERROR canonicalization EQUALS uses - otherwise
+            # `status IN ["ERROR"]` would build a literal `span.status:"ERROR"`
+            # term that never matches real (lowercase) Sentry data.
+            if field == "span.status":
+                or_terms = [self._status_equals_condition(v, is_duration) for v in values]
+            else:
+                or_terms = [f"{field}:{self._format_query_value(v, is_duration)}" for v in values]
             return "(" + " OR ".join(or_terms) + ")"
 
         logger.warning(f"Unsupported operator for Sentry query: {operator}")

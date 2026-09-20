@@ -38,7 +38,13 @@ classifiers = [
     "Framework :: FastAPI",
 ]
 dependencies = [
-    "mcp>=2.0,<3",
+    # Lower bound raised to the version actually locked/tested in uv.lock
+    # (2.2.0) rather than the original ">=2.0" floor - a fresh resolve
+    # outside this repo's `uv sync --frozen` workflow (e.g. `pip install`
+    # from an sdist, or a downstream project vendoring this package without
+    # the lockfile) could otherwise select an older 2.x point release this
+    # project has never actually run against.
+    "mcp>=2.2.0,<3",
     "fastmcp>=4.0.5,<4.1",
     # Pinned directly (not just transitive via mcp/fastmcp/httpx/starlette) to
     # close CVE-2026-63374 (TLS cert-validation bypass via IDNA2003 hostname
@@ -56,9 +62,15 @@ dependencies = [
     "opentelemetry-semantic-conventions-ai>=0.4.13",
     "opentelemetry-semantic-conventions>=0.60b0",
     "tenacity>=9.1,<10",
-    "opentelemetry-sdk>=1.30,<2",
-    "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
-    "boto3>=1.40,<2",
+    # Lower bounds raised to the versions actually locked/tested in
+    # uv.lock (1.44.0 / 1.44.0 / 1.43.97) rather than the original,
+    # much-wider ">=1.30"/">=1.40" floors - a fresh resolve outside this
+    # repo's `uv sync --frozen` workflow could otherwise select an older
+    # point release predating a since-patched CVE that this project has
+    # never actually run against.
+    "opentelemetry-sdk>=1.44.0,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0,<2",
+    "boto3>=1.43.97,<2",
 ]
 
 [project.urls]

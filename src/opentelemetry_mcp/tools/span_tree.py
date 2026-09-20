@@ -77,6 +77,28 @@ def find_owning_root(
     return span
 
 
+def find_unreachable_error_spans(
+    spans: list[SpanData],
+    roots: list[SpanData],
+    children_map: dict[str | None, list[SpanData]],
+) -> list[SpanData]:
+    """ERROR-status spans not reachable from any of `roots`.
+
+    build_children_map's orphan redirect only catches a parent_span_id that
+    is missing or self-referential; a longer cycle where every span in it
+    has a present, non-self parent (A's parent is B, B's parent is A, both
+    in `spans`) has no entry point any root-first walk can discover, so
+    find_all_error_chains from the real root(s) alone silently misses an
+    error trapped there. Returns spans in no particular order - there is no
+    reachable root to build a path from, so callers that want a "chain" for
+    one of these can only treat the span itself as a standalone root (see
+    find_owning_root's same fallback)."""
+    reachable: set[str] = set()
+    for root in roots:
+        reachable |= subtree_span_ids(root, children_map)
+    return [span for span in spans if span.span_id not in reachable and span.status == "ERROR"]
+
+
 def compute_critical_path(
     root: SpanData, children_map: dict[str | None, list[SpanData]]
 ) -> list[SpanData]:
@@ -118,7 +140,12 @@ def compute_self_time_ms(span: SpanData, children_map: dict[str | None, list[Spa
     this field."""
     children = children_map.get(span.span_id, [])
     if not children:
-        return span.duration_ms
+        # Clamped for the same reason as the merged-interval return below: a
+        # backend affected by clock skew can supply a negative duration_ms
+        # (no ge=0 constraint on the model), and a negative self_time_ms is
+        # a semantically-impossible result that can surface directly as
+        # triage_trace's headline likely_root_cause value.
+        return max(0.0, span.duration_ms)
 
     span_start_ms = span.start_time.timestamp() * 1000
     span_end_ms = span_start_ms + span.duration_ms
@@ -134,7 +161,7 @@ def compute_self_time_ms(span: SpanData, children_map: dict[str | None, list[Spa
         if interval[1] > interval[0]
     )
     if not intervals:
-        return span.duration_ms
+        return max(0.0, span.duration_ms)
 
     covered_ms = 0.0
     current_start, current_end = intervals[0]

@@ -8,10 +8,18 @@ elements) - not a Python list handed directly to the parser.
 """
 
 import base64
+import re
+from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
+from urllib.parse import quote
+
+import httpx
+import pytest
 
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.tempo import TempoBackend
+from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, SpanQuery, TraceQuery
 
 FAKE_API_KEY = "dd-api1"
 FAKE_TEMPO_INSTANCE_ID = "123456"
@@ -367,3 +375,352 @@ def test_instance_id_without_api_key_falls_back_to_no_auth() -> None:
     )
 
     assert backend._create_headers() == {}
+
+
+# -- Regression tests: TraceQL injection, root-service misattribution, ------
+# -- silently-dropped filters, path-injection, and silent-outage findings --
+
+
+class _FakeResponse:
+    """Minimal httpx.Response stand-in for the hand-rolled fake clients
+    below - conftest.py's fake_json_client fixture pops canned payloads in
+    call order but never exposes the requested URL/params to the test,
+    which several of the regression tests below need to assert on."""
+
+    def __init__(self, payload: Any) -> None:
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def json(self) -> Any:
+        return self._payload
+
+
+def _minimal_otlp_trace(trace_id: str, status_code: int) -> dict[str, Any]:
+    """Minimal valid /api/traces/{id} OTLP payload with a single span whose
+    numeric OTLP status code is 1 (OK) or 2 (ERROR)."""
+    return {
+        "batches": [
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": "checkout-service"}}
+                    ]
+                },
+                "scopeSpans": [
+                    {
+                        "spans": [
+                            {
+                                "traceId": trace_id,
+                                "spanId": "span1",
+                                "name": "handle_request",
+                                "startTimeUnixNano": "1000000000",
+                                "endTimeUnixNano": "1050000000",
+                                "status": {"code": status_code},
+                                "attributes": [],
+                            }
+                        ]
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def test_filter_to_traceql_escapes_quotes_in_string_value() -> None:
+    """A crafted filter value containing a double quote must not be able to
+    break out of the TraceQL string literal and inject additional
+    structure - the original code spliced Filter.value into the query
+    unescaped (f'{traceql_field} = "{value}"')."""
+    backend = TempoBackend(url="http://localhost:3200")
+    malicious_value = 'x" || resource.service.name =~ ".*'
+    filter_obj = Filter(
+        field="gen_ai.request.model",
+        operator=FilterOperator.EQUALS,
+        value=malicious_value,
+        value_type=FilterType.STRING,
+    )
+
+    condition = backend._filter_to_traceql(filter_obj)
+
+    assert condition == ('span.gen_ai.request.model = "x\\" || resource.service.name =~ \\".*"')
+
+
+def test_filter_to_traceql_rejects_unsafe_field_name() -> None:
+    """Filter.field is an unvalidated MCP tool argument spliced directly
+    into the query as `span.{field}` - a crafted field name must be
+    rejected rather than interpolated unchecked, mirroring datadog.py's/
+    sentry.py's field-name allowlisting."""
+    backend = TempoBackend(url="http://localhost:3200")
+    filter_obj = Filter(
+        field='x" || resource.service.name =~ ".*',
+        operator=FilterOperator.EQUALS,
+        value="anything",
+        value_type=FilterType.STRING,
+    )
+
+    assert backend._filter_to_traceql(filter_obj) is None
+
+
+def test_filter_to_traceql_escapes_regex_metacharacters_for_contains() -> None:
+    """CONTAINS is documented as a literal substring match, not a regex
+    match - the original code built raw regex via f'.*{value}.*' with no
+    re.escape, so a literal '.' in a value like "gpt-4.5" would match "any
+    character", causing an unrelated string like "gpt-405" to false-positive."""
+    backend = TempoBackend(url="http://localhost:3200")
+    filter_obj = Filter(
+        field="gen_ai.request.model",
+        operator=FilterOperator.CONTAINS,
+        value="gpt-4.5",
+        value_type=FilterType.STRING,
+    )
+
+    condition = backend._filter_to_traceql(filter_obj)
+
+    assert condition is not None
+    quoted = condition.split("=~", 1)[1].strip()
+    assert quoted.startswith('"') and quoted.endswith('"')
+    # Reconstruct the regex TraceQL would actually evaluate by undoing the
+    # string-literal escaping (backslash-then-quote) applied on top of the
+    # regex escaping.
+    raw_pattern = quoted[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+
+    assert re.search(raw_pattern, "call to gpt-4.5 done") is not None
+    assert re.search(raw_pattern, "call to gpt-405 done") is None
+
+
+async def test_get_service_operations_escapes_service_name_in_query() -> None:
+    """service_name is an unvalidated MCP tool argument spliced into the
+    TraceQL query value - a crafted value must not be able to break out of
+    the quoted string and inject additional TraceQL structure."""
+    backend = TempoBackend(url="http://localhost:3200")
+    captured_params: dict[str, Any] = {}
+
+    class _CapturingClient:
+        is_closed = False
+
+        async def get(self, url: str, params: dict[str, Any] | None = None) -> Any:
+            captured_params.update(params or {})
+            return _FakeResponse({"traces": []})
+
+    backend._client = _CapturingClient()
+
+    malicious_service_name = 'x" || resource.service.name =~ ".*'
+    await backend.get_service_operations(malicious_service_name)
+
+    assert captured_params["q"] == (
+        '{ resource.service.name = "x\\" || resource.service.name =~ \\".*" }'
+    )
+
+
+async def test_get_service_operations_only_counts_matching_root_service(
+    fake_json_client: Callable[..., Any],
+) -> None:
+    """get_service_operations's TraceQL query matches if service_name
+    appears ANYWHERE in the trace (any span), not just at the root - the
+    original code unconditionally trusted rootServiceName/rootTraceName,
+    misattributing another service's root operation to the queried
+    service."""
+    backend = TempoBackend(url="http://localhost:3200")
+    backend._client = fake_json_client(
+        {
+            "traces": [
+                {"rootServiceName": "checkout-service", "rootTraceName": "checkout_flow"},
+                {"rootServiceName": "billing-service", "rootTraceName": "billing_flow"},
+            ]
+        }
+    )
+
+    operations = await backend.get_service_operations("checkout-service")
+
+    assert operations == ["checkout_flow"]
+
+
+def test_filter_to_traceql_maps_not_equals_error_to_negation() -> None:
+    """has_error=False (models.py's _convert_params_to_filters) produces a
+    NOT_EQUALS "ERROR" status filter - the original code's status branch
+    only handled EQUALS, silently dropping every other operator (including
+    this one) by falling through to `return None` with no warning and no
+    client-side fallback."""
+    backend = TempoBackend(url="http://localhost:3200")
+    filter_obj = Filter(
+        field="status",
+        operator=FilterOperator.NOT_EQUALS,
+        value="ERROR",
+        value_type=FilterType.STRING,
+    )
+
+    assert backend._filter_to_traceql(filter_obj) == "status != error"
+
+
+async def test_search_traces_applies_unconvertible_status_filter_client_side() -> None:
+    """A status filter whose value _filter_to_traceql can't express (e.g.
+    "TIMEOUT", neither "ERROR" nor "OK") must still be enforced
+    client-side - the original classification logic only checked whether
+    an operator was globally "native" (get_supported_operators()), never
+    whether _filter_to_traceql actually produced a usable condition for
+    this specific field/value, so the filter was silently dropped and
+    search_traces returned every trace unfiltered, as if the filter never
+    existed."""
+    backend = TempoBackend(url="http://localhost:3200")
+    ok_trace_id = "aaaa000000000000000000000000000"
+    error_trace_id = "bbbb000000000000000000000000000"
+
+    class _SequencedClient:
+        is_closed = False
+
+        def __init__(self) -> None:
+            self._responses = [
+                _FakeResponse({"traces": [{"traceID": ok_trace_id}, {"traceID": error_trace_id}]}),
+                _FakeResponse(_minimal_otlp_trace(ok_trace_id, status_code=1)),
+                _FakeResponse(_minimal_otlp_trace(error_trace_id, status_code=2)),
+            ]
+
+        async def get(self, url: str, *args: Any, **kwargs: Any) -> Any:
+            return self._responses.pop(0)
+
+    backend._client = _SequencedClient()
+
+    query = TraceQuery(
+        limit=10,
+        filters=[
+            Filter(
+                field="status",
+                operator=FilterOperator.EQUALS,
+                value="TIMEOUT",
+                value_type=FilterType.STRING,
+            )
+        ],
+    )
+
+    traces = await backend.search_traces(query)
+
+    assert traces == []
+
+
+async def test_get_trace_url_escapes_trace_id() -> None:
+    """trace_id is an unvalidated MCP tool argument used as a URL path
+    segment - it must be percent-encoded before interpolation (mirrors
+    sentry.py's identical quote(trace_id, safe='') at its own
+    /trace/{id}/ path-segment call site), so a crafted value can't inject
+    additional path structure."""
+    backend = TempoBackend(url="http://localhost:3200")
+    captured_urls: list[str] = []
+    malicious_trace_id = "abc/../../etc?x=1"
+
+    class _CapturingClient:
+        is_closed = False
+
+        async def get(self, url: str, *args: Any, **kwargs: Any) -> Any:
+            captured_urls.append(url)
+            return _FakeResponse(_minimal_otlp_trace("deadbeef", status_code=1))
+
+    backend._client = _CapturingClient()
+
+    await backend.get_trace(malicious_trace_id)
+
+    assert captured_urls == [f"/api/traces/{quote(malicious_trace_id, safe='')}"]
+    suffix = captured_urls[0].removeprefix("/api/traces/")
+    assert "/" not in suffix
+    assert "?" not in suffix
+
+
+async def test_search_traces_escapes_trace_id_from_search_result_in_fetch_url() -> None:
+    """The trace_id used to build the per-trace hydration URL comes from
+    Tempo's own /api/search response, but the original code spliced it
+    into the request path unescaped - the same unescaped-interpolation
+    pattern as get_trace's own trace_id argument."""
+    backend = TempoBackend(url="http://localhost:3200")
+    captured_urls: list[str] = []
+    tricky_trace_id = "abc/def?x=1"
+
+    class _CapturingClient:
+        is_closed = False
+
+        def __init__(self) -> None:
+            self._call_count = 0
+
+        async def get(self, url: str, params: dict[str, Any] | None = None) -> Any:
+            self._call_count += 1
+            captured_urls.append(url)
+            if self._call_count == 1:
+                return _FakeResponse({"traces": [{"traceID": tricky_trace_id}]})
+            return _FakeResponse(_minimal_otlp_trace(tricky_trace_id, status_code=1))
+
+    backend._client = _CapturingClient()
+
+    await backend.search_traces(TraceQuery(limit=10))
+
+    assert captured_urls[1] == f"/api/traces/{quote(tricky_trace_id, safe='')}"
+
+
+async def test_search_traces_raises_when_all_trace_fetches_fail() -> None:
+    """A total outage of Tempo's /api/traces/{id} endpoint (while
+    /api/search still works) must surface as an error, not be silently
+    swallowed into an empty result indistinguishable from "no traces
+    matched"."""
+    backend = TempoBackend(url="http://localhost:3200")
+
+    class _AllFetchesFailClient:
+        is_closed = False
+
+        def __init__(self) -> None:
+            self._call_count = 0
+
+        async def get(self, url: str, *args: Any, **kwargs: Any) -> Any:
+            self._call_count += 1
+            if self._call_count == 1:
+                return _FakeResponse({"traces": [{"traceID": "aaaa"}, {"traceID": "bbbb"}]})
+            raise httpx.ConnectError("connection refused")
+
+    backend._client = _AllFetchesFailClient()
+
+    with pytest.raises(RuntimeError, match="per-trace fetch"):
+        await backend.search_traces(TraceQuery(limit=10))
+
+
+async def test_search_spans_raises_when_all_trace_fetches_fail() -> None:
+    """Mirrors the search_traces regression above for search_spans, whose
+    per-trace hydration loop had the identical silent-failure bug."""
+    backend = TempoBackend(url="http://localhost:3200")
+
+    class _AllFetchesFailClient:
+        is_closed = False
+
+        def __init__(self) -> None:
+            self._call_count = 0
+
+        async def get(self, url: str, *args: Any, **kwargs: Any) -> Any:
+            self._call_count += 1
+            if self._call_count == 1:
+                return _FakeResponse({"traces": [{"traceID": "aaaa"}, {"traceID": "bbbb"}]})
+            raise httpx.ConnectError("connection refused")
+
+    backend._client = _AllFetchesFailClient()
+
+    with pytest.raises(RuntimeError, match="per-trace fetch"):
+        await backend.search_spans(SpanQuery(limit=10))
+
+
+def test_parse_otlp_span_start_time_is_utc_aware() -> None:
+    """OTLP's startTimeUnixNano is a UTC epoch timestamp - fromtimestamp()
+    without tz=UTC silently shifts it into the server's local timezone and
+    returns a naive datetime, unlike every sibling backend doing this same
+    conversion (sentry.py, honeycomb.py, newrelic.py, xray.py all pass
+    tz=UTC)."""
+    backend = TempoBackend(url="http://localhost:3200")
+    span_data = {
+        "traceId": "abc123",
+        "spanId": "span1",
+        "name": "handle_request",
+        "startTimeUnixNano": "1700000000000000000",
+        "endTimeUnixNano": "1700000001000000000",
+        "attributes": [],
+    }
+
+    span = backend._parse_otlp_span(span_data, "checkout-service")
+
+    assert span is not None
+    assert span.start_time.tzinfo is not None
+    assert span.start_time.utcoffset() == timedelta(0)

@@ -247,6 +247,25 @@ class TestParseSegmentItem:
         assert span is not None
         assert span.parent_span_id == "seg-0"
 
+    def test_annotation_colliding_with_span_attributes_field_skips_segment_not_crash(
+        self,
+    ) -> None:
+        """Regression test: a custom X-Ray annotation named e.g. "error"
+        collides with SpanAttributes.error's typed (bool | None) alias.
+        SpanAttributes(**attrs_dict) then raises pydantic.ValidationError
+        for a non-bool value - this must be caught and the single
+        malformed segment skipped (returning None), not propagate out and
+        discard an entire batch of otherwise-valid results."""
+        backend = _backend()
+        item = {
+            "id": "seg-1",
+            "name": "my-op",
+            "start_time": 1.0,
+            "end_time": 2.0,
+            "annotations": {"error": "not-a-bool"},
+        }
+        assert backend._parse_segment_item(item, "svc", "1-abc") is None
+
 
 class TestFilterExpression:
     def test_service_name_equals_builds_service_predicate(self) -> None:
@@ -755,6 +774,31 @@ class TestHealthCheck:
         stubber.add_client_error("get_service_graph", service_error_code="AccessDeniedException")
         stubber.add_client_error("get_trace_summaries", service_error_code="AccessDeniedException")
 
+        with stubber:
+            result = await backend.health_check()
+
+        assert result.status == "unhealthy"
+        assert result.error is not None
+
+    async def test_health_check_bypasses_query_cache_reflects_live_failure(self) -> None:
+        """Regression test: health_check() must always reflect live
+        backend state, never a stale cached result. Once a query cache is
+        configured, a first successful list_services() call would cache a
+        "healthy" outcome under health_check()'s old implementation
+        (which called the public, cached list_services() directly) - a
+        second, now-failing probe must still be correctly reported
+        unhealthy rather than returning that stale cached success."""
+        backend = _backend()
+        backend.configure_query_cache(60.0)
+        stubber = Stubber(backend._xray_client)
+
+        stubber.add_response("get_service_graph", {"Services": [{"ReferenceId": 0, "Name": "svc"}]})
+        with stubber:
+            first = await backend.list_services()
+        assert first == ["svc"]
+
+        stubber.add_client_error("get_service_graph", service_error_code="AccessDeniedException")
+        stubber.add_client_error("get_trace_summaries", service_error_code="AccessDeniedException")
         with stubber:
             result = await backend.health_check()
 

@@ -335,7 +335,27 @@ class XRayBackend(BaseBackend):
         action from GetTraceSummaries), falling back to sampling recent
         GetTraceSummaries+BatchGetTraces results on any failure (missing
         permission, unexpected shape, etc.) - mirrors SentryBackend's own
-        sampling-fallback shape."""
+        sampling-fallback shape.
+
+        Delegates to _list_services_uncached() - see that method's
+        docstring for why the body lives there rather than here directly.
+        """
+        return await self._list_services_uncached()
+
+    async def _list_services_uncached(self) -> list[str]:
+        """The actual body of list_services(), factored out so
+        health_check() can call it directly instead of going through the
+        public list_services() method above - list_services() is one of
+        BaseBackend's _CACHEABLE_METHODS, wrapped with the query cache
+        (once QUERY_CACHE_TTL_SECONDS is configured) by
+        BaseBackend.__init_subclass__. health_check() must always reflect
+        live backend state (the /ready endpoint and the doctor CLI depend
+        on this), so it deliberately calls this private, never-cached
+        helper rather than the cached public wrapper - mirrors
+        DatadogBackend.health_check calling its own private
+        _search_spans_raw() directly rather than the cached public
+        search_spans().
+        """
         start, end = self._time_range(None, None)
 
         try:
@@ -380,10 +400,13 @@ class XRayBackend(BaseBackend):
         return sorted(operations)
 
     async def health_check(self) -> HealthCheckResponse:
-        """Calls list_services() and wraps success/failure - identical
-        shape to every other backend's health_check."""
+        """Calls the private, never-cached _list_services_uncached()
+        directly - NOT the public list_services() (see that method's
+        docstring: it is one of BaseBackend's _CACHEABLE_METHODS, and a
+        configured query cache would otherwise let this silently return a
+        stale cached result instead of live backend state)."""
         try:
-            await self.list_services()
+            await self._list_services_uncached()
             return HealthCheckResponse(status="healthy", backend="xray", url=self.url)
         except Exception as e:
             return HealthCheckResponse(
@@ -764,6 +787,23 @@ class XRayBackend(BaseBackend):
 
         attrs_dict = self._extract_segment_attributes(item)
 
+        try:
+            span_attributes = SpanAttributes(**attrs_dict)
+        except Exception as e:
+            # A custom annotation/metadata key can collide with one of
+            # SpanAttributes' own typed field aliases (e.g. a customer
+            # annotation literally named "error") and raise a pydantic
+            # ValidationError here. Skip just this one malformed segment
+            # (matching every other rejection above in this function)
+            # rather than letting it propagate and discard the entire
+            # batch of otherwise-valid traces in search_traces/
+            # search_spans/get_trace.
+            logger.warning(
+                f"Skipping X-Ray segment {segment_id}: attributes incompatible with "
+                f"SpanAttributes ({e})"
+            )
+            return None
+
         return SpanData(
             trace_id=trace_id,
             span_id=segment_id,
@@ -773,7 +813,7 @@ class XRayBackend(BaseBackend):
             start_time=datetime.fromtimestamp(start_time_raw, tz=UTC),
             duration_ms=duration_ms,
             status=status,
-            attributes=SpanAttributes(**attrs_dict),
+            attributes=span_attributes,
         )
 
     def _extract_segment_attributes(self, item: dict[str, Any]) -> dict[str, Any]:

@@ -149,6 +149,61 @@ jobs:
                   load: true
                   push: false
                   tags: tracehub-mcp-server:${{ github.sha }}-${{ matrix.platform }}
+
+            - name: Smoke-test the built image actually runs
+              # `docker build` succeeding only proves the image's filesystem
+              # layers assembled - it never invokes the venv's own
+              # interpreter, so a builder/runtime base-image Python version
+              # desync (silently introduced by a Docker minor/patch-only
+              # Dependabot bump touching only one of the two stages) shipped
+              # 4 real releases whose entrypoint crashed on every single run
+              # with "ModuleNotFoundError: No module named
+              # 'opentelemetry_mcp'" while this job stayed green throughout.
+              # Actually start the container and confirm the process stays
+              # up and the HTTP transport actually binds and answers - NOT
+              # by waiting for the Dockerfile's own HEALTHCHECK to report
+              # "healthy", since that now probes /ready (a real
+              # health_check()+list_services() call against BACKEND_URL,
+              # deliberately - see docker_healthcheck.py), and this job has
+              # no reachable trace backend to point it at. This step only
+              # needs to catch "the entrypoint crashed on startup", the
+              # same class of bug the Python-version desync caused - not
+              # re-verify live backend connectivity, which is what the
+              # /ready probe itself is for in a real deployment.
+              run: |
+                  docker run -d --name smoke-test \
+                    -p 18000:8000 \
+                    -e BACKEND_TYPE=jaeger \
+                    -e BACKEND_URL=http://localhost:16686 \
+                    "tracehub-mcp-server:${{ github.sha }}-${{ matrix.platform }}"
+
+                  for i in $(seq 1 15); do
+                    if [ "$(docker inspect --format='{{.State.Status}}' smoke-test 2>/dev/null)" = "exited" ]; then
+                      echo "::error::Container exited unexpectedly - entrypoint crashed"
+                      docker logs smoke-test
+                      docker rm -f smoke-test
+                      exit 1
+                    fi
+                    # Any real HTTP response (curl's own %{http_code}, even
+                    # a 4xx) proves uvicorn bound the port and the ASGI app
+                    # is serving - only "000" (curl's own sentinel for a
+                    # refused/timed-out connection) means it isn't up yet.
+                    status_code="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18000/mcp 2>/dev/null || echo 000)"
+                    if [ "$status_code" != "000" ]; then
+                      echo "HTTP transport is up and answering (got status ${status_code} from /mcp) after ${i} attempt(s)"
+                      docker logs smoke-test
+                      docker rm -f smoke-test
+                      exit 0
+                    fi
+                    echo "Attempt ${i}/15: HTTP transport not answering yet, waiting 2s..."
+                    sleep 2
+                  done
+
+                  echo "::error::Container never started answering HTTP requests within 30s"
+                  docker logs smoke-test
+                  docker rm -f smoke-test
+                  exit 1
+
             - name: Cache Trivy
               uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
               with:
@@ -221,3 +276,25 @@ jobs:
               with:
                   header: trivy-scan-tracehub-mcp-server-${{ matrix.platform }}
                   path: trivy-comment-${{ matrix.platform }}.md
+            - name: Fail on CRITICAL/HIGH findings
+              # The scan step above deliberately runs with exit-code "0" so
+              # the informational/comment steps above still execute and post
+              # even when there are findings. This step is the actual gate:
+              # it re-reads the same JSON results file and fails the build
+              # if any CRITICAL/HIGH vulnerability, secret, or
+              # misconfiguration is present. `if: always()` so this gate
+              # still runs (and fails closed) even if an earlier
+              # informational step in this job errors out.
+              if: always()
+              run: |
+                  RESULTS_FILE="trivy-results-${{ matrix.platform }}.json"
+                  if [ ! -f "$RESULTS_FILE" ]; then
+                    echo "::error::${RESULTS_FILE} not found - Trivy scan did not complete, failing closed"
+                    exit 1
+                  fi
+                  FINDING_COUNT=$(jq '[(.Results // [])[] | ((.Vulnerabilities // []) + (.Secrets // []) + (.Misconfigurations // []))[]] | length' "$RESULTS_FILE")
+                  if [ "$FINDING_COUNT" -gt 0 ]; then
+                    echo "::error::${FINDING_COUNT} CRITICAL/HIGH finding(s) in ${RESULTS_FILE} - see the Trivy Scan Results log or PR comment above for details"
+                    exit 1
+                  fi
+                  echo "No CRITICAL/HIGH findings in ${RESULTS_FILE}"

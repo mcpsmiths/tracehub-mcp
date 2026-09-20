@@ -309,11 +309,41 @@ class TestParseNewRelicRow:
         backend = _backend()
         assert backend._parse_newrelic_row(self._row(**{"duration.ms": -5.0})) is None
 
+    def test_nan_duration_rejected(self) -> None:
+        """Regression: Python's json module accepts a bare NaN token, so a
+        NerdGraph response could hand this field float('nan') - which
+        satisfies neither `< 0` nor `> _MAX_REASONABLE_DURATION_MS` (every
+        comparison against NaN is False), so without an explicit
+        math.isnan check the span would slip through with a poisoned
+        duration instead of being rejected like any other out-of-range
+        value."""
+        backend = _backend()
+        assert backend._parse_newrelic_row(self._row(**{"duration.ms": float("nan")})) is None
+
     def test_parent_id_is_carried_through(self) -> None:
         backend = _backend()
         span = backend._parse_newrelic_row(self._row(**{"parent.id": "parent1"}))
         assert span is not None
         assert span.parent_span_id == "parent1"
+
+    def test_list_and_dict_valued_attributes_pass_through(self) -> None:
+        """Regression: gen_ai.response.finish_reasons (a JSON array) and
+        gen_ai.input.messages (a list of dicts) must survive into
+        SpanAttributes' own typed list/dict fields instead of being
+        silently dropped by an isinstance filter that only allowed
+        str/int/float/bool through."""
+        backend = _backend()
+        span = backend._parse_newrelic_row(
+            self._row(
+                **{
+                    "gen_ai.response.finish_reasons": ["stop"],
+                    "gen_ai.input.messages": [{"role": "user", "content": "hi"}],
+                }
+            )
+        )
+        assert span is not None
+        assert span.attributes.gen_ai_response_finish_reasons == ["stop"]
+        assert span.attributes.gen_ai_input_messages == [{"role": "user", "content": "hi"}]
 
 
 class TestParseNewRelicGraphQLSpan:
@@ -368,6 +398,33 @@ class TestParseNewRelicGraphQLSpan:
         backend = _backend()
         span = backend._parse_newrelic_graphql_span(self._span(durationMs=None), "trace1")
         assert span is None
+
+    def test_nan_duration_rejected(self) -> None:
+        """Regression: same NaN-duration gap as _parse_newrelic_row - a
+        bare NaN durationMs value satisfies neither the `< 0` nor
+        `> _MAX_REASONABLE_DURATION_MS` comparison, so without an explicit
+        math.isnan check it would slip through instead of being rejected."""
+        backend = _backend()
+        span = backend._parse_newrelic_graphql_span(self._span(durationMs=float("nan")), "trace1")
+        assert span is None
+
+    def test_list_and_dict_valued_attributes_pass_through(self) -> None:
+        """Regression: same list/dict passthrough gap as _parse_newrelic_row,
+        but for the GraphQL hydration path's `attributes` object."""
+        backend = _backend()
+        span = backend._parse_newrelic_graphql_span(
+            self._span(
+                attributes={
+                    "service.name": "my-llm-app",
+                    "gen_ai.response.finish_reasons": ["stop"],
+                    "gen_ai.output.messages": [{"role": "assistant", "content": "hi"}],
+                }
+            ),
+            "trace1",
+        )
+        assert span is not None
+        assert span.attributes.gen_ai_response_finish_reasons == ["stop"]
+        assert span.attributes.gen_ai_output_messages == [{"role": "assistant", "content": "hi"}]
 
 
 class TestGroupIntoTrace:
@@ -529,6 +586,57 @@ class TestCallNerdgraph:
             await backend._call_nerdgraph("query {}", {})
 
 
+class TestRunAccountNrql:
+    """_run_account_nrql's account/nrql null-shape handling - mirrors
+    get_trace's existing null-shape-raises pattern rather than treating a
+    misconfigured account as merely "empty results"."""
+
+    async def test_null_account_raises(self, fake_json_client: Callable[..., Any]) -> None:
+        backend = _backend()
+        backend._client = fake_json_client({"data": {"actor": {"account": None}}})
+
+        with pytest.raises(ValueError, match="No account found for account ID"):
+            await backend._run_account_nrql("SELECT * FROM Span")
+
+    async def test_missing_actor_raises(self, fake_json_client: Callable[..., Any]) -> None:
+        backend = _backend()
+        backend._client = fake_json_client({"data": {}})
+
+        with pytest.raises(ValueError, match="No account found for account ID"):
+            await backend._run_account_nrql("SELECT * FROM Span")
+
+    async def test_unexpected_nrql_shape_raises(self, fake_json_client: Callable[..., Any]) -> None:
+        backend = _backend()
+        backend._client = fake_json_client({"data": {"actor": {"account": {"nrql": "not-a-dict"}}}})
+
+        with pytest.raises(ValueError, match="Unexpected NerdGraph NRQL response shape"):
+            await backend._run_account_nrql("SELECT * FROM Span")
+
+    async def test_unexpected_results_shape_raises(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
+        backend = _backend()
+        backend._client = fake_json_client(
+            {"data": {"actor": {"account": {"nrql": {"results": "not-a-list"}}}}}
+        )
+
+        with pytest.raises(ValueError, match="Unexpected NerdGraph NRQL response shape"):
+            await backend._run_account_nrql("SELECT * FROM Span")
+
+    async def test_empty_results_is_a_valid_zero_match_response(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
+        """A genuinely empty `results: []` list (query ran fine, zero
+        matching rows) must NOT raise - only a null/unexpected shape
+        indicates an account access failure."""
+        backend = _backend()
+        backend._client = fake_json_client(
+            {"data": {"actor": {"account": {"nrql": {"results": []}}}}}
+        )
+
+        assert await backend._run_account_nrql("SELECT * FROM Span") == []
+
+
 class TestListServices:
     async def test_happy_path(self, fake_json_client: Callable[..., Any]) -> None:
         backend = _backend()
@@ -554,15 +662,31 @@ class TestListServices:
 
         assert await backend.list_services() == []
 
-    async def test_unexpected_shape_returns_empty_list(
+    async def test_unexpected_results_shape_raises(
         self, fake_json_client: Callable[..., Any]
     ) -> None:
+        """Regression: an unexpected (non-list) `results` shape must raise
+        rather than being silently swallowed as "zero matching traces" -
+        see TestRunAccountNrql for the full account/nrql-null coverage."""
         backend = _backend()
         backend._client = fake_json_client(
             {"data": {"actor": {"account": {"nrql": {"results": "not-a-list"}}}}}
         )
 
-        assert await backend.list_services() == []
+        with pytest.raises(ValueError, match="Unexpected NerdGraph NRQL response shape"):
+            await backend.list_services()
+
+    async def test_null_account_raises(self, fake_json_client: Callable[..., Any]) -> None:
+        """Regression: a null `account` (misconfigured account ID, or a
+        User API key without access to it) must raise a clear
+        configuration error rather than silently looking like "zero
+        matching traces" (see TestRunAccountNrql for the unit-level
+        coverage of this)."""
+        backend = _backend()
+        backend._client = fake_json_client({"data": {"actor": {"account": None}}})
+
+        with pytest.raises(ValueError, match="No account found for account ID"):
+            await backend.list_services()
 
 
 class TestGetServiceOperations:

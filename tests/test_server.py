@@ -917,6 +917,90 @@ class TestApplyToolGating:
         mock_mcp.local_provider.remove_tool.assert_not_called()
 
 
+class TestFixedWindowRateLimiterEviction:
+    """_FixedWindowRateLimiter._buckets must be swept of expired entries,
+    not retained forever - see _sweep_expired_locked's docstring. Without
+    this, every distinct key (client IP) that ever hits the server adds a
+    permanent entry that's never removed, even long after its window
+    expired."""
+
+    async def test_buckets_do_not_grow_unboundedly_across_many_expired_windows(
+        self,
+    ) -> None:
+        """Regression test: simulates many distinct, never-repeated client
+        IPs (as a rotating-source bot, or simply many one-off clients,
+        would produce) across several fully-elapsed windows. Before the
+        fix, _buckets accumulated one permanent entry per distinct IP
+        (len == 20 here); with the sweep, only recently-active windows
+        survive."""
+        clock_time = [0.0]
+
+        def fake_clock() -> float:
+            return clock_time[0]
+
+        limiter = server._FixedWindowRateLimiter(
+            max_requests=10, window_seconds=60.0, clock=fake_clock
+        )
+
+        for window_index in range(20):
+            # Each iteration lands in a window that is already fully
+            # expired relative to the previous one (61s > the 60s window).
+            clock_time[0] = window_index * 61.0
+            await limiter.hit(f"client-{window_index}")
+
+        assert len(limiter._buckets) < 20
+
+    async def test_sweep_only_evicts_entries_whose_window_has_expired(self) -> None:
+        """A bucket whose window has NOT yet expired must survive a sweep
+        triggered by a different key's hit - only entries genuinely past
+        their own window_seconds should ever be dropped."""
+        clock_time = [0.0]
+
+        def fake_clock() -> float:
+            return clock_time[0]
+
+        limiter = server._FixedWindowRateLimiter(
+            max_requests=10, window_seconds=60.0, clock=fake_clock
+        )
+
+        clock_time[0] = 10.0
+        await limiter.hit("stale-client")  # window_start=10; fully expired
+        # (>=60s old) by the time the sweep below runs at t=70
+
+        clock_time[0] = 59.0
+        await limiter.hit("fresh-client")  # window_start=59; still well
+        # within its own 60s window at t=70
+
+        clock_time[0] = 70.0
+        # >=60s since construction (t=0) triggers the amortized sweep.
+        await limiter.hit("other-client")
+
+        assert "stale-client" not in limiter._buckets
+        assert "fresh-client" in limiter._buckets
+
+    async def test_hit_behavior_unaffected_by_sweep(self) -> None:
+        """The sweep must be purely a cleanup side effect - it must not
+        change hit()'s own allow/reject decision for the key being hit."""
+        clock_time = [0.0]
+
+        def fake_clock() -> float:
+            return clock_time[0]
+
+        limiter = server._FixedWindowRateLimiter(
+            max_requests=2, window_seconds=60.0, clock=fake_clock
+        )
+
+        assert await limiter.hit("a") is True
+        assert await limiter.hit("a") is True
+        # Third hit within the same window breaches max_requests=2.
+        assert await limiter.hit("a") is False
+
+        # Advance past the window and past the sweep threshold - a sweep
+        # runs, but "a" gets a fresh window and is allowed again.
+        clock_time[0] = 61.0
+        assert await limiter.hit("a") is True
+
+
 class TestMainCli:
     """main() is the click CLI entrypoint. mcp.run is mocked so it never
     blocks; ServerConfig.from_env/apply_cli_overrides are exercised for

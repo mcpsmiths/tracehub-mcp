@@ -1277,6 +1277,19 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     this check exists for: a malicious webpage running in a victim's browser
     using DNS rebinding or a crafted fetch() to reach a locally-bound
     tracehub-mcp HTTP server.
+
+    No separate CORS middleware is configured alongside this Origin
+    allowlist. That is deliberate, not an oversight: the documented use
+    case for the streamable-http transport (see CLAUDE.md) is non-browser
+    MCP clients - CLI tools, agents, and server-to-server callers - which
+    never send preflight requests and are unaffected by CORS either way.
+    A browser-based MCP client attempting direct cross-origin access would
+    be blocked by the browser's own CORS enforcement (no
+    Access-Control-Allow-Origin is ever sent), same-origin exemptions
+    aside. Do not "fix" this by adding a permissive CORS layer or loosening
+    _LOCAL_ORIGIN_PATTERN above - either would widen exactly the
+    DNS-rebinding/cross-origin attack surface this middleware exists to
+    close.
     """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
@@ -1306,12 +1319,49 @@ class _FixedWindowRateLimiter:
         self._clock = clock
         self._buckets: dict[str, tuple[float, int]] = {}
         self._lock = asyncio.Lock()
+        self._last_swept = self._clock()
+
+    def _sweep_expired_locked(self, now: float) -> None:
+        """Drop bucket entries whose window has already expired. Caller
+        must already hold self._lock.
+
+        Without this, _buckets is never evicted or pruned: every distinct
+        key (client IP - rate limiting is on by default) that ever hits
+        the server adds a permanent entry that's never removed, even long
+        after its own window expired - an unbounded-growth risk for a
+        long-running process, or trivially for an attacker/bot rotating
+        source IPs. Mirrors backends/cache.py's TTLCoalescingCache's own
+        `_sweep_expired_locked`: amortized rather than per-call, running at
+        most once per window_seconds rather than on every hit(), so this
+        stays O(1) amortized rather than O(len(_buckets)) per call.
+
+        Known, accepted limitation (see RateLimitMiddleware's own
+        docstring for the full rationale): this sweep - like the limiter
+        as a whole - is keyed on request.client.host only. A source
+        rotating its IP on every request always starts a brand-new,
+        never-before-seen bucket at count 0, so the per-IP cap never
+        engages against that source's aggregate volume. That is a
+        structural limitation of pure per-IP fixed-window limiting, not
+        something this sweep (or a bigger one) can fix - it would need
+        additional infra (e.g. a WAF) to address.
+        """
+        if now - self._last_swept < self._window_seconds:
+            return
+        self._last_swept = now
+        expired = [
+            key
+            for key, (window_start, _) in self._buckets.items()
+            if now - window_start >= self._window_seconds
+        ]
+        for key in expired:
+            del self._buckets[key]
 
     async def hit(self, key: str) -> bool:
         """Record one hit for `key`. Returns True if within the allowed
         limit, False if this hit breaches it (caller should reject)."""
         now = self._clock()
         async with self._lock:
+            self._sweep_expired_locked(now)
             window_start, count = self._buckets.get(key, (now, 0))
             if now - window_start >= self._window_seconds:
                 window_start, count = now, 0
@@ -1328,7 +1378,14 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     X-Forwarded-For parsing - this codebase has no trusted-proxy allowlist
     anywhere to validate that header against, and trusting a client-
     supplied header without one would make the limiter trivially
-    bypassable.
+    bypassable. A direct consequence: a source rotating its IP on every
+    request is never capped, since each never-before-seen IP always
+    starts its own bucket at count 0 - the per-IP cap only ever bounds a
+    single, stable IP's own volume, never a rotating source's aggregate
+    volume. This is a known, accepted structural limitation of pure
+    per-IP fixed-window limiting, not something fixable at this layer -
+    mitigating it would need additional infra (e.g. a WAF) in front of
+    this server.
     """
 
     def __init__(

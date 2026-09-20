@@ -108,6 +108,13 @@ _POLL_INTERVAL_SECONDS = 0.5
 
 _MAX_TRACES_TO_HYDRATE = 50
 
+# Hard row cap _run_search clamps every query's limit to (also the literal
+# batch-hydration/get_trace limit passed into it) - used by
+# _batch_fetch_trace_rows to detect when a batch hydration query's result
+# was itself truncated by this cap, as opposed to a trace simply having no
+# spans in the window.
+_MAX_QUERY_ROWS = 1000
+
 # Sanity upper bound (10 years, in milliseconds) on a parsed span duration -
 # same rationale/value as the Sentry/X-Ray/New Relic backends' own bound.
 _MAX_REASONABLE_DURATION_MS = 1000 * 60 * 60 * 24 * 365 * 10
@@ -385,6 +392,13 @@ class HoneycombBackend(BaseBackend):
         per ID, used by search_traces to avoid one rate-limited Create
         Query Result call per trace.
 
+        Only a trace that loses ALL its spans to _MAX_QUERY_ROWS is caught
+        elsewhere (as "no spans found"). A trace that loses only SOME of its
+        spans gets no such signal - a trace missing its error span looks
+        healthy, one missing its longest span looks faster than it was - so
+        this logs a WARNING whenever the result hits the cap exactly, giving
+        operators visibility into that partial-truncation case too.
+
         Args:
             trace_ids: Trace IDs to fetch (already capped at
                 _MAX_TRACES_TO_HYDRATE by the caller)
@@ -401,7 +415,16 @@ class HoneycombBackend(BaseBackend):
                 value_type=FilterType.STRING,
             )
         ]
-        rows = await self._run_search(filters, start, end, limit=1000)
+        rows = await self._run_search(filters, start, end, limit=_MAX_QUERY_ROWS)
+
+        if len(rows) >= _MAX_QUERY_ROWS:
+            logger.warning(
+                f"Batch hydration for {len(trace_ids)} trace(s) returned the "
+                f"maximum {_MAX_QUERY_ROWS} rows; some traces in this batch "
+                f"may be missing individual spans (not just entirely "
+                f"missing) due to the cap, which can silently understate a "
+                f"trace's duration or hide an error status"
+            )
 
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -586,9 +609,19 @@ class HoneycombBackend(BaseBackend):
     async def _run_search(
         self, filters: list[Filter], start: datetime, end: datetime, limit: int
     ) -> list[dict[str, Any]]:
-        """Run a raw-span-row search: breakdown on _SEARCH_BREAKDOWNS paired
-        with a trivial COUNT, so each result group corresponds to one span
+        """Run a raw-span-row search: breakdown on _SEARCH_BREAKDOWNS (plus
+        any filtered-on column outside that fixed list) paired with a
+        trivial COUNT, so each result group corresponds to one span
         (trace.span_id is unique per span) - see module docstring point 2.
+
+        _SEARCH_BREAKDOWNS is deliberately extended per-call with any column
+        a filter references but that isn't already a breakdown. Honeycomb's
+        server-side filter can match correctly on a column outside that
+        fixed list (e.g. gen_ai.request.temperature, which isn't in
+        _GEN_AI_BREAKDOWNS), but the returned rows only ever carry data for
+        columns actually requested as breakdowns - without this extension, a
+        filter on such a column would silently return rows with no way to
+        confirm/use the very field it matched on.
 
         Args:
             filters: Filter objects already restricted to supported operators
@@ -600,12 +633,21 @@ class HoneycombBackend(BaseBackend):
             List of raw result rows
         """
         honeycomb_filters = [f for f in (self._filter_to_honeycomb_filter(f) for f in filters) if f]
+
+        breakdowns = list(_SEARCH_BREAKDOWNS)
+        breakdown_set = set(breakdowns)
+        for hc_filter in honeycomb_filters:
+            column = hc_filter.get("column")
+            if isinstance(column, str) and column not in breakdown_set:
+                breakdown_set.add(column)
+                breakdowns.append(column)
+
         return await self._run_query(
-            breakdowns=list(_SEARCH_BREAKDOWNS),
+            breakdowns=breakdowns,
             filters=honeycomb_filters,
             start=start,
             end=end,
-            limit=min(max(limit, 1), 1000),
+            limit=min(max(limit, 1), _MAX_QUERY_ROWS),
             # Recency-biased truncation when more spans match than `limit`
             # - "timestamp" is always one of _SEARCH_BREAKDOWNS, same
             # rationale as Datadog's own "-timestamp" search ordering.

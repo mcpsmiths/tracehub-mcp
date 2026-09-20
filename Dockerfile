@@ -1,7 +1,37 @@
 # Multi-stage build for OpenTelemetry MCP Server
 
 # Stage 1: Builder with official UV image
-FROM ghcr.io/astral-sh/uv:0.12.15-python3.13-trixie-slim AS builder
+#
+# MUST track the same Python minor version as .python-version (3.13) and
+# the runtime stage's base image below - a venv built here is not
+# relocatable across Python minor versions, and the two stages' base images
+# are bumped independently by Dependabot. A prior desync (this stage stayed
+# on 3.13 while the runtime stage below was bumped to 3.14 by a Docker
+# minor/patch-only Dependabot group) silently shipped a container whose
+# entrypoint crashed with "ModuleNotFoundError: No module named
+# 'opentelemetry_mcp'" on every single run, across 4 published releases -
+# `docker build` and the CI Trivy scan both still succeed in that state,
+# since neither actually invokes the venv's own interpreter. Bumping this
+# stage to 3.14 to match is NOT a safe alternative fix without a dedicated
+# upgrade: .python-version pins exactly 3.13, and `uv sync --frozen` with
+# UV_PYTHON_DOWNLOADS=0 fails outright under a 3.14-only interpreter search
+# path ("No interpreter found for Python 3.13"). See the CI workflow's
+# build-test job for the real-container smoke test added to catch this
+# class of bug going forward.
+#
+# Pinned by immutable @sha256 digest (in addition to the tag), mirroring
+# every third-party step in .github/workflows/*.yml being SHA-pinned there:
+# a mutable tag can be re-pushed (registry compromise or an upstream
+# re-tag) and a subsequent build would then silently pull a different
+# image with no build-time detection. The tag is kept alongside the digest
+# (not replaced) so Dependabot's "docker" ecosystem entry in
+# .github/dependabot.yml can keep bumping both together - a digest-only
+# reference has no version for Dependabot to track. Digest verified
+# 2026-09-20 via `docker buildx imagetools inspect
+# ghcr.io/astral-sh/uv:0.12.15-python3.13-trixie-slim` (reads the registry
+# API only, no image layers pulled); re-verify the same way after any tag
+# bump and update the digest below to match.
+FROM ghcr.io/astral-sh/uv:0.12.15-python3.13-trixie-slim@sha256:3ba6b26a3424b592f2dd630450caa526d107597e1cc38f8964a154d4123952b0 AS builder
 
 # Enable bytecode compilation for faster startup and use copy mode
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
@@ -26,7 +56,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 # Stage 2: Runtime - Minimal production image
-FROM python:3.14-slim-trixie AS runtime
+#
+# MUST track the same Python minor version as the builder stage above - see
+# that stage's comment for why.
+#
+# Pinned by immutable @sha256 digest alongside the tag - see the builder
+# stage's FROM comment above for the full rationale (registry-compromise /
+# re-tag protection, and why the tag stays so Dependabot can still bump
+# this). Digest verified 2026-09-20 via `docker buildx imagetools inspect
+# python:3.13-slim-trixie`; re-verify the same way after any tag bump.
+FROM python:3.13-slim-trixie@sha256:8d9d0b8bcf6506481eae4907c18f5e3e7902e629f5f6d684f9e7c32e85e3ddf0 AS runtime
 
 # Upgrade packages to get latest security patches
 RUN apt-get update && \

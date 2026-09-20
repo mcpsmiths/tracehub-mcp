@@ -62,6 +62,7 @@ this in production.
 
 import asyncio
 import logging
+import math
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -296,8 +297,10 @@ class NewRelicBackend(BaseBackend):
         discarded once trace IDs are extracted - get_trace's GraphQL
         hydration path relies on an unverified assumption about the shape
         of distributedTracing.trace's `attributes` field (module docstring
-        point 1), and Sentry's own backend hit exactly this kind of gap in
-        its own native lookup endpoint on a live account. Overlaying the
+        point 1), and Sentry's own backend anticipates exactly this kind of
+        gap defensively in its own native lookup endpoint, for the same
+        reason (no live account was available to verify either shape).
+        Overlaying the
         search rows (which came from the same `SELECT * FROM Span` query
         search_spans already trusts) means a wrong shape assumption in
         get_trace degrades gracefully instead of silently dropping
@@ -588,19 +591,44 @@ class NewRelicBackend(BaseBackend):
 
         Returns:
             List of raw result row dicts (possibly empty)
+
+        Raises:
+            ValueError: If the account/nrql response shape is null/unexpected
+                in a way that indicates account access failure rather than
+                zero matching rows - mirroring get_trace's equivalent
+                null-shape handling above
         """
         data = await self._call_nerdgraph(_NRQL_QUERY, {"accountId": self.account_id, "nrql": nrql})
 
-        actor = data.get("actor")
+        actor = data.get("actor") if isinstance(data, dict) else None
         account = actor.get("account") if isinstance(actor, dict) else None
-        nrql_result = account.get("nrql") if isinstance(account, dict) else None
-        results = nrql_result.get("results") if isinstance(nrql_result, dict) else None
-
-        if not isinstance(results, list):
-            logger.warning(
-                f"Unexpected NRQL results shape (got {type(results).__name__}); treating as empty"
+        if not isinstance(account, dict):
+            # actor.account(id) resolves to null when the account doesn't
+            # exist or this User API key lacks access to it - a
+            # misconfigured BACKEND_NEWRELIC_ACCOUNT_ID or an under-scoped
+            # key, not "zero matching traces". Raise rather than silently
+            # reporting empty results.
+            raise ValueError(
+                f"No account found for account ID {self.account_id} - check "
+                "BACKEND_NEWRELIC_ACCOUNT_ID and that the User API key has "
+                "access to this account"
             )
-            return []
+
+        nrql_result = account.get("nrql")
+        if not isinstance(nrql_result, dict):
+            raise ValueError(
+                f"Unexpected NerdGraph NRQL response shape for account "
+                f"{self.account_id} (expected an nrql object, got "
+                f"{type(nrql_result).__name__})"
+            )
+
+        results = nrql_result.get("results")
+        if not isinstance(results, list):
+            raise ValueError(
+                f"Unexpected NerdGraph NRQL response shape for account "
+                f"{self.account_id} (expected a results list, got "
+                f"{type(results).__name__})"
+            )
         return [r for r in results if isinstance(r, dict)]
 
     async def _run_nrql_search(
@@ -830,15 +858,18 @@ class NewRelicBackend(BaseBackend):
                 SpanData attributes, to exclude from the passthrough
 
         Returns:
-            Dict of remaining scalar attributes, suitable for
-            SpanAttributes(**...)
+            Dict of remaining scalar/list/dict attributes, suitable for
+            SpanAttributes(**...) - list/dict are included (not just
+            scalars) so SpanAttributes' own typed list/dict fields (e.g.
+            gen_ai_response_finish_reasons, gen_ai_input_messages) actually
+            get populated instead of silently losing that data
         """
         return {
             key: value
             for key, value in source.items()
             if key not in structural_fields
             and value is not None
-            and isinstance(value, str | int | float | bool)
+            and isinstance(value, str | int | float | bool | list | dict)
         }
 
     def _parse_newrelic_row(self, row: dict[str, Any]) -> SpanData | None:
@@ -876,7 +907,11 @@ class NewRelicBackend(BaseBackend):
                 logger.warning(f"Rejecting span {span_id}: missing or invalid duration.ms")
                 return None
             duration_ms = float(duration_raw)
-            if duration_ms < 0 or duration_ms > _MAX_REASONABLE_DURATION_MS:
+            if (
+                math.isnan(duration_ms)
+                or duration_ms < 0
+                or duration_ms > _MAX_REASONABLE_DURATION_MS
+            ):
                 logger.warning(
                     f"Rejecting span {span_id}: out-of-range duration.ms {duration_ms!r}"
                 )
@@ -942,7 +977,11 @@ class NewRelicBackend(BaseBackend):
                 logger.warning(f"Rejecting span {span_id}: missing or invalid durationMs")
                 return None
             duration_ms = float(duration_raw)
-            if duration_ms < 0 or duration_ms > _MAX_REASONABLE_DURATION_MS:
+            if (
+                math.isnan(duration_ms)
+                or duration_ms < 0
+                or duration_ms > _MAX_REASONABLE_DURATION_MS
+            ):
                 logger.warning(f"Rejecting span {span_id}: out-of-range durationMs {duration_ms!r}")
                 return None
 

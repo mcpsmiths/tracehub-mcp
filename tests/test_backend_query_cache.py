@@ -97,6 +97,42 @@ async def test_exception_propagates_without_poisoning_subsequent_calls() -> None
     assert call_count == 2
 
 
+async def test_cancelling_the_leader_does_not_hang_a_coalesced_follower_forever() -> None:
+    # asyncio.CancelledError is a BaseException, not an Exception - before
+    # the fix, `except Exception` skipped the leader's cleanup entirely on
+    # cancellation, leaving the shared future forever pending and the key
+    # forever stuck in _inflight. A follower coalesced onto that leader
+    # (line 54's `await future`) would then hang indefinitely, and every
+    # later call for the same key would join the same dead future too.
+    cache = TTLCoalescingCache(ttl_seconds=60.0)
+    started = asyncio.Event()
+
+    async def blocking_compute() -> str:
+        started.set()
+        await asyncio.Event().wait()  # never completes on its own
+        return "unreachable"
+
+    leader = asyncio.create_task(cache.get_or_compute("key", blocking_compute))
+    await started.wait()
+    follower = asyncio.create_task(cache.get_or_compute("key", blocking_compute))
+    await asyncio.sleep(0)  # let the follower actually join the leader's future
+
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+
+    # The follower must see the same cancellation surface, not hang forever.
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(follower, timeout=1.0)
+
+    # And the key must not be permanently poisoned - a fresh call succeeds.
+    async def succeeding_compute() -> str:
+        return "ok"
+
+    result = await asyncio.wait_for(cache.get_or_compute("key", succeeding_compute), timeout=1.0)
+    assert result == "ok"
+
+
 async def test_clear_forces_a_recompute_on_next_call() -> None:
     cache = TTLCoalescingCache(ttl_seconds=60.0)
     call_count = 0
@@ -107,10 +143,34 @@ async def test_clear_forces_a_recompute_on_next_call() -> None:
         return call_count
 
     await cache.get_or_compute("key", compute)
-    cache.clear()
+    await cache.clear()
     await cache.get_or_compute("key", compute)
 
     assert call_count == 2
+
+
+async def test_expired_entries_are_swept_even_if_never_requeried() -> None:
+    # A key that's simply never queried again after expiring would
+    # otherwise sit in _entries forever - only a hit on that exact key
+    # replaces it. This proves the amortized sweep actually reclaims it via
+    # an unrelated key's call, not just via a same-key cache-miss path.
+    clock_value = [0.0]
+    cache = TTLCoalescingCache(ttl_seconds=10.0, clock=lambda: clock_value[0])
+
+    async def compute_stale() -> str:
+        return "stale"
+
+    await cache.get_or_compute("stale-key", compute_stale)
+    assert "stale-key" in cache._entries
+
+    clock_value[0] = 20.0  # well past ttl_seconds - stale-key has expired
+
+    async def compute_other() -> str:
+        return "other"
+
+    await cache.get_or_compute("other-key", compute_other)  # unrelated key
+
+    assert "stale-key" not in cache._entries
 
 
 async def test_different_keys_are_independent() -> None:

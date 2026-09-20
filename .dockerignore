@@ -42,6 +42,9 @@ docs/
 .github/
 
 # Environment files (include these at runtime instead)
+# Broad pattern is the primary safeguard (matches .gitignore's .env.* convention) -
+# excludes every dotenv variant (e.g. .env.datadog), not just the two named below.
+.env.*
 .env
 .env.local
 .env.*.local

@@ -585,6 +585,30 @@ class DatadogBackend(BaseBackend):
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
 
+    def _format_dd_value(self, value: Any, scale: int) -> str:
+        """Format a single filter value for EQUALS/NOT_EQUALS/IN.
+
+        bool must be checked before int | float since bool is an int
+        subclass in Python - otherwise a boolean value would be demoted to
+        a plain 1/0 integer by the scale multiplication below and quoted as
+        a string, instead of emitted as Datadog's bare true/false boolean
+        literal syntax. Shared by all three operators (rather than each
+        duplicating this check) specifically because IN previously lacked
+        it entirely - a boolean value list for IN.
+
+        Args:
+            value: A single filter value (bool | int | float | str | ...)
+            scale: 1_000_000 for the @duration field (ms->ns), else 1
+
+        Returns:
+            A bare true/false literal for a bool, else the escaped/quoted
+            (scaled, if numeric) value
+        """
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        v = value * scale if isinstance(value, int | float) else value
+        return self._escape_dd_query_value(str(v))
+
     def _filter_to_dd_query(self, filter_obj: Filter) -> str | None:
         """Convert a single Filter to a Datadog span search condition.
 
@@ -613,16 +637,14 @@ class DatadogBackend(BaseBackend):
                 return "status:error"
             if field == "status" and value == "OK":
                 return "status:ok"
-            v = value * scale if isinstance(value, int | float) else value
-            return f"{field}:{self._escape_dd_query_value(str(v))}"
+            return f"{field}:{self._format_dd_value(value, scale)}"
 
         elif operator == FilterOperator.NOT_EQUALS:
             if field == "status" and value == "ERROR":
                 return "-status:error"
             if field == "status" and value == "OK":
                 return "-status:ok"
-            v = value * scale if isinstance(value, int | float) else value
-            return f"-{field}:{self._escape_dd_query_value(str(v))}"
+            return f"-{field}:{self._format_dd_value(value, scale)}"
 
         elif operator in (
             FilterOperator.GT,
@@ -659,7 +681,12 @@ class DatadogBackend(BaseBackend):
         elif operator == FilterOperator.IN:
             if not values:
                 return None
-            or_terms = [f"{field}:{self._escape_dd_query_value(str(v))}" for v in values]
+            # Routed through the same _format_dd_value as EQUALS/NOT_EQUALS
+            # so a boolean value in the list gets Datadog's bare true/false
+            # literal (not a quoted "1"/"0") and a duration value gets the
+            # same ms->ns scale conversion, instead of duplicating (and
+            # previously, silently missing) either fix here separately.
+            or_terms = [f"{field}:{self._format_dd_value(v, scale)}" for v in values]
             return "(" + " OR ".join(or_terms) + ")"
 
         logger.warning(f"Unsupported operator for Datadog query: {operator}")

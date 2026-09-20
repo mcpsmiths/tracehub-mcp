@@ -57,11 +57,19 @@ def _error_signal(trace: TraceData) -> tuple[bool, str | None]:
     error_chains = [
         chain for root in roots for chain in span_tree.find_all_error_chains(root, children_map)
     ]
-    if not error_chains:
-        return False, None
+    if error_chains:
+        deepest = max(error_chains, key=len)
+        return True, deepest[-1].service_name
 
-    deepest = max(error_chains, key=len)
-    return True, deepest[-1].service_name
+    # No root-reachable error chain, but an error can still be trapped in a
+    # disconnected/cyclic parent chain no root-first walk can discover (see
+    # span_tree.find_unreachable_error_spans) - the same blind spot
+    # triage_trace's own error-chain search has, and just as real here.
+    unreachable_errors = span_tree.find_unreachable_error_spans(spans, roots, children_map)
+    if not unreachable_errors:
+        return False, None
+    trapped = max(unreachable_errors, key=lambda s: s.duration_ms)
+    return True, trapped.service_name
 
 
 def _root_cause_consistent(
@@ -143,7 +151,12 @@ async def correlate_trace(
         + _SEARCH_WINDOW_PAD
     )
     candidates_by_id: dict[str, TraceData] = {}
-    for service_name in primary_services:
+    # Sorted rather than iterated directly off the set: str hashing (and
+    # therefore set iteration order) is randomized per-process by default
+    # (PYTHONHASHSEED), which would otherwise make candidates_by_id's
+    # insertion order - and thus which candidate wins a tie in the ranked
+    # sort below - non-deterministic across runs for the exact same input.
+    for service_name in sorted(primary_services):
         query = TraceQuery(
             service_name=service_name,
             start_time=start_time,

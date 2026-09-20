@@ -1,12 +1,14 @@
 """Jaeger backend implementation for querying OpenTelemetry traces."""
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes, SpanEvent
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
+from opentelemetry_mcp.constants import Fields
 from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceData, TraceQuery
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,19 @@ class JaegerBackend(BaseBackend):
         # Use to_backend_params for now (handles service, operation, duration, time, tags)
         params = query.to_backend_params()
 
+        # native_filters is only ever a service.name EQUALS filter (see
+        # supported_fields in search_traces/search_spans above), but
+        # to_backend_params() only reads query.service_name directly - it
+        # never consults native_filters. An explicit generic filter on
+        # service.name (distinct from the service_name convenience
+        # parameter) was classified as "native" and therefore never handed
+        # to FilterEngine for client-side application, yet never actually
+        # applied here either, silently dropping it. Apply it now so a
+        # native filter is never a no-op.
+        for native_filter in native_filters:
+            if native_filter.field == Fields.SERVICE_NAME:
+                params["service"] = str(native_filter.value)
+
         logger.debug(f"Searching traces with params: {params}")
 
         response = await self.client.get("/api/traces", params=params)
@@ -172,7 +187,11 @@ class JaegerBackend(BaseBackend):
             min_duration_ms=query.min_duration_ms,
             max_duration_ms=query.max_duration_ms,
             tags=query.tags,
-            limit=query.limit * 2,  # Fetch more traces to ensure we get enough spans
+            # Fetch more traces to ensure we get enough spans, but cap at
+            # TraceQuery.limit's own le=1000 constraint - query.limit can be
+            # up to 1000, so doubling it unclamped would raise a pydantic
+            # ValidationError for any query.limit above 500.
+            limit=min(query.limit * 2, 1000),
             has_error=query.has_error,
             gen_ai_system=query.gen_ai_system,
             gen_ai_request_model=query.gen_ai_request_model,
@@ -213,7 +232,12 @@ class JaegerBackend(BaseBackend):
         """
         logger.debug(f"Fetching trace: {trace_id}")
 
-        response = await self.client.get(f"/api/traces/{trace_id}")
+        # trace_id can originate from an external MCP tool call. It's a URL
+        # *path* segment here, so a crafted value (e.g. containing "../")
+        # could redirect the outbound request to a different path if left
+        # unescaped - see sentry.py's get_trace for the identical pattern.
+        encoded_trace_id = quote(trace_id, safe="")
+        response = await self.client.get(f"/api/traces/{encoded_trace_id}")
         response.raise_for_status()
 
         data = response.json()
@@ -263,7 +287,11 @@ class JaegerBackend(BaseBackend):
         """
         logger.debug(f"Getting operations for service: {service_name}")
 
-        response = await self.client.get(f"/api/services/{service_name}/operations")
+        # service_name can originate from an external MCP tool call and is a
+        # URL *path* segment here - encode it the same way get_trace encodes
+        # trace_id, to avoid a crafted value redirecting the request.
+        encoded_service_name = quote(service_name, safe="")
+        response = await self.client.get(f"/api/services/{encoded_service_name}/operations")
         response.raise_for_status()
 
         data = response.json()
@@ -391,11 +419,20 @@ class JaegerBackend(BaseBackend):
             span_id = str(span_id_raw)
             operation_name = str(operation_name_raw)
 
-            # Parse timestamps (Jaeger uses microseconds)
-            start_time_us = span_data.get("startTime", 0)
-            duration_us = span_data.get("duration", 0)
+            # Parse timestamps (Jaeger uses microseconds).
+            # `or 0` (not the dict.get default) because a malformed span can
+            # return startTime/duration as an explicit JSON null rather than
+            # an absent key - the dict.get default only applies when the key
+            # is missing, matching the same null-vs-missing fix already
+            # applied to list_services/get_service_operations above.
+            start_time_us = span_data.get("startTime") or 0
+            duration_us = span_data.get("duration") or 0
 
-            start_time = datetime.fromtimestamp(start_time_us / 1_000_000)
+            # tz=UTC: Jaeger epoch timestamps are UTC. Without an explicit
+            # tz, fromtimestamp() interprets them in the server process's
+            # local timezone, silently skewing every returned timestamp
+            # unless the host happens to run with TZ=UTC.
+            start_time = datetime.fromtimestamp(start_time_us / 1_000_000, tz=UTC)
             duration_ms = duration_us / 1000
 
             # Get process/service info

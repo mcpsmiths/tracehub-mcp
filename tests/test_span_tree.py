@@ -206,6 +206,28 @@ class TestComputeSelfTimeMs:
 
         assert span_tree.compute_self_time_ms(root, children_map) == 0.0
 
+    def test_negative_duration_leaf_span_clamps_to_zero_not_negative(self) -> None:
+        # SpanData.duration_ms has no ge=0 constraint - a backend affected
+        # by clock skew can legitimately supply a negative value. The
+        # no-children early return must clamp it the same way the
+        # merged-interval path already does, not return it raw.
+        span = _span("leaf", duration_ms=-50.0)
+        children_map = span_tree.build_children_map([span])
+
+        assert span_tree.compute_self_time_ms(span, children_map) == 0.0
+
+    def test_negative_duration_span_with_children_but_no_valid_intervals_clamps_to_zero(
+        self,
+    ) -> None:
+        # Same clamp, but via the "no valid clipped intervals" early return
+        # (all children clip to inverted/empty intervals) rather than the
+        # no-children path.
+        root = _span("root", duration_ms=-50.0)
+        child = _span("child", parent_span_id="root", start_offset_ms=100.0, duration_ms=10.0)
+        children_map = span_tree.build_children_map([root, child])
+
+        assert span_tree.compute_self_time_ms(root, children_map) == 0.0
+
 
 class TestRankByLatencyContribution:
     def test_sorted_descending_by_self_time(self) -> None:
@@ -297,3 +319,39 @@ class TestFindAllErrorChains:
 
         assert len(chains) == 1
         assert [s.span_id for s in chains[0]] == ["a"]
+
+
+class TestFindUnreachableErrorSpans:
+    def test_no_unreachable_spans_returns_empty_list(self) -> None:
+        root = _span("root", status="OK")
+        child = _span("child", parent_span_id="root", status="ERROR")
+        children_map = span_tree.build_children_map([root, child])
+        roots = span_tree.find_roots(children_map)
+
+        assert span_tree.find_unreachable_error_spans([root, child], roots, children_map) == []
+
+    def test_error_in_a_disconnected_cycle_is_found(self) -> None:
+        # A genuine root reachable normally, plus a separate 2-cycle (a's
+        # parent is b, b's parent is a - both present, neither self- nor
+        # missing-referential, so build_children_map's orphan redirect
+        # never fires for either) that no root-first walk can discover.
+        root = _span("root", status="OK")
+        a = _span("a", parent_span_id="b", status="ERROR")
+        b = _span("b", parent_span_id="a", status="OK")
+        spans = [root, a, b]
+        children_map = span_tree.build_children_map(spans)
+        roots = span_tree.find_roots(children_map)
+
+        assert [r.span_id for r in roots] == ["root"]  # confirms a/b are genuinely unreachable
+        unreachable = span_tree.find_unreachable_error_spans(spans, roots, children_map)
+        assert [s.span_id for s in unreachable] == ["a"]
+
+    def test_non_error_spans_in_a_disconnected_cycle_are_not_reported(self) -> None:
+        root = _span("root", status="OK")
+        a = _span("a", parent_span_id="b", status="OK")
+        b = _span("b", parent_span_id="a", status="OK")
+        spans = [root, a, b]
+        children_map = span_tree.build_children_map(spans)
+        roots = span_tree.find_roots(children_map)
+
+        assert span_tree.find_unreachable_error_spans(spans, roots, children_map) == []

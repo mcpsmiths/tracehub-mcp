@@ -82,6 +82,13 @@ async def triage_trace(
     top_contributors = span_tree.rank_by_latency_contribution(spans, children_map)
 
     error_chain_summaries: list[TriagedSpanSummary] | None = None
+    # None of the real root(s) can reach an error trapped in a disconnected
+    # cyclic parent chain (malformed instrumentation) - checked only when
+    # find_all_error_chains came back empty, since a genuine error chain
+    # from a real root always takes priority over this fallback.
+    unreachable_errors = (
+        [] if error_chains else span_tree.find_unreachable_error_spans(spans, roots, children_map)
+    )
 
     if error_chains:
         max_depth = max(len(chain) for chain in error_chains)
@@ -114,6 +121,37 @@ async def triage_trace(
         # critical path from there (rather than an arbitrarily-picked
         # `roots[0]`) keeps it about the same subtree as the verdict.
         critical_path_root = chain[0]
+    elif unreachable_errors:
+        # An error exists but no real root can reach it - almost certainly a
+        # disconnected/cyclic parent chain (malformed instrumentation), not
+        # a genuinely error-free trace. Report it directly rather than
+        # falling through to the pure-latency fallback below, which would
+        # otherwise silently hide a real error.
+        trapped = max(unreachable_errors, key=lambda s: s.duration_ms)
+        error_chain_summaries = [
+            _summarize(trapped, span_tree.compute_self_time_ms(trapped, children_map))
+        ]
+        if detail_level == "full":
+            error_chain_summaries[0] = error_chain_summaries[0].model_copy(
+                update={"error_detail": extract_error_details(trapped)}
+            )
+        likely_root_cause = error_chain_summaries[0]
+        reasoning = (
+            "Error span found, but it is not reachable from any detected trace "
+            "root - likely a disconnected/cyclic parent chain (malformed "
+            "instrumentation) rather than a genuinely error-free trace."
+            + (
+                f" {len(unreachable_errors)} such span(s) found; picked the longest-running one."
+                if len(unreachable_errors) > 1
+                else ""
+            )
+        )
+        verdict = TriageVerdict(
+            likely_root_cause=likely_root_cause, confidence="low", reasoning=reasoning
+        )
+        # No reachable root exists for this span - it stands in as its own
+        # critical-path root, same fallback find_owning_root already uses.
+        critical_path_root = trapped
     else:
         top_span, top_self_time = top_contributors[0]
         verdict = TriageVerdict(

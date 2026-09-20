@@ -1,8 +1,9 @@
 """Traceloop backend implementation for querying Opentelemetry traces."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from urllib.parse import quote
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes, SpanEvent
 from opentelemetry_mcp.backends.base import BaseBackend
@@ -282,9 +283,12 @@ class TraceloopBackend(BaseBackend):
                     span_id=span_data["span_id"],
                     parent_span_id=span_data.get("parent_span_id"),
                     operation_name=span_data["span_name"],
-                    service_name=raw_attrs.get("service.name", ""),
+                    # service_name is a top-level field on the span object, not
+                    # nested inside span_attributes - the real Traceloop API
+                    # never populates span_attributes["service.name"].
+                    service_name=span_data.get("service_name", ""),
                     start_time=datetime.fromtimestamp(
-                        span_data["timestamp"] / 1000
+                        span_data["timestamp"] / 1000, tz=UTC
                     ),  # Convert ms to seconds
                     duration_ms=float(span_data["duration"]),
                     status=self._status_code_to_status(span_data.get("status_code", "UNSET")),
@@ -320,7 +324,12 @@ class TraceloopBackend(BaseBackend):
         """
         logger.debug(f"Getting trace: {trace_id}")
 
-        endpoint = f"/v2/projects/{self.project_id}/traces/{trace_id}/spans"
+        # trace_id is an unvalidated MCP tool argument used as a URL path
+        # segment - encode it so a crafted value (e.g. containing "../")
+        # can't redirect this request to a different path, matching
+        # jaeger.py's/sentry.py's/tempo.py's identical fix for the same
+        # get_trace(trace_id) shape.
+        endpoint = f"/v2/projects/{self.project_id}/traces/{quote(trace_id, safe='')}/spans"
         response = await self.client.get(endpoint)
         response.raise_for_status()
 
@@ -388,35 +397,62 @@ class TraceloopBackend(BaseBackend):
     async def get_service_operations(self, service_name: str) -> list[str]:
         """Get operations for a service from Traceloop.
 
-        Returns workflow names which represent high-level operations.
+        Returns workflow names which represent high-level operations, scoped
+        to the requested service.
+
+        Traceloop's dedicated /spans/workflow-names endpoint only accepts a
+        time range (start_time/end_time) - it has no service-scoping
+        parameter, so it always returns workflow names across ALL services
+        regardless of what's passed here. Instead, this reuses the same
+        unscoped root-spans query list_services() issues (root spans are the
+        top-level, workflow-representing span of each trace) and derives the
+        operation names actually emitted by this service client-side, by
+        cross-referencing each root span's own service_name field.
 
         Args:
-            service_name: Service name (currently not used for filtering)
+            service_name: Service name to scope operations to
 
         Returns:
-            List of operation/workflow names
+            List of operation/workflow names emitted by this service
 
         Raises:
             httpx.HTTPError: If the API request fails
         """
         logger.debug(f"Getting operations for service: {service_name}")
 
-        endpoint = f"/v2/projects/{self.project_id}/spans/workflow-names"
-
-        # Get recent data (last 7 days)
-        params = {
-            "start_time": int((datetime.now() - timedelta(days=7)).timestamp() * 1000),
-            "end_time": int(datetime.now().timestamp() * 1000),
+        body = {
+            "filters": [],
+            "logical_operator": "and",
+            "environments": self.environments,
+            "sort_by": "timestamp",
+            "sort_order": "DESC",
+            "cursor": 0,
+            "limit": 1000,  # Get more traces to find all operations
+            "from_timestamp_sec": int((datetime.now() - timedelta(days=7)).timestamp()),
+            "to_timestamp_sec": int(datetime.now().timestamp()),
         }
 
-        response = await self.client.get(endpoint, params=params)
+        endpoint = f"/v2/projects/{self.project_id}/traces/root-spans"
+        response = await self.client.post(endpoint, json=body)
         response.raise_for_status()
 
-        workflows_raw = response.json()
-        workflows: list[str] = [str(w) for w in workflows_raw]
+        data = response.json()
+        root_spans_data = data.get("root_spans", {})
+        root_spans = root_spans_data.get("data", [])
 
-        logger.debug(f"Found {len(workflows)} workflows")
-        return workflows
+        # Cross-reference: only keep operation names for root spans that were
+        # actually emitted by the requested service.
+        operations_set: set[str] = set()
+        for root_span in root_spans:
+            if root_span.get("service_name") != service_name:
+                continue
+            operation_name = root_span.get("span_name")
+            if operation_name:
+                operations_set.add(str(operation_name))
+
+        operations = sorted(operations_set)
+        logger.debug(f"Found {len(operations)} operations for service {service_name}")
+        return operations
 
     async def health_check(self) -> HealthCheckResponse:
         """Check Traceloop backend health.
@@ -529,7 +565,7 @@ class TraceloopBackend(BaseBackend):
         traceloop_value_type = value_type_map.get(filter_obj.value_type, "string")
 
         if traceloop_value_type == "boolean":
-            serialized_value = "true" if value else "false"
+            serialized_value = "true" if self._normalize_bool_value(value) else "false"
         else:
             serialized_value = str(value)
 
@@ -539,6 +575,28 @@ class TraceloopBackend(BaseBackend):
             "value": serialized_value,
             "value_type": traceloop_value_type,
         }
+
+    @staticmethod
+    def _normalize_bool_value(value: Any) -> bool:
+        """Normalize a filter value to its intended boolean meaning.
+
+        ``Filter.value`` is typed ``str | int | float | bool | None``, and
+        pydantic's smart-mode union validation can pick the ``str`` branch
+        over ``bool`` when a caller sends the string "false" - plain Python
+        truthiness on that string is ``True`` (any non-empty string is
+        truthy), which would silently invert the filter. String forms are
+        mapped explicitly here; everything else falls back to normal Python
+        truthiness.
+
+        Args:
+            value: Raw filter value, expected to represent a boolean
+
+        Returns:
+            The normalized boolean value
+        """
+        if isinstance(value, str):
+            return value.strip().lower() == "true"
+        return bool(value)
 
     @staticmethod
     def _transform_llm_attributes_to_gen_ai(attrs: dict[str, Any]) -> dict[str, Any]:
@@ -610,7 +668,7 @@ class TraceloopBackend(BaseBackend):
                 operation_name=root_span["span_name"],
                 service_name=root_span.get("service_name", ""),
                 start_time=datetime.fromtimestamp(
-                    root_span["timestamp"] / 1000
+                    root_span["timestamp"] / 1000, tz=UTC
                 ),  # Convert ms to seconds
                 duration_ms=float(root_span["duration"]),
                 status=self._status_code_to_status(root_span.get("status_code", "UNSET")),
@@ -650,40 +708,46 @@ class TraceloopBackend(BaseBackend):
         spans = []
 
         for span_data in spans_data:
-            # Extract and transform span attributes from llm.* to gen_ai.* format
-            raw_attrs = span_data.get("span_attributes", {})
-            transformed_attrs = self._transform_llm_attributes_to_gen_ai(raw_attrs)
+            try:
+                # Extract and transform span attributes from llm.* to gen_ai.* format
+                raw_attrs = span_data.get("span_attributes", {})
+                transformed_attrs = self._transform_llm_attributes_to_gen_ai(raw_attrs)
 
-            # Create strongly-typed SpanAttributes
-            span_attributes = SpanAttributes(**transformed_attrs)
+                # Create strongly-typed SpanAttributes
+                span_attributes = SpanAttributes(**transformed_attrs)
 
-            # Transform events if present
-            events_data = span_data.get("events", [])
-            events = [
-                SpanEvent(
-                    name=event.get("name", ""),
-                    timestamp=event.get("timestamp", 0),
-                    attributes=event.get("attributes", {}),
+                # Transform events if present
+                events_data = span_data.get("events", [])
+                events = [
+                    SpanEvent(
+                        name=event.get("name", ""),
+                        timestamp=event.get("timestamp", 0),
+                        attributes=event.get("attributes", {}),
+                    )
+                    for event in events_data
+                ]
+
+                span = SpanData(
+                    trace_id=span_data["trace_id"],
+                    span_id=span_data["span_id"],
+                    parent_span_id=span_data.get("parent_span_id"),
+                    operation_name=span_data["span_name"],
+                    # service_name is a top-level field on the span object, not
+                    # nested inside span_attributes - the real Traceloop API
+                    # never populates span_attributes["service.name"].
+                    service_name=span_data.get("service_name", ""),
+                    start_time=datetime.fromtimestamp(
+                        span_data["timestamp"] / 1000, tz=UTC
+                    ),  # Convert ms to seconds
+                    duration_ms=float(span_data["duration"]),
+                    status=self._status_code_to_status(span_data.get("status_code", "UNSET")),
+                    attributes=span_attributes,
+                    events=events,
                 )
-                for event in events_data
-            ]
 
-            span = SpanData(
-                trace_id=span_data["trace_id"],
-                span_id=span_data["span_id"],
-                parent_span_id=span_data.get("parent_span_id"),
-                operation_name=span_data["span_name"],
-                service_name=raw_attrs.get("service.name", ""),
-                start_time=datetime.fromtimestamp(
-                    span_data["timestamp"] / 1000
-                ),  # Convert ms to seconds
-                duration_ms=float(span_data["duration"]),
-                status=self._status_code_to_status(span_data.get("status_code", "UNSET")),
-                attributes=span_attributes,
-                events=events,
-            )
-
-            spans.append(span)
+                spans.append(span)
+            except Exception as e:
+                logger.warning(f"Failed to parse span {span_data.get('span_id')}: {e}")
 
         # Guard against empty spans list
         if not spans:
@@ -700,7 +764,9 @@ class TraceloopBackend(BaseBackend):
             trace_start = min(start_times)
             # Find the maximum end time
             end_times = [
-                datetime.fromtimestamp(s.start_time.timestamp() + (s.duration_ms / 1000))
+                datetime.fromtimestamp(
+                    s.start_time.timestamp() + (s.duration_ms / 1000), tz=s.start_time.tzinfo
+                )
                 for s in spans
             ]
             trace_end = max(end_times)

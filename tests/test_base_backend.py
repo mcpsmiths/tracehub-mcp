@@ -128,6 +128,43 @@ def test_backend_client_forwards_slow_request_threshold_to_transport() -> None:
     assert client._transport._slow_request_threshold_ms == 500.0
 
 
+async def test_close_does_not_leak_a_client_that_appears_during_its_own_await() -> None:
+    """httpx flips is_closed=True synchronously as the very first line
+    inside aclose(), before the real await that follows it - a concurrent
+    caller of the `client` property (sync, so it can't take a lock against
+    this async close()) can observe that flag mid-close and build a
+    replacement client while close() is still awaiting. Before the fix,
+    close() unconditionally set self._client = None afterward, silently
+    overwriting (and leaking - never .aclose()'d) that replacement."""
+    backend = JaegerBackend(url="http://localhost:16686")
+    client_a = backend.client
+
+    replacement_client = httpx.AsyncClient()
+    closed: list[str] = []
+
+    async def fake_aclose_a() -> None:
+        # Simulates the concurrent property access: by the time this
+        # await point is reached, a different task has already swapped in
+        # a replacement.
+        backend._client = replacement_client
+        closed.append("a")
+
+    client_a.aclose = fake_aclose_a  # type: ignore[method-assign]
+
+    real_replacement_aclose = replacement_client.aclose
+
+    async def fake_aclose_b() -> None:
+        closed.append("b")
+        await real_replacement_aclose()
+
+    replacement_client.aclose = fake_aclose_b  # type: ignore[method-assign]
+
+    await backend.close()
+
+    assert closed == ["a", "b"]  # the replacement must be closed too, not orphaned
+    assert backend._client is None
+
+
 class TestSlowRequestLogging:
     """_RetryingTransport logs a warning when a request exceeds the
     configured threshold, independent of the request's own success/failure."""

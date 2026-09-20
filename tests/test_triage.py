@@ -205,6 +205,48 @@ class TestPureLatencyFallback:
         assert [s.span_id for s in result.critical_path] == ["root2", "busy_leaf"]
 
 
+class TestUnreachableErrorFallback:
+    async def test_error_in_a_disconnected_cycle_is_reported_not_hidden_as_pure_latency(
+        self,
+    ) -> None:
+        # root is a genuine, reachable root with no error. a/b form a
+        # separate 2-cycle (a's parent is b, b's parent is a - both
+        # present) that find_roots can never discover, with an ERROR span
+        # trapped inside it. Before this fix, this trace's error would be
+        # invisible to error_chains and silently fall through to the
+        # pure-latency fallback, misreporting the trace as error-free.
+        root = _span("root", status="OK", duration_ms=50.0)
+        a = _span("a", parent_span_id="b", status="ERROR", duration_ms=10.0)
+        b = _span("b", parent_span_id="a", status="OK", duration_ms=5.0)
+        backend = _backend()
+        backend.get_trace.return_value = _trace([root, a, b])
+
+        result = await triage_trace(backend, "t1")
+
+        assert result.verdict.confidence == "low"
+        assert result.verdict.likely_root_cause is not None
+        assert result.verdict.likely_root_cause.span_id == "a"
+        assert "not reachable" in result.verdict.reasoning.lower()
+        assert result.error_chain is not None
+        assert [s.span_id for s in result.error_chain] == ["a"]
+
+    async def test_real_root_error_chain_takes_priority_over_a_disconnected_cycle(self) -> None:
+        # A real, reachable error chain from `root` must win even when an
+        # unrelated disconnected cyclic island also contains an error.
+        root = _span("root", status="OK", duration_ms=50.0)
+        real_error = _span("real_error", parent_span_id="root", status="ERROR", duration_ms=20.0)
+        a = _span("a", parent_span_id="b", status="ERROR", duration_ms=10.0)
+        b = _span("b", parent_span_id="a", status="OK", duration_ms=5.0)
+        backend = _backend()
+        backend.get_trace.return_value = _trace([root, real_error, a, b])
+
+        result = await triage_trace(backend, "t1")
+
+        assert result.verdict.likely_root_cause is not None
+        assert result.verdict.likely_root_cause.span_id == "real_error"
+        assert result.verdict.confidence == "high"
+
+
 class TestBackendInteraction:
     async def test_get_trace_awaited_with_the_requested_trace_id(self) -> None:
         backend = _backend()

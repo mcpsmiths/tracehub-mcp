@@ -165,6 +165,10 @@ class TestBuildSentryQuery:
         assert backend._filter_to_sentry_query(f) == '!gen_ai.system:"openai"'
 
     def test_status_error_equals(self) -> None:
+        """EQUALS "ERROR" must exclude both "ok" and "unknown" (Sentry's
+        literal for UNSET, per _infer_status) - not just "ok" - otherwise
+        a span that never had its status explicitly set would be
+        misclassified as ERROR instead of UNSET."""
         backend = _backend()
         f = Filter(
             field="status",
@@ -172,7 +176,7 @@ class TestBuildSentryQuery:
             value="ERROR",
             value_type=FilterType.STRING,
         )
-        assert backend._filter_to_sentry_query(f) == "!span.status:ok"
+        assert backend._filter_to_sentry_query(f) == "(!span.status:ok AND !span.status:unknown)"
 
     def test_status_ok_equals(self) -> None:
         backend = _backend()
@@ -185,6 +189,8 @@ class TestBuildSentryQuery:
         assert backend._filter_to_sentry_query(f) == "span.status:ok"
 
     def test_status_error_not_equals(self) -> None:
+        """NOT_EQUALS "ERROR" is the complement of EQUALS "ERROR": OK or
+        explicitly unset ("unknown"), not just OK."""
         backend = _backend()
         f = Filter(
             field="status",
@@ -192,7 +198,26 @@ class TestBuildSentryQuery:
             value="ERROR",
             value_type=FilterType.STRING,
         )
-        assert backend._filter_to_sentry_query(f) == "span.status:ok"
+        assert backend._filter_to_sentry_query(f) == "(span.status:ok OR span.status:unknown)"
+
+    def test_status_ok_not_equals(self) -> None:
+        """Regression test: NOT_EQUALS "OK" previously fell through to the
+        generic branch and built a literal, quoted `!span.status:"OK"` term
+        (a string comparison against the internal "OK" token, which never
+        appears in real lowercase Sentry data) instead of the canonical
+        "not ok" query - unlike EQUALS "ERROR"/"OK" and NOT_EQUALS "ERROR",
+        which were already canonicalized. Reverting the added
+        `if field == "span.status" and value == "OK"` branch in the
+        NOT_EQUALS arm of `_filter_to_sentry_query` reproduces the original
+        bug and makes this test fail."""
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.NOT_EQUALS,
+            value="OK",
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_sentry_query(f) == "!span.status:ok"
 
     def test_duration_gte_uses_ms_suffix_unquoted(self) -> None:
         backend = _backend()
@@ -276,6 +301,28 @@ class TestBuildSentryQuery:
         )
         assert backend._filter_to_sentry_query(f) == (
             '(gen_ai.system:"openai" OR gen_ai.system:"anthropic")'
+        )
+
+    def test_in_on_status_field_canonicalizes_each_value(self) -> None:
+        """Regression test: the IN operator previously built a raw literal
+        term (e.g. `span.status:"ERROR"`) for the status field instead of
+        routing each value through the same OK/ERROR canonicalization
+        EQUALS/NOT_EQUALS already use - a literal quoted "ERROR" never
+        matches real (lowercase) Sentry span.status data, so
+        `status IN ["ERROR"]` would silently match nothing. Reverting the
+        `if field == "span.status": ... else: ...` branch in the IN arm of
+        `_filter_to_sentry_query` back to the unconditional
+        `_format_query_value` form reproduces the bug and makes this test
+        fail."""
+        backend = _backend()
+        f = Filter(
+            field="status",
+            operator=FilterOperator.IN,
+            values=["OK", "ERROR"],
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_sentry_query(f) == (
+            "(span.status:ok OR (!span.status:ok AND !span.status:unknown))"
         )
 
     def test_build_sentry_query_empty_defaults_to_match_all(self) -> None:
@@ -1098,6 +1145,7 @@ class TestListServices:
         backend = _backend()
         fake_response = AsyncMock()
         fake_response.raise_for_status = lambda: None
+        fake_response.links = {}
         fake_response.json = lambda: [{"slug": "beta"}, {"slug": "alpha"}]
         backend._client = AsyncMock()
         backend._client.is_closed = False
@@ -1122,12 +1170,32 @@ class TestListServices:
         backend = _backend()
         fake_response = AsyncMock()
         fake_response.raise_for_status = lambda: None
+        fake_response.links = {}
         fake_response.json = lambda: [{"slug": "ok"}, "not-a-dict", {"no_slug": True}]
         backend._client = AsyncMock()
         backend._client.is_closed = False
         backend._client.get = AsyncMock(return_value=fake_response)
 
         assert await backend.list_services() == ["ok"]
+
+    async def test_follows_cursor_pagination_across_pages(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
+        """Regression test: list_services previously issued a single
+        request and never followed Sentry's Link-header cursor pagination
+        (unlike _search_events_raw), so an org with more projects than fit
+        on one page got a silently truncated service list. Reverting
+        list_services back to a single `self.client.get(...)` call (no
+        pagination loop) reproduces the bug and makes this test fail,
+        since only "alpha" from the first page would be returned."""
+        backend = _backend()
+        page_1 = ([{"slug": "alpha"}], {"next": {"results": "true", "cursor": "cursor-1"}})
+        page_2 = ([{"slug": "beta"}], {"next": {"results": "false", "cursor": "cursor-2"}})
+        backend._client = fake_json_client(page_1, page_2)
+
+        services = await backend.list_services()
+
+        assert services == ["alpha", "beta"]
 
 
 class TestGetServiceOperations:
@@ -1137,6 +1205,7 @@ class TestGetServiceOperations:
         backend = _backend()
         fake_response = AsyncMock()
         fake_response.raise_for_status = lambda: None
+        fake_response.links = {}
         fake_response.json = lambda: ["chat_completion", "embedding"]
         backend._client = AsyncMock()
         backend._client.is_closed = False
@@ -1529,6 +1598,7 @@ class TestGetOperationsViaAttributeValues:
         backend = _backend()
         fake_response = AsyncMock()
         fake_response.raise_for_status = lambda: None
+        fake_response.links = {}
         fake_response.json = lambda: ["db.query", "http.client"]
         backend._client = AsyncMock()
         backend._client.is_closed = False
@@ -1542,6 +1612,7 @@ class TestGetOperationsViaAttributeValues:
         backend = _backend()
         fake_response = AsyncMock()
         fake_response.raise_for_status = lambda: None
+        fake_response.links = {}
         fake_response.json = lambda: [{"value": "db.query"}, {"value": "http.client"}]
         backend._client = AsyncMock()
         backend._client.is_closed = False
@@ -1572,6 +1643,7 @@ class TestGetOperationsViaAttributeValues:
         backend = _backend()
         fake_response = AsyncMock()
         fake_response.raise_for_status = lambda: None
+        fake_response.links = {}
         fake_response.json = lambda: [1, 2, 3]
         backend._client = AsyncMock()
         backend._client.is_closed = False
@@ -1596,6 +1668,26 @@ class TestGetOperationsViaAttributeValues:
         result = await backend._get_operations_via_attribute_values("svc")
 
         assert result is None
+
+    async def test_follows_cursor_pagination_across_pages(
+        self, fake_json_client: Callable[..., Any]
+    ) -> None:
+        """Regression test: _get_operations_via_attribute_values previously
+        issued a single request and never followed Sentry's Link-header
+        cursor pagination (unlike _search_events_raw), so an account with
+        more than one page's worth of distinct span.op values got a
+        silently truncated result. Reverting the pagination loop back to a
+        single `self.client.get(...)` call reproduces the bug and makes
+        this test fail, since only "db.query" from the first page would be
+        returned."""
+        backend = _backend()
+        page_1 = (["db.query"], {"next": {"results": "true", "cursor": "cursor-1"}})
+        page_2 = (["http.client"], {"next": {"results": "false", "cursor": "cursor-2"}})
+        backend._client = fake_json_client(page_1, page_2)
+
+        result = await backend._get_operations_via_attribute_values("svc")
+
+        assert result == ["db.query", "http.client"]
 
     async def test_get_service_operations_falls_back_to_sampling_on_none(self) -> None:
         backend = _backend()
@@ -1642,6 +1734,7 @@ class TestListServicesShapeValidation:
         backend = _backend()
         fake_response = AsyncMock()
         fake_response.raise_for_status = lambda: None
+        fake_response.links = {}
         fake_response.json = lambda: [
             {"slug": "real-project"},
             {"slug": ""},
