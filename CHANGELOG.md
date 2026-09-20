@@ -1,3 +1,9 @@
+## v0.12.2 (2026-09-20)
+
+### Fix
+
+- sync server.json/mcpb manifest with the real 8-backend list
+
 ## v0.12.1 (2026-09-20)
 
 ### Fix
