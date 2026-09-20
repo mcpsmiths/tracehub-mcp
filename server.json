@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mcpsmiths/tracehub-mcp",
-  "description": "Query OpenTelemetry traces from LLM apps across Jaeger, Tempo, Traceloop, Datadog, Sentry, X-Ray.",
+  "description": "Query OpenTelemetry traces from LLM apps across Jaeger, Tempo, Traceloop, Datadog, Sentry, X-Ray, New Relic, and Honeycomb.",
   "repository": {
     "url": "https://github.com/mcpsmiths/tracehub-mcp",
     "source": "github"
   },
-  "version": "0.4.0",
+  "version": "0.12.1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "tracehub-mcp",
-      "version": "0.4.0",
+      "version": "0.12.1",
       "transport": {
         "type": "stdio"
       },
@@ -22,19 +22,19 @@
           "isRequired": true,
           "isSecret": false,
           "format": "string",
-          "choices": ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray"],
+          "choices": ["jaeger", "tempo", "traceloop", "datadog", "sentry", "xray", "newrelic", "honeycomb"],
           "default": "jaeger"
         },
         {
           "name": "BACKEND_URL",
-          "description": "Backend API endpoint, e.g. http://localhost:16686 for Jaeger or https://api.datadoghq.com for Datadog. For the X-Ray backend this is decorative only (e.g. https://xray.us-east-1.amazonaws.com) - never dereferenced for a live request.",
+          "description": "Backend API endpoint, e.g. http://localhost:16686 for Jaeger, https://api.datadoghq.com for Datadog, https://api.newrelic.com/graphql for New Relic, or https://api.honeycomb.io for Honeycomb. For the X-Ray backend this is decorative only (e.g. https://xray.us-east-1.amazonaws.com) - never dereferenced for a live request.",
           "isRequired": true,
           "isSecret": false,
           "format": "string"
         },
         {
           "name": "BACKEND_API_KEY",
-          "description": "API key or auth token. Required for Traceloop, Datadog, and Sentry; not used by Jaeger, Tempo, or X-Ray.",
+          "description": "API key or auth token. Required for Traceloop, Datadog, Sentry, New Relic, and Honeycomb; not used by Jaeger, Tempo, or X-Ray. For New Relic this must be a User API key, not an Ingest or License key; for Honeycomb this must be a Configuration Key, not an Ingest or Management key.",
           "isRequired": false,
           "isSecret": true,
           "format": "string"
@@ -42,6 +42,20 @@
         {
           "name": "BACKEND_AWS_REGION",
           "description": "AWS region, e.g. us-east-1. Required for the X-Ray backend only - X-Ray authenticates via boto3's standard AWS credential chain, not BACKEND_API_KEY.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "BACKEND_NEWRELIC_ACCOUNT_ID",
+          "description": "New Relic account ID, required for the New Relic backend only - NerdGraph queries are user-scoped, not account-scoped, so this identifies which account's data to read.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "BACKEND_HONEYCOMB_DATASET",
+          "description": "Honeycomb dataset slug, required for the Honeycomb backend only - the Query Data API is dataset-scoped.",
           "isRequired": false,
           "isSecret": false,
           "format": "string"

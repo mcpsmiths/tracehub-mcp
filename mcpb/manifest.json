@@ -3,8 +3,8 @@
   "name": "tracehub-mcp",
   "display_name": "TraceHub MCP",
   "version": "0.12.1",
-  "description": "MCP server for querying OpenTelemetry traces across multiple observability backends (Jaeger, Tempo, Traceloop, Datadog, Sentry, and AWS X-Ray) for LLM application debugging",
-  "long_description": "TraceHub MCP lets AI agents query and analyze OpenTelemetry traces from LLM applications. It parses gen_ai.* / llm.* semantic-convention attributes to enable automated debugging, cost analysis, and observability across Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry, and AWS X-Ray backends.\n\nThis bundle does not vendor the server's source: it declares the published `tracehub-mcp` PyPI package as a dependency in a bundled pyproject.toml and runs it via `uv run`, which resolves and installs the real package from PyPI at launch time.",
+  "description": "MCP server for querying OpenTelemetry traces across multiple observability backends (Jaeger, Tempo, Traceloop, Datadog, Sentry, AWS X-Ray, New Relic, and Honeycomb) for LLM application debugging",
+  "long_description": "TraceHub MCP lets AI agents query and analyze OpenTelemetry traces from LLM applications. It parses gen_ai.* / llm.* semantic-convention attributes to enable automated debugging, cost analysis, and observability across Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry, AWS X-Ray, New Relic, and Honeycomb backends.\n\nThis bundle does not vendor the server's source: it declares the published `tracehub-mcp` PyPI package as a dependency in a bundled pyproject.toml and runs it via `uv run`, which resolves and installs the real package from PyPI at launch time.",
   "author": {
     "name": "Doron Kopit, Gal Klienman, Nir Gazit, sairam0424",
     "url": "https://github.com/mcpsmiths/tracehub-mcp"
@@ -29,7 +29,9 @@
     "tempo",
     "traceloop",
     "datadog",
-    "aws-xray"
+    "aws-xray",
+    "new-relic",
+    "honeycomb"
   ],
   "server": {
     "type": "uv",
@@ -51,6 +53,8 @@
         "BACKEND_SENTRY_ORG": "${user_config.backend_sentry_org}",
         "BACKEND_SENTRY_PROJECT": "${user_config.backend_sentry_project}",
         "BACKEND_AWS_REGION": "${user_config.backend_aws_region}",
+        "BACKEND_NEWRELIC_ACCOUNT_ID": "${user_config.backend_newrelic_account_id}",
+        "BACKEND_HONEYCOMB_DATASET": "${user_config.backend_honeycomb_dataset}",
         "BACKEND_ENVIRONMENTS": "${user_config.backend_environments}",
         "BACKEND_TIMEOUT": "${user_config.backend_timeout}",
         "LOG_LEVEL": "${user_config.log_level}",
@@ -72,21 +76,21 @@
     "backend_type": {
       "type": "string",
       "title": "Backend Type",
-      "description": "Observability backend to query. One of: jaeger, tempo, traceloop, datadog, sentry, xray.",
+      "description": "Observability backend to query. One of: jaeger, tempo, traceloop, datadog, sentry, xray, newrelic, honeycomb.",
       "default": "jaeger",
       "required": true
     },
     "backend_url": {
       "type": "string",
       "title": "Backend URL",
-      "description": "Backend API endpoint, e.g. http://localhost:16686 for Jaeger, http://localhost:3200 for Tempo, https://api.traceloop.com/v2 for Traceloop, https://api.datadoghq.com for Datadog, https://sentry.io for Sentry, or https://xray.<region>.amazonaws.com for X-Ray (decorative only for X-Ray - never dereferenced for a live request).",
+      "description": "Backend API endpoint, e.g. http://localhost:16686 for Jaeger, http://localhost:3200 for Tempo, https://api.traceloop.com for Traceloop, https://api.datadoghq.com for Datadog, https://sentry.io for Sentry, https://api.newrelic.com/graphql for New Relic, https://api.honeycomb.io for Honeycomb, or https://xray.<region>.amazonaws.com for X-Ray (decorative only for X-Ray - never dereferenced for a live request).",
       "default": "http://localhost:16686",
       "required": true
     },
     "backend_api_key": {
       "type": "string",
       "title": "Backend API Key",
-      "description": "Authentication key for the backend. Required for Traceloop and Datadog; for Sentry this must be an auth token with trace/event read permissions. Not needed for a local/self-hosted Jaeger or Tempo, or for X-Ray (which authenticates via boto3's standard AWS credential chain).",
+      "description": "Authentication key for the backend. Required for Traceloop, Datadog, New Relic, and Honeycomb; for Sentry this must be an auth token with trace/event read permissions; for New Relic this must be a User API key, not an Ingest or License key; for Honeycomb this must be a Configuration Key, not an Ingest or Management key. Not needed for a local/self-hosted Jaeger or Tempo, or for X-Ray (which authenticates via boto3's standard AWS credential chain).",
       "sensitive": true,
       "required": false
     },
@@ -94,6 +98,18 @@
       "type": "string",
       "title": "AWS Region",
       "description": "AWS region, e.g. us-east-1. Required only when Backend Type is xray.",
+      "required": false
+    },
+    "backend_newrelic_account_id": {
+      "type": "string",
+      "title": "New Relic Account ID",
+      "description": "New Relic account ID. Required only when Backend Type is newrelic - NerdGraph queries are user-scoped, not account-scoped, so this identifies which account's data to read.",
+      "required": false
+    },
+    "backend_honeycomb_dataset": {
+      "type": "string",
+      "title": "Honeycomb Dataset",
+      "description": "Honeycomb dataset slug. Required only when Backend Type is honeycomb - the Query Data API is dataset-scoped.",
       "required": false
     },
     "backend_app_key": {

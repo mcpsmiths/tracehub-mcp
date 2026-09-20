@@ -261,8 +261,14 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
 5. Add the new backend name to every hardcoded backend-name literal site (must update in
    lockstep): [config.py](opentelemetry_mcp/config.py)'s `BackendConfig.type` `Literal` (and its
    `from_env`/`apply_cli_overrides` inline validation lists),
-   [attributes.py](opentelemetry_mcp/attributes.py)'s `HealthCheckResponse.backend` `Literal`, and
-   [server.py](opentelemetry_mcp/server.py)'s `click.Choice` for the `--backend` CLI flag
+   [attributes.py](opentelemetry_mcp/attributes.py)'s `HealthCheckResponse.backend` `Literal`,
+   [server.py](opentelemetry_mcp/server.py)'s `click.Choice` for the `--backend` CLI flag,
+   [server.json](server.json)'s `BACKEND_TYPE` env var `choices` (published to the live MCP
+   Registry on every release - this drifted unnoticed across 3 backend additions in a row before
+   `tests/test_discoverability_sync.py` was added specifically to catch it), and
+   [mcpb/manifest.json](mcpb/manifest.json)'s `user_config.backend_type` description plus a new
+   `user_config.backend_<name>_*` entry (with a matching `server.mcp_config.env` mapping) for any
+   backend-specific required field
 
 ### 6. Adding New Tools
 
