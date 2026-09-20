@@ -1,3 +1,16 @@
+## v0.12.0 (2026-09-20)
+
+### Feat
+
+- **backends**: add Honeycomb (Query Data API) as an 8th backend
+- **backends**: add New Relic (NerdGraph) as a 7th backend
+- **tools**: add correlate_trace for best-effort cross-backend correlation
+- **tools**: add triage_trace for agent-native root-cause diagnosis
+
+### Fix
+
+- **mcp-registry**: shorten server.json description under the registry's 100-char limit
+
 ## v0.11.0 (2026-09-19)
 
 ### Feat
