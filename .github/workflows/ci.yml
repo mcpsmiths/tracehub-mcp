@@ -171,7 +171,15 @@ jobs:
               # re-verify live backend connectivity, which is what the
               # /ready probe itself is for in a real deployment.
               run: |
+                  # --platform explicit: confirmed live on ubuntu-24.04-arm
+                  # that a bare `docker run` (no --platform) picked
+                  # linux/amd64 as its default despite the runner and image
+                  # both being arm64 ("detected host platform
+                  # linux/amd64/v4"), producing "exec format error" against
+                  # the real arm64 binary inside - a runner/buildx platform-
+                  # detection quirk this step must not depend on.
                   docker run -d --name smoke-test \
+                    --platform "${{ matrix.docker-platform }}" \
                     -p 18000:8000 \
                     -e BACKEND_TYPE=jaeger \
                     -e BACKEND_URL=http://localhost:16686 \
