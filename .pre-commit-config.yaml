@@ -38,7 +38,7 @@ repos:
       - id: codespell
         args:
           - "--skip=uv.lock,tests/integration/cassettes/**"
-          - "--ignore-words-list=unparseable"
+          - "--ignore-words-list=unparseable,fo"
 
   # mypy needs pydantic (for its BaseModel plugin) and the rest of this
   # project's real dependency graph to type-check correctly - the mirrors-mypy
