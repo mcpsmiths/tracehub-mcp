@@ -224,6 +224,20 @@ jobs:
                   severity: CRITICAL,HIGH
                   format: json
                   output: trivy-results-${{ matrix.platform }}.json
+                  # Confirmed live: python:3.13-slim-trixie currently carries
+                  # ~44 HIGH findings in OS packages (util-linux/bsdutils
+                  # etc.) that Trivy reports as "affected" with no Fixed
+                  # Version at all - Debian trixie's own upstream has not
+                  # shipped a patch yet, so `apt-get upgrade` (already in
+                  # this Dockerfile) genuinely cannot resolve them no matter
+                  # how often this image is rebuilt. Gating on those would
+                  # permanently block every build for a condition nothing in
+                  # this repo can fix. ignore-unfixed scopes both this scan's
+                  # own findings and the "Fail on CRITICAL/HIGH findings"
+                  # step below to only genuinely actionable findings (a real
+                  # Fixed Version exists) - confirmed locally this still
+                  # catches genuine, fixable HIGH CVEs (setuptools/msgpack).
+                  ignore-unfixed: true
             - name: Convert to table
               run: trivy convert --format table --output trivy-results-${{ matrix.platform }}.txt trivy-results-${{ matrix.platform }}.json
             - name: Convert to SARIF

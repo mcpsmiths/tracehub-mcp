@@ -72,6 +72,19 @@ RUN apt-get update && \
     apt-get upgrade -y && \
     rm -rf /var/lib/apt/lists/*
 
+# The base image's SYSTEM pip vendors its own bundled copy of msgpack
+# (pip/_vendor/msgpack) at a version with a known HIGH CVE
+# (GHSA-6v7p-g79w-8964), and the base image's system setuptools has its own
+# HIGH CVE (CVE-2025-47273) - neither is fixable via `apt-get upgrade`
+# above, since both were installed by the upstream base image's own
+# ensurepip step, not apt/dpkg. This app never invokes system pip/
+# setuptools at runtime - it runs entirely from the uv-managed venv copied
+# in below via its own compiled `tracehub-mcp` console-script entrypoint -
+# so removing them outright resolves both CVEs and reduces the final
+# image's attack surface, rather than trying to patch build-time-only
+# tooling that ships in the production image for no reason.
+RUN python3 -m pip uninstall -y pip setuptools wheel
+
 # Copy the entire app with virtual environment from builder
 COPY --from=builder /app /app
 
