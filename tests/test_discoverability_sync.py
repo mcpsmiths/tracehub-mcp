@@ -66,6 +66,21 @@ def test_server_json_description_mentions_every_backend() -> None:
         )
 
 
+def test_server_json_description_fits_the_registrys_100_char_limit() -> None:
+    # Regression test: this has already broken a live release once before
+    # (commit e35ad7d, when X-Ray was added) and broke it again when New
+    # Relic/Honeycomb were added - the MCP Registry's publish endpoint
+    # rejects server.json with a 422 ("expected length <= 100") if
+    # `description` exceeds 100 characters, which only surfaces as a CI
+    # failure during the release workflow, not during normal development.
+    server_json = json.loads((REPO_ROOT / "server.json").read_text())
+    description = server_json["description"]
+    assert len(description) <= 100, (
+        f"server.json's description is {len(description)} chars, over the MCP "
+        "Registry's 100-char limit - the publish step will fail with a 422"
+    )
+
+
 def test_mcpb_manifest_backend_type_description_mentions_every_backend() -> None:
     manifest = json.loads((REPO_ROOT / "mcpb" / "manifest.json").read_text())
     description = manifest["user_config"]["backend_type"]["description"].lower()

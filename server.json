@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mcpsmiths/tracehub-mcp",
-  "description": "Query OpenTelemetry traces from LLM apps across Jaeger, Tempo, Traceloop, Datadog, Sentry, X-Ray, New Relic, and Honeycomb.",
+  "description": "Query OTel traces across Jaeger, Tempo, Traceloop, Datadog, Sentry, X-Ray, New Relic, Honeycomb.",
   "repository": {
     "url": "https://github.com/mcpsmiths/tracehub-mcp",
     "source": "github"
   },
-  "version": "0.12.1",
+  "version": "0.12.2",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "tracehub-mcp",
-      "version": "0.12.1",
+      "version": "0.12.2",
       "transport": {
         "type": "stdio"
       },
