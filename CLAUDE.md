@@ -718,15 +718,15 @@ Unlike `search_traces` which returns grouped traces, `search_spans` returns indi
 
 ```python
 {
-  "filters": [
-    {
-      "field": "traceloop.span.kind",
-      "operator": "equals",
-      "value": "tool",
-      "value_type": "string"
-    }
-  ],
-  "limit": 100
+    "filters": [
+        {
+            "field": "traceloop.span.kind",
+            "operator": "equals",
+            "value": "tool",
+            "value_type": "string",
+        }
+    ],
+    "limit": 100,
 }
 ```
 
