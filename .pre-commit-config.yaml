@@ -16,7 +16,7 @@ ci:
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
+    rev: v6.0.0 # v6.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
@@ -26,14 +26,14 @@ repos:
       - id: check-added-large-files
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: fa93bc3224c614a0e9786d3e2d3d48edcca246eb # v0.15.1
+    rev: v0.16.8 # v0.15.1
     hooks:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
 
   - repo: https://github.com/codespell-project/codespell
-    rev: 57b21406f092110c18776e39b0bda50d37c945c8 # v2.4.3
+    rev: v2.4.3 # v2.4.3
     hooks:
       - id: codespell
         args:
