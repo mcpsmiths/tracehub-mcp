@@ -53,9 +53,21 @@ jobs:
           image-ref: tracehub-mcp-server:${{ github.sha }}-${{ matrix.platform }}
           format: json
           output: trivy-results-${{ matrix.platform }}.json
-          scanners: vuln,secret,license
+          scanners: vuln,secret
           vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM,LOW
+          # This step and ci.yml's Trivy step both upload to the same SARIF
+          # category (container-security-tracehub-mcp-server-${platform}),
+          # so a mismatched config between them makes GitHub's code-scanning
+          # alerts flip-flop: ci.yml's push-triggered scan (ignore-unfixed:
+          # true, no license scanner) auto-resolves findings that this
+          # schedule-triggered scan then re-opens every night. Removing
+          # `license` (no consumer of that data in this repo - it was just
+          # inflating the Security tab's alert count with base-image OS
+          # package licenses, not real vulnerabilities) and matching
+          # ignore-unfixed keeps both workflows' output for this category
+          # consistent instead of overwriting each other daily.
+          ignore-unfixed: true
 
       - name: Convert Trivy results
         run: |
