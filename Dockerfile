@@ -31,7 +31,7 @@
 # ghcr.io/astral-sh/uv:0.12.15-python3.13-trixie-slim` (reads the registry
 # API only, no image layers pulled); re-verify the same way after any tag
 # bump and update the digest below to match.
-FROM ghcr.io/astral-sh/uv:0.12.15-python3.13-trixie-slim@sha256:3ba6b26a3424b592f2dd630450caa526d107597e1cc38f8964a154d4123952b0 AS builder
+FROM ghcr.io/astral-sh/uv:0.12.19-python3.13-trixie-slim@sha256:aba5f865793af9275ceaa06d30935dfc6db8b81969c9fb099b0ebca6396b189e AS builder
 
 # Enable bytecode compilation for faster startup and use copy mode
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
@@ -65,7 +65,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # re-tag protection, and why the tag stays so Dependabot can still bump
 # this). Digest verified 2026-09-20 via `docker buildx imagetools inspect
 # python:3.13-slim-trixie`; re-verify the same way after any tag bump.
-FROM python:3.13-slim-trixie@sha256:8d9d0b8bcf6506481eae4907c18f5e3e7902e629f5f6d684f9e7c32e85e3ddf0 AS runtime
+FROM python:3.14-slim-trixie@sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234fe388a343719cb97305b3d AS runtime
 
 # Upgrade packages to get latest security patches
 RUN apt-get update && \
