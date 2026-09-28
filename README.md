@@ -638,14 +638,14 @@ tracehub-mcp exposes **19 MCP tools**:
 
 ```python
 {
-  "service_name": "my-app",
-  "start_time": "2024-01-01T00:00:00Z",
-  "end_time": "2024-01-01T23:59:59Z",
-  "gen_ai_system": "openai",
-  "gen_ai_request_model": "gpt-4",
-  "min_duration_ms": 1000,
-  "has_error": false,
-  "limit": 50
+    "service_name": "my-app",
+    "start_time": "2024-01-01T00:00:00Z",
+    "end_time": "2024-01-01T23:59:59Z",
+    "gen_ai_system": "openai",
+    "gen_ai_request_model": "gpt-4",
+    "min_duration_ms": 1000,
+    "has_error": false,
+    "limit": 50,
 }
 ```
 
@@ -654,7 +654,7 @@ Parameters: `service_name`, `operation_name`, `start_time`/`end_time` (ISO 8601)
 **`get_trace`**
 
 ```python
-{ "trace_id": "abc123def456" }
+{"trace_id": "abc123def456"}
 ```
 
 Returns the full trace tree: all spans with attributes, parsed OpenTelemetry `gen_ai.*` data for LLM spans, per-span token usage, error information, and each span's raw `events` (e.g. `gen_ai.evaluation.result`, or any other instrumentation-emitted event — not filtered to a fixed set of names).
@@ -662,7 +662,7 @@ Returns the full trace tree: all spans with attributes, parsed OpenTelemetry `ge
 **`triage_trace`**
 
 ```python
-{ "trace_id": "abc123def456", "detail_level": "summary" }
+{"trace_id": "abc123def456", "detail_level": "summary"}
 ```
 
 Instead of returning raw trace data for an agent to re-derive a diagnosis from every time, this synthesizes one directly: a critical path (the "Last Finishing Child" chain actually responsible for the trace's total latency), the top spans ranked by self-time (latency contribution net of children), and — when the trace contains an error — the deepest error span in the trace's error chain as the likely root cause (`confidence: "high"`, or `"medium"` when multiple equally-deep error chains make blame ambiguous). Falls back to the highest self-time span as a pure-latency diagnosis (`confidence: "low"`) when no error is present. Deterministic — no LLM call — and works against any configured backend, since it operates on `get_trace`'s already-fetched span data. `detail_level: "full"` additionally attaches the diagnosed root cause's raw error detail (message/type/stacktrace) when the verdict is error-driven.
@@ -670,7 +670,7 @@ Instead of returning raw trace data for an agent to re-derive a diagnosis from e
 **`correlate_trace`**
 
 ```python
-{ "trace_id": "abc123def456" }
+{"trace_id": "abc123def456"}
 ```
 
 Tries to find the corresponding trace in a second, independently-configured backend (e.g. a Datadog trace and its downstream Sentry error, joined). Tries a direct `trace_id` match in the secondary backend first (`confidence: "high"`); if that fails, falls back to a time-window + service-name-overlap heuristic search (`confidence: "low"`) - queried once per service name in the primary trace, so this works against backends like Jaeger that require `service_name` on `search_traces`. Each match also reports `root_cause_consistent`: `null` when neither trace has an error to compare, otherwise `true`/`false` for whether both sides agree on the error and which service it traces back to (reusing the same error-chain logic `triage_trace` uses). This is a best-effort correlation, not a guaranteed join - the result always includes a fixed `limitations` list (clock skew, sampling mismatches, partial trace visibility, and the fact that trace-id continuity across a vendor boundary isn't guaranteed even under normal W3C Trace Context propagation). Requires a secondary backend configured via `SECONDARY_BACKEND_TYPE`/`SECONDARY_BACKEND_URL` (see [configuration table](#all-configuration-options)); raises a clear error otherwise.
@@ -679,11 +679,11 @@ Tries to find the corresponding trace in a second, independently-configured back
 
 ```python
 {
-  "start_time": "2024-01-01T00:00:00Z",
-  "end_time": "2024-01-01T23:59:59Z",
-  "service_name": "my-app",
-  "gen_ai_system": "openai",
-  "limit": 1000
+    "start_time": "2024-01-01T00:00:00Z",
+    "end_time": "2024-01-01T23:59:59Z",
+    "service_name": "my-app",
+    "gen_ai_system": "openai",
+    "limit": 1000,
 }
 ```
 
@@ -694,11 +694,7 @@ Returns aggregated prompt/completion/total tokens, broken down by model and by s
 **`find_errors`**
 
 ```python
-{
-  "start_time": "2024-01-15T14:00:00Z",
-  "service_name": "my-app",
-  "limit": 50
-}
+{"start_time": "2024-01-15T14:00:00Z", "service_name": "my-app", "limit": 50}
 ```
 
 Returns error messages, error types, truncated stack traces, and LLM-specific error info.
