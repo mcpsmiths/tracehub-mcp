@@ -18,7 +18,7 @@ Also listed on the [official MCP registry](https://registry.modelcontextprotocol
 
 It speaks OpenTelemetry's `gen_ai.*` semantic conventions natively, so it understands prompts, completions, token usage, and finish reasons as first-class concepts, not just generic span attributes.
 
-tracehub-mcp started as a fork of [traceloop/opentelemetry-mcp-server](https://github.com/traceloop/opentelemetry-mcp-server) (Apache 2.0) — full attribution and fork history are in [NOTICE](NOTICE). It's grown into a 5-backend, security-hardened server maintained independently under [mcpsmiths](https://github.com/mcpsmiths); see [What's Different From Upstream](#whats-different-from-upstream) below for the parts that are new here.
+tracehub-mcp started as a fork of [traceloop/opentelemetry-mcp-server](https://github.com/traceloop/opentelemetry-mcp-server) (Apache 2.0) — full attribution and fork history are in [NOTICE](NOTICE). It's grown into an 8-backend, security-hardened server maintained independently under [mcpsmiths](https://github.com/mcpsmiths); see [What's Different From Upstream](#whats-different-from-upstream) below for the parts that are new here.
 
 ---
 

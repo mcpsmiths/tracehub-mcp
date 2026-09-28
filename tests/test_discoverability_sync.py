@@ -91,6 +91,30 @@ def test_mcpb_manifest_backend_type_description_mentions_every_backend() -> None
         )
 
 
+def test_mcpb_manifest_keywords_mentions_every_backend() -> None:
+    # Regression test: the `keywords` array (a separate field from
+    # `user_config.backend_type.description`, covered by the test above)
+    # once silently dropped "sentry" while every other backend's keyword
+    # was present - found by a live audit, not caught by any existing test.
+    manifest = json.loads((REPO_ROOT / "mcpb" / "manifest.json").read_text())
+    keywords = {k.lower() for k in manifest["keywords"]}
+
+    display_names = {
+        "jaeger": "jaeger",
+        "tempo": "tempo",
+        "traceloop": "traceloop",
+        "datadog": "datadog",
+        "sentry": "sentry",
+        "xray": "aws-xray",
+        "newrelic": "new-relic",
+        "honeycomb": "honeycomb",
+    }
+    for backend in _EXPECTED_BACKENDS:
+        assert display_names[backend] in keywords, (
+            f"mcpb/manifest.json's keywords array is missing the {backend} backend"
+        )
+
+
 def test_mcpb_manifest_env_mapping_covers_every_backend_specific_field() -> None:
     manifest = json.loads((REPO_ROOT / "mcpb" / "manifest.json").read_text())
     env = manifest["server"]["mcp_config"]["env"]

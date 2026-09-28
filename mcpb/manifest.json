@@ -29,6 +29,7 @@
     "tempo",
     "traceloop",
     "datadog",
+    "sentry",
     "aws-xray",
     "new-relic",
     "honeycomb"
