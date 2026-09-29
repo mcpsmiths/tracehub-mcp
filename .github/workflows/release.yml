@@ -12,6 +12,9 @@ on:
         default: ""
         options: ["", "MAJOR", "MINOR", "PATCH"]
 
+permissions:
+  contents: read  # Restrictive default; each job below escalates only what it needs
+
 jobs:
   bump-version:
     name: Bump Version & Create Release

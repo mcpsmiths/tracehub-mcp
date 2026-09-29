@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: "0 10 * * *" # Daily at 10 AM UTC
 
+permissions:
+  contents: read  # Restrictive default; image-scan escalates itself to write
+
 jobs:
   image-scan:
     permissions:

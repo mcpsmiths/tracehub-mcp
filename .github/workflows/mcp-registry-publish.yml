@@ -35,6 +35,9 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read  # Restrictive default; publish-mcp escalates itself to id-token:write
+
 jobs:
   publish-mcp:
     name: Publish server.json to the MCP Registry

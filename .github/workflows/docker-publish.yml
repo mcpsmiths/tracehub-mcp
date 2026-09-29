@@ -6,6 +6,9 @@ on:
       - "v*"
   workflow_dispatch: # Manual trigger via GitHub Actions UI, for re-publishing without a new tag
 
+permissions:
+  contents: read  # Restrictive default; build-and-push escalates to packages:write itself
+
 jobs:
   build-and-push:
     name: Build and Push to GHCR
