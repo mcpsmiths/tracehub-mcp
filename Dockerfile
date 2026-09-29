@@ -27,11 +27,11 @@
 # (not replaced) so Dependabot's "docker" ecosystem entry in
 # .github/dependabot.yml can keep bumping both together - a digest-only
 # reference has no version for Dependabot to track. Digest verified
-# 2026-09-20 via `docker buildx imagetools inspect
-# ghcr.io/astral-sh/uv:0.12.15-python3.13-trixie-slim` (reads the registry
+# 2026-09-29 via `docker buildx imagetools inspect
+# ghcr.io/astral-sh/uv:0.12.19-python3.13-trixie-slim` (reads the registry
 # API only, no image layers pulled); re-verify the same way after any tag
 # bump and update the digest below to match.
-FROM ghcr.io/astral-sh/uv:0.12.15-python3.13-trixie-slim@sha256:3ba6b26a3424b592f2dd630450caa526d107597e1cc38f8964a154d4123952b0 AS builder
+FROM ghcr.io/astral-sh/uv:0.12.19-python3.13-trixie-slim@sha256:aba5f865793af9275ceaa06d30935dfc6db8b81969c9fb099b0ebca6396b189e AS builder
 
 # Enable bytecode compilation for faster startup and use copy mode
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
