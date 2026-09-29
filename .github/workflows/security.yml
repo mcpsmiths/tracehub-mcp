@@ -5,14 +5,13 @@ on:
   schedule:
     - cron: "0 10 * * *" # Daily at 10 AM UTC
 
-permissions:
-  contents: read
-  actions: read
-  security-events: write
-  pull-requests: write
-
 jobs:
   image-scan:
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+      pull-requests: write
     strategy:
       fail-fast: false
       matrix:

@@ -6,14 +6,13 @@ on:
       - "v*"
   workflow_dispatch: # Manual trigger via GitHub Actions UI, for re-publishing without a new tag
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
   build-and-push:
     name: Build and Push to GHCR
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
