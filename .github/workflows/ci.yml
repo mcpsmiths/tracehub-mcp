@@ -57,7 +57,15 @@ jobs:
               with:
                 token: ${{ secrets.CODECOV_TOKEN }}
                 files: ./coverage.xml
-                fail_ci_if_error: true
+                # GitHub withholds repo secrets from Dependabot-triggered runs,
+                # so CODECOV_TOKEN is always empty here and Codecov's own
+                # "token required because branch is protected" check fails the
+                # upload every time - this was permanently blocking the "Test"
+                # required check (and therefore every Dependabot PR) even
+                # though the test suite itself passed. Only relax the failure
+                # for that one actor; a real upload failure on a human-authored
+                # push/PR still fails the build.
+                fail_ci_if_error: ${{ github.actor != 'dependabot[bot]' }}
     conformance:
         name: MCP Conformance
         runs-on: ubuntu-latest
