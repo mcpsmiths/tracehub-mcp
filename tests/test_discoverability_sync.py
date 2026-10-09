@@ -17,6 +17,7 @@ or Honeycomb at all.
 """
 
 import json
+import tomllib
 from pathlib import Path
 from typing import get_args
 
@@ -25,6 +26,20 @@ from opentelemetry_mcp.config import BackendConfig
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _EXPECTED_BACKENDS = set(get_args(BackendConfig.model_fields["type"].annotation))
+
+# Keyword/topic slugs are the hyphenated vendor names, not config.py's
+# Literal values ("aws-xray", not "xray"). Shared by every keyword-list
+# test below so the two lists can't drift from each other either.
+_KEYWORD_SLUGS = {
+    "jaeger": "jaeger",
+    "tempo": "tempo",
+    "traceloop": "traceloop",
+    "datadog": "datadog",
+    "sentry": "sentry",
+    "xray": "aws-xray",
+    "newrelic": "new-relic",
+    "honeycomb": "honeycomb",
+}
 
 
 def test_expected_backends_is_not_accidentally_empty() -> None:
@@ -99,19 +114,24 @@ def test_mcpb_manifest_keywords_mentions_every_backend() -> None:
     manifest = json.loads((REPO_ROOT / "mcpb" / "manifest.json").read_text())
     keywords = {k.lower() for k in manifest["keywords"]}
 
-    display_names = {
-        "jaeger": "jaeger",
-        "tempo": "tempo",
-        "traceloop": "traceloop",
-        "datadog": "datadog",
-        "sentry": "sentry",
-        "xray": "aws-xray",
-        "newrelic": "new-relic",
-        "honeycomb": "honeycomb",
-    }
     for backend in _EXPECTED_BACKENDS:
-        assert display_names[backend] in keywords, (
+        assert _KEYWORD_SLUGS[backend] in keywords, (
             f"mcpb/manifest.json's keywords array is missing the {backend} backend"
+        )
+
+
+def test_pyproject_keywords_mentions_every_backend() -> None:
+    # Regression test: PyPI's keyword index is its own discoverability
+    # surface - third-party MCP directories (mcprush, for one) read it
+    # straight from pypi.org/pypi/<project>/json. "sentry" was never in this
+    # list at all, and nobody added New Relic or Honeycomb after X-Ray;
+    # found by auditing a live directory listing, not by any existing test.
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    keywords = {k.lower() for k in pyproject["project"]["keywords"]}
+
+    for backend in _EXPECTED_BACKENDS:
+        assert _KEYWORD_SLUGS[backend] in keywords, (
+            f"pyproject.toml's keywords list is missing the {backend} backend"
         )
 
 

@@ -265,10 +265,14 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
    [server.py](opentelemetry_mcp/server.py)'s `click.Choice` for the `--backend` CLI flag,
    [server.json](server.json)'s `BACKEND_TYPE` env var `choices` (published to the live MCP
    Registry on every release - this drifted unnoticed across 3 backend additions in a row before
-   `tests/test_discoverability_sync.py` was added specifically to catch it), and
+   `tests/test_discoverability_sync.py` was added specifically to catch it),
    [mcpb/manifest.json](mcpb/manifest.json)'s `user_config.backend_type` description plus a new
    `user_config.backend_<name>_*` entry (with a matching `server.mcp_config.env` mapping) for any
-   backend-specific required field
+   backend-specific required field, [pyproject.toml](pyproject.toml)'s `keywords` list (PyPI's
+   keyword index - third-party MCP directories such as mcprush read it straight from pypi.org;
+   `sentry` was missing here from day one until a live directory listing surfaced it), and the
+   GitHub repo topics (`gh repo edit mcpsmiths/tracehub-mcp --add-topic <name>` - not file-backed,
+   so the test can't cover it; verify with `gh api repos/mcpsmiths/tracehub-mcp --jq .topics`)
 
 ### 6. Adding New Tools
 

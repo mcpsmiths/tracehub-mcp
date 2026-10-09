@@ -10,7 +10,7 @@
 [![mcpsmiths/tracehub-mcp MCP server](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp/badges/score.svg)](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp)
 [![M8ven Score](https://m8ven.ai/badge/mcp/mcpsmiths/tracehub-mcp)](https://m8ven.ai/mcp/mcpsmiths/tracehub-mcp)
 
-Also listed on the [official MCP registry](https://registry.modelcontextprotocol.io/v0/servers/io.github.mcpsmiths%2Ftracehub-mcp/versions) as `io.github.mcpsmiths/tracehub-mcp` (the registry's own `?search=` endpoint can surface an outdated version first; this exact-name endpoint always reflects the current `isLatest` release).
+Also listed on the [official MCP registry](https://registry.modelcontextprotocol.io/v0/servers/io.github.mcpsmiths%2Ftracehub-mcp/versions) as `io.github.mcpsmiths/tracehub-mcp` (the registry's own `?search=` endpoint can surface an outdated version first; this exact-name endpoint always reflects the current `isLatest` release), and on [mcprush](https://mcprush.com/mcpsmiths/tracehub-mcp).
 
 [![tracehub-mcp MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp/badges/card.svg)](https://glama.ai/mcp/servers/mcpsmiths/tracehub-mcp)
 

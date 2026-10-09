@@ -24,7 +24,10 @@ keywords = [
     "tempo",
     "traceloop",
     "datadog",
-    "aws-xray"
+    "sentry",
+    "aws-xray",
+    "new-relic",
+    "honeycomb"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
