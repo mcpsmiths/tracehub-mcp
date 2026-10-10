@@ -1,3 +1,17 @@
+## v0.12.3 (2026-10-10)
+
+### Fix
+
+- **deps**: bump pyjwt to 2.15.1 and urllib3 to 2.8.0 to clear new pip-audit advisories
+- **ci**: add explicit restrictive top-level permissions alongside job-level scoping
+- **ci**: scope GITHUB_TOKEN permissions to the job that actually needs them
+- **ci**: stop Codecov's missing-token failure from blocking every Dependabot PR
+- **ci**: align security.yml's Trivy config with ci.yml to stop nightly alert flip-flop
+- correct stale backend counts found by a full end-to-end verify
+- sync uv.lock's self-referential version pin to 0.12.2
+- add codespell false-positive for a deliberate CONTAINS-filter test value
+- shorten server.json description under the registry's 100-char limit
+
 ## v0.12.2 (2026-09-20)
 
 ### Fix
