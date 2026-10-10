@@ -11,7 +11,10 @@ version_files = [
     "pyproject.toml:version",
     "src/opentelemetry_mcp/__init__.py:__version__",
     "mcpb/manifest.json:version",
-    "mcpb/pyproject.toml:version"
+    "mcpb/pyproject.toml:version",
+    # both "version" fields (top-level + packages[0]) - published to the MCP Registry on
+    # every release; drifted to 0.4.0 once because it was missing from this list
+    "server.json:version"
 ]
 
 # Changelog configuration
