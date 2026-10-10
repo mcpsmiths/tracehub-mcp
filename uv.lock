@@ -2370,7 +2370,7 @@ wheels = [
 
 [[package]]
 name = "tracehub-mcp"
-version = "0.12.2"
+version = "0.12.3"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
