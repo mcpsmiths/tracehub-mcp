@@ -17,6 +17,13 @@ version_files = [
     "server.json:version"
 ]
 
+# uv.lock also carries this project's own version but cannot be a version_files
+# entry (every package in it has a `version = "..."` line). This hook rewrites
+# just that block after the files above are bumped and before the `git commit -a`,
+# so the bump commit and the tag carry a consistent lockfile. Runs inside
+# commitizen-action's python:3.10-alpine container - stdlib only, no uv there.
+pre_bump_hooks = ["python3 scripts/sync_uv_lock_version.py"]
+
 # Changelog configuration
 [tool.commitizen.changelog]
 # Categorize commits by type

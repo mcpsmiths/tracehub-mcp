@@ -54,7 +54,13 @@ jobs:
           # main-protection ruleset's bypass covers.
           github_token: ${{ secrets.RELEASE_PAT }}
           increment: ${{ github.event.inputs.increment }}
-          changelog_increment_filename: body.md
+          # Deliberately NOT using changelog_increment_filename: that makes the
+          # action run `cz bump --changelog-to-stdout > body.md`, and everything
+          # else cz prints to stdout lands in the file too - the `git commit`
+          # summary ("[main <sha>] bump: ..." / "N files changed") was the last
+          # two lines of every GitHub Release body from v0.2.0 to v0.12.3, and
+          # the pre_bump_hooks banner ("Running hook ...") would join it now.
+          # The notes are rendered by the step below instead.
           # The action's own entrypoint runs `git config --local user.name/email`
           # unconditionally using these inputs (default: github-actions[bot]) --
           # a standalone `git config` step earlier in this job has no effect,
@@ -84,6 +90,15 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Render release notes for the new version
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          # The bump above already appended this version to CHANGELOG.md and
+          # created its tag; `cz changelog --dry-run <version>` renders just
+          # that version's section to stdout (nothing else is printed there).
+          cz changelog --dry-run "${{ steps.cz.outputs.version }}" > body.md
+          echo "--- body.md ---"; cat body.md
 
       - name: Create GitHub Release
         if: steps.check_release.outputs.exists == 'false'
