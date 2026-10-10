@@ -270,9 +270,14 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
    `user_config.backend_<name>_*` entry (with a matching `server.mcp_config.env` mapping) for any
    backend-specific required field, [pyproject.toml](pyproject.toml)'s `keywords` list (PyPI's
    keyword index - third-party MCP directories such as mcprush read it straight from pypi.org;
-   `sentry` was missing here from day one until a live directory listing surfaced it), and the
+   `sentry` was missing here from day one until a live directory listing surfaced it), the
    GitHub repo topics (`gh repo edit mcpsmiths/tracehub-mcp --add-topic <name>` - not file-backed,
-   so the test can't cover it; verify with `gh api repos/mcpsmiths/tracehub-mcp --jq .topics`)
+   so the test can't cover it; verify with `gh api repos/mcpsmiths/tracehub-mcp --jq .topics`),
+   and the mcprush listing's own "What it does" paragraph
+   (https://mcprush.com/mcpsmiths/tracehub-mcp, edited in mcprush Studio -> Manage listing by
+   the mcpsmiths publisher account) - mcprush imports a listing once and never re-reads its
+   fields afterwards (it only re-scans for the security grade), so that paragraph sat on the
+   pre-X-Ray 5-backend wording for three releases until it was spotted by hand
 
 ### 6. Adding New Tools
 
