@@ -7,7 +7,7 @@ import asyncio
 
 import pytest
 
-from opentelemetry_mcp.backends.cache import TTLCoalescingCache
+from opentelemetry_mcp.backends.cache import DEFAULT_QUERY_CACHE_MAX_ENTRIES, TTLCoalescingCache
 
 
 async def test_cache_hit_within_ttl_avoids_recompute() -> None:
@@ -304,3 +304,49 @@ async def test_clear_sheds_a_stuck_inflight_computation() -> None:
 
     release.set()
     assert await asyncio.wait_for(old_leader, timeout=1.0) == "late"
+
+
+async def test_entry_count_is_bounded_independent_of_ttl() -> None:
+    # Retention used to be modelled purely as time: a long TTL (or an
+    # ever-changing key space - one key per distinct filter combination)
+    # retained one full entry per distinct query with no aggregate bound.
+    clock_value = [0.0]
+    cache = TTLCoalescingCache(600.0, clock=lambda: clock_value[0], max_entries=100)
+
+    async def make_compute(value: int) -> int:
+        return value
+
+    for i in range(101):
+        await cache.get_or_compute(f"key-{i}", lambda i=i: make_compute(i))  # type: ignore[misc]
+
+    assert len(cache._entries) == 100
+    assert "key-0" not in cache._entries  # the oldest entry was evicted
+    assert "key-1" in cache._entries
+
+    # LRU, not FIFO: a hit refreshes key-2, so the next insert evicts key-1
+    # (now the least recently used) and key-2 survives.
+    assert await cache.get_or_compute("key-2", lambda: make_compute(2)) == 2
+    await cache.get_or_compute("key-101", lambda: make_compute(101))
+
+    assert len(cache._entries) == 100
+    assert "key-2" in cache._entries
+    assert "key-1" not in cache._entries
+    assert "key-3" in cache._entries
+
+
+@pytest.mark.parametrize(
+    ("ttl_seconds", "max_entries"),
+    [(float("inf"), 1024), (float("nan"), 1024), (60.0, 0), (0.0, 1024), (-1.0, 1024)],
+)
+def test_non_finite_or_non_positive_ttl_and_zero_capacity_raise(
+    ttl_seconds: float, max_entries: int
+) -> None:
+    # With an infinite TTL the amortized sweep gate never opened, so nothing
+    # was ever evicted; the cache must refuse to be built that way.
+    with pytest.raises(ValueError):
+        TTLCoalescingCache(ttl_seconds, max_entries=max_entries)
+
+
+def test_default_capacity_is_the_documented_constant() -> None:
+    assert DEFAULT_QUERY_CACHE_MAX_ENTRIES == 1024
+    assert TTLCoalescingCache(60.0)._max_entries == DEFAULT_QUERY_CACHE_MAX_ENTRIES

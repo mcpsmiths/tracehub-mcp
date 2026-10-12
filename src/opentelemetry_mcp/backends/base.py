@@ -23,7 +23,7 @@ from tenacity import (
 )
 
 from opentelemetry_mcp.attributes import HealthCheckResponse
-from opentelemetry_mcp.backends.cache import TTLCoalescingCache
+from opentelemetry_mcp.backends.cache import DEFAULT_QUERY_CACHE_MAX_ENTRIES, TTLCoalescingCache
 from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceData, TraceQuery
 from opentelemetry_mcp.security import is_cloud_metadata_host
 
@@ -40,11 +40,40 @@ _CACHEABLE_METHODS = (
 )
 
 
+# Upper bound on the rendered size of one cache key. A key is built from the
+# validated arguments (pydantic models rendered with model_dump_json), so its
+# size tracks the request's - up to the MCP transport's request-body cap. For
+# Jaeger any non-service.name filter is applied client-side, so a request
+# carrying an arbitrarily large filter value costs the backend one small GET
+# that succeeds empty while the server would retain the whole filter text
+# under the key. A call whose key exceeds this is still served; it just never
+# occupies a cache slot.
+_MAX_CACHE_KEY_BYTES = 64 * 1024
+
+
+def _render_cache_part(value: Any) -> Any:
+    return value.model_dump_json() if isinstance(value, BaseModel) else value
+
+
 def _cache_key(method_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
     parts: list[Any] = [method_name]
-    for value in (*args, *kwargs.values()):
-        parts.append(value.model_dump_json() if isinstance(value, BaseModel) else value)
+    parts.extend(_render_cache_part(value) for value in args)
+    # Keyword names participate (sorted, so call-site order is irrelevant):
+    # two calls passing the same values under different parameter names are
+    # different queries and must not share an entry.
+    parts.extend((name, _render_cache_part(value)) for name, value in sorted(kwargs.items()))
     return tuple(parts)
+
+
+def _cache_key_size(key: tuple[Any, ...]) -> int:
+    """UTF-8 size of every string the key carries - the only parts whose
+    size a caller controls (method names, ids, rendered query models)."""
+    size = 0
+    for part in key:
+        value = part[1] if isinstance(part, tuple) else part
+        if isinstance(value, str):
+            size += len(value.encode("utf-8"))
+    return size
 
 
 def _wrap_with_cache(
@@ -56,6 +85,10 @@ def _wrap_with_cache(
         if cache is None:
             return await original(self, *args, **kwargs)
         key = _cache_key(method_name, args, kwargs)
+        if _cache_key_size(key) > _MAX_CACHE_KEY_BYTES:
+            # Oversized key: no lookup, no store - a request-sized key must
+            # never occupy one of the bounded slots.
+            return await original(self, *args, **kwargs)
         return await cache.get_or_compute(key, lambda: original(self, *args, **kwargs))
 
     return wrapper
@@ -410,13 +443,18 @@ class BaseBackend(ABC):
         self.max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
         self._query_cache: TTLCoalescingCache | None = None
 
-    def configure_query_cache(self, ttl_seconds: float | None) -> None:
+    def configure_query_cache(
+        self, ttl_seconds: float | None, max_entries: int = DEFAULT_QUERY_CACHE_MAX_ENTRIES
+    ) -> None:
         """Mirrors slow_request_threshold_ms's own post-construction-
         attribute pattern above - set by the caller (server.py's
         _create_backend) after construction, since several subclasses
-        override __init__ with their own named params."""
+        override __init__ with their own named params. `max_entries` is
+        the LRU bound on cached results (QUERY_CACHE_MAX_ENTRIES)."""
         self._query_cache = (
-            TTLCoalescingCache(ttl_seconds) if ttl_seconds and ttl_seconds > 0 else None
+            TTLCoalescingCache(ttl_seconds, max_entries=max_entries)
+            if ttl_seconds and ttl_seconds > 0
+            else None
         )
 
     @property

@@ -137,6 +137,21 @@
           "format": "number"
         },
         {
+          "name": "QUERY_CACHE_TTL_SECONDS",
+          "description": "Cache backend query results for this many seconds with in-flight request coalescing; finite, > 0 and at most 86400 (one day). Unset disables the cache.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number"
+        },
+        {
+          "name": "QUERY_CACHE_MAX_ENTRIES",
+          "description": "Upper bound on the number of cached query results held at once (1-100000); the least-recently-used entry is evicted first.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number",
+          "default": "1024"
+        },
+        {
           "name": "OTEL_EXPORTER_OTLP_ENDPOINT",
           "description": "Enables opt-in OTel self-instrumentation of tool calls when set. Unset means zero overhead - no TracerProvider is configured and no middleware is registered.",
           "isRequired": false,

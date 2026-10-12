@@ -1,6 +1,7 @@
 """Configuration management for Opentelemetry MCP Server."""
 
 import logging
+import math
 import os
 from typing import Literal
 
@@ -8,6 +9,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, field_validator
 
 from opentelemetry_mcp.backends.base import DEFAULT_MAX_RESPONSE_BYTES
+from opentelemetry_mcp.backends.cache import DEFAULT_QUERY_CACHE_MAX_ENTRIES
 from opentelemetry_mcp.security import is_cloud_metadata_host, is_loopback_host
 
 logger = logging.getLogger(__name__)
@@ -206,6 +208,13 @@ class BackendConfig(BaseModel):
         )
 
 
+# Ceilings for the opt-in query cache. One day mirrors BACKEND_TIMEOUT's own
+# `le` pattern; 100000 entries is far above any deployment's distinct query
+# count but still a bound a single peer cannot push past.
+MAX_QUERY_CACHE_TTL_SECONDS = 86400.0
+MAX_QUERY_CACHE_MAX_ENTRIES = 100_000
+
+
 class ServerConfig(BaseModel):
     """MCP Server configuration."""
 
@@ -219,7 +228,18 @@ class ServerConfig(BaseModel):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     max_traces_per_query: int = Field(default=500, ge=1, le=1000)
     slow_request_threshold_ms: float | None = Field(default=None, gt=0)
-    query_cache_ttl_seconds: float | None = Field(default=None, gt=0)
+    # Bounded above (one day) and finite: an inf TTL meant "never expire"
+    # and never opened the cache's expiry sweep, so nothing was ever evicted
+    # from the process-wide cache every MCP session shares.
+    query_cache_ttl_seconds: float | None = Field(
+        default=None, gt=0, le=MAX_QUERY_CACHE_TTL_SECONDS, allow_inf_nan=False
+    )
+    # LRU entry bound on the query cache, independent of the TTL - the
+    # aggregate cap on what distinct tool arguments can make the process
+    # retain (backends/cache.py's DEFAULT_QUERY_CACHE_MAX_ENTRIES).
+    query_cache_max_entries: int = Field(
+        default=DEFAULT_QUERY_CACHE_MAX_ENTRIES, ge=1, le=MAX_QUERY_CACHE_MAX_ENTRIES
+    )
 
     @classmethod
     def from_env(cls) -> "ServerConfig":
@@ -264,6 +284,20 @@ class ServerConfig(BaseModel):
                     f"'{query_cache_ttl_str}': {e}. Query caching disabled."
                 )
 
+        # Parse query_cache_max_entries with validation (same warn-and-default
+        # pattern; out-of-range values are rejected by the field bounds below)
+        query_cache_max_entries = DEFAULT_QUERY_CACHE_MAX_ENTRIES
+        query_cache_max_entries_str = os.getenv("QUERY_CACHE_MAX_ENTRIES")
+        if query_cache_max_entries_str:
+            try:
+                query_cache_max_entries = int(query_cache_max_entries_str)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Invalid QUERY_CACHE_MAX_ENTRIES value "
+                    f"'{query_cache_max_entries_str}': {e}. "
+                    f"Using default: {DEFAULT_QUERY_CACHE_MAX_ENTRIES}"
+                )
+
         return cls(
             backend=BackendConfig.from_env(),
             secondary_backend=BackendConfig.from_env_optional(),
@@ -271,6 +305,7 @@ class ServerConfig(BaseModel):
             max_traces_per_query=max_traces_per_query,
             slow_request_threshold_ms=slow_request_threshold_ms,
             query_cache_ttl_seconds=query_cache_ttl_seconds,
+            query_cache_max_entries=query_cache_max_entries,
         )
 
     def apply_cli_overrides(
@@ -290,6 +325,7 @@ class ServerConfig(BaseModel):
         max_traces_per_query: int | None = None,
         slow_request_threshold_ms: float | None = None,
         query_cache_ttl_seconds: float | None = None,
+        query_cache_max_entries: int | None = None,
     ) -> None:
         """Apply CLI argument overrides to configuration."""
         if slow_request_threshold_ms is not None:
@@ -301,12 +337,25 @@ class ServerConfig(BaseModel):
             self.slow_request_threshold_ms = slow_request_threshold_ms
 
         if query_cache_ttl_seconds is not None:
-            if query_cache_ttl_seconds <= 0:
+            # isfinite first: nan compares False against every bound below.
+            if (
+                not math.isfinite(query_cache_ttl_seconds)
+                or query_cache_ttl_seconds <= 0
+                or query_cache_ttl_seconds > MAX_QUERY_CACHE_TTL_SECONDS
+            ):
                 raise ValueError(
                     f"Invalid query_cache_ttl_seconds: {query_cache_ttl_seconds}. "
-                    "Must be greater than 0"
+                    f"Must be greater than 0 and at most {MAX_QUERY_CACHE_TTL_SECONDS:g}"
                 )
             self.query_cache_ttl_seconds = query_cache_ttl_seconds
+
+        if query_cache_max_entries is not None:
+            if not (1 <= query_cache_max_entries <= MAX_QUERY_CACHE_MAX_ENTRIES):
+                raise ValueError(
+                    f"Invalid query_cache_max_entries: {query_cache_max_entries}. "
+                    f"Must be between 1 and {MAX_QUERY_CACHE_MAX_ENTRIES}"
+                )
+            self.query_cache_max_entries = query_cache_max_entries
 
         if log_level:
             log_level_upper = log_level.upper()

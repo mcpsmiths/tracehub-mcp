@@ -13,9 +13,21 @@ changes.
 """
 
 import asyncio
+import math
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Hashable
 from typing import Any
+
+# Default upper bound on the number of entries one TTLCoalescingCache holds.
+# Retention was previously modelled purely as time (TTL + an amortized expiry
+# sweep), so a long TTL - or simply an ever-changing key space, one key per
+# distinct filter combination minted by any peer able to call tools - kept
+# one full result per distinct query in the process every MCP session
+# shares. The bound is an entry count with least-recently-used eviction on
+# every insert; QUERY_CACHE_MAX_ENTRIES / --query-cache-max-entries set it
+# per deployment (config.py).
+DEFAULT_QUERY_CACHE_MAX_ENTRIES = 1024
 
 
 class TTLCoalescingCache:
@@ -23,10 +35,27 @@ class TTLCoalescingCache:
     coalesces concurrent calls sharing the same key onto a single
     in-flight `compute()` invocation."""
 
-    def __init__(self, ttl_seconds: float, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        ttl_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+        max_entries: int = DEFAULT_QUERY_CACHE_MAX_ENTRIES,
+    ) -> None:
+        # inf would mean "never expire" AND never open the sweep gate below;
+        # nan compares False against everything, so it would never expire
+        # either. Both are refused here rather than silently accepted.
+        if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+            raise ValueError(
+                f"ttl_seconds must be a finite number greater than 0, got {ttl_seconds!r}"
+            )
+        if max_entries <= 0:
+            raise ValueError(f"max_entries must be greater than 0, got {max_entries!r}")
         self._ttl_seconds = ttl_seconds
+        self._max_entries = max_entries
         self._clock = clock
-        self._entries: dict[Hashable, tuple[float, Any]] = {}
+        # Insertion/recency-ordered so the oldest-used entry is O(1) to find
+        # and evict once the entry bound is reached.
+        self._entries: OrderedDict[Hashable, tuple[float, Any]] = OrderedDict()
         self._inflight: dict[Hashable, asyncio.Future[Any]] = {}
         self._lock = asyncio.Lock()
         self._last_swept = self._clock()
@@ -41,6 +70,8 @@ class TTLCoalescingCache:
         ever-changing key space (e.g. one key per distinct search filter
         combination). Runs at most once per ttl_seconds, not on every call,
         so this stays O(1) amortized rather than O(len(_entries)) per call.
+        The hard bound on live entries is _evict_to_capacity_locked, applied
+        on every insert; this sweep only reclaims expired entries earlier.
         """
         if now - self._last_swept < self._ttl_seconds:
             return
@@ -49,12 +80,19 @@ class TTLCoalescingCache:
         for key in expired:
             del self._entries[key]
 
+    def _evict_to_capacity_locked(self) -> None:
+        """Drop least-recently-used entries until the entry bound holds.
+        Caller must already hold self._lock."""
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
     async def get_or_compute(self, key: Hashable, compute: Callable[[], Awaitable[Any]]) -> Any:
         now = self._clock()
         async with self._lock:
             self._sweep_expired_locked(now)
             cached = self._entries.get(key)
             if cached is not None and cached[0] > now:
+                self._entries.move_to_end(key)  # a hit makes the entry most recently used
                 return cached[1]
             existing_future = self._inflight.get(key)
             if existing_future is not None:
@@ -117,6 +155,10 @@ class TTLCoalescingCache:
         else:
             async with self._lock:
                 self._entries[key] = (now + self._ttl_seconds, result)
+                # Assigning an existing key keeps its OrderedDict position;
+                # a fresh result must count as most recently used.
+                self._entries.move_to_end(key)
+                self._evict_to_capacity_locked()
             if not future.done():
                 future.set_result(result)
             return result

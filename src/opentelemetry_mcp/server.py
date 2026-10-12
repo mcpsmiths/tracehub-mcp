@@ -293,7 +293,7 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
     # params, so this is applied uniformly here instead.
     backend.slow_request_threshold_ms = config.slow_request_threshold_ms
     backend.max_response_bytes = config.backend.max_response_bytes
-    backend.configure_query_cache(config.query_cache_ttl_seconds)
+    backend.configure_query_cache(config.query_cache_ttl_seconds, config.query_cache_max_entries)
     return backend
 
 
@@ -371,7 +371,9 @@ async def _get_secondary_backend() -> BaseBackend:
         _secondary_backend = _build_backend_from_config(_config.secondary_backend)
         _secondary_backend.slow_request_threshold_ms = _config.slow_request_threshold_ms
         _secondary_backend.max_response_bytes = _config.secondary_backend.max_response_bytes
-        _secondary_backend.configure_query_cache(_config.query_cache_ttl_seconds)
+        _secondary_backend.configure_query_cache(
+            _config.query_cache_ttl_seconds, _config.query_cache_max_entries
+        )
 
         try:
             health = await _secondary_backend.health_check()
@@ -2138,8 +2140,16 @@ def _backend_config_options(f: Any) -> Any:
     default=None,
     help="Cache backend query results (search_traces/search_spans/get_trace/"
     "list_services/get_service_operations) for this many seconds, with "
-    "in-flight request coalescing (unset: disabled, overrides "
-    "QUERY_CACHE_TTL_SECONDS env var)",
+    "in-flight request coalescing; must be finite, > 0 and at most 86400 "
+    "(unset: disabled, overrides QUERY_CACHE_TTL_SECONDS env var)",
+)
+@click.option(
+    "--query-cache-max-entries",
+    type=click.IntRange(1, 100_000),
+    default=None,
+    help="Upper bound on the number of cached backend query results held at "
+    "once; the least-recently-used entry is evicted first, independent of "
+    "the TTL (overrides QUERY_CACHE_MAX_ENTRIES env var, default: 1024)",
 )
 @click.option(
     "--shutdown-drain-seconds",
@@ -2207,6 +2217,7 @@ def main(
     session_idle_timeout_seconds: float,
     stateless_http: bool,
     query_cache_ttl_seconds: float | None,
+    query_cache_max_entries: int | None,
     shutdown_drain_seconds: float,
     backend_close_timeout_seconds: float,
     graceful_shutdown_timeout_seconds: int,
@@ -2285,6 +2296,7 @@ def main(
                 or max_traces_per_query is not None
                 or slow_request_threshold_ms is not None
                 or query_cache_ttl_seconds is not None
+                or query_cache_max_entries is not None
             ):
                 _config.apply_cli_overrides(
                     backend_type=backend,
@@ -2302,6 +2314,7 @@ def main(
                     max_traces_per_query=max_traces_per_query,
                     slow_request_threshold_ms=slow_request_threshold_ms,
                     query_cache_ttl_seconds=query_cache_ttl_seconds,
+                    query_cache_max_entries=query_cache_max_entries,
                 )
                 _apply_log_level(_config.log_level)
         except (ValidationError, ValueError) as e:
@@ -2328,6 +2341,7 @@ def main(
                 "max_traces_per_query": _config.max_traces_per_query,
                 "slow_request_threshold_ms": _config.slow_request_threshold_ms,
                 "query_cache_ttl_seconds": _config.query_cache_ttl_seconds,
+                "query_cache_max_entries": _config.query_cache_max_entries,
                 "transport": transport,
                 "host": host,
                 "port": port,

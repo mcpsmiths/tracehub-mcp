@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
+from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, TraceQuery
 
 
 def _fake_response(payload: dict[str, Any]) -> AsyncMock:
@@ -116,3 +117,43 @@ async def test_cancelling_a_follower_does_not_fail_the_leader_end_to_end() -> No
     release.set()
     assert await asyncio.wait_for(leader, timeout=1.0) == ["svc-a"]
     assert mock_get.call_count == 1
+
+
+async def test_oversized_key_bypasses_cache() -> None:
+    """A cache key is rendered from the validated arguments (model_dump_json),
+    so its size tracks the request. For Jaeger a non-service.name filter is
+    client-side, so a request-sized filter value costs the backend one small
+    GET that succeeds empty - and used to mint a request-sized cache entry.
+    Oversized keys now bypass the cache entirely: computed, never stored."""
+    backend, mock_get = _mocked_backend({"data": []})
+    backend.configure_query_cache(60.0)
+    huge_filter = Filter(
+        field="http.target",
+        operator=FilterOperator.EQUALS,
+        value="x" * (100 * 1024),
+        value_type=FilterType.STRING,
+    )
+    oversized_query = TraceQuery(service_name="svc-a", filters=[huge_filter], limit=5)
+
+    assert await backend.search_traces(oversized_query) == []
+    assert await backend.search_traces(oversized_query) == []
+
+    assert mock_get.call_count == 2
+    assert backend._query_cache is not None
+    assert len(backend._query_cache._entries) == 0
+
+    normal_query = TraceQuery(service_name="svc-a", limit=5)
+    await backend.search_traces(normal_query)
+    await backend.search_traces(normal_query)
+
+    assert mock_get.call_count == 3
+    assert len(backend._query_cache._entries) == 1
+
+
+def test_configure_query_cache_passes_the_entry_bound_through() -> None:
+    backend, _ = _mocked_backend({"data": []})
+
+    backend.configure_query_cache(60.0, max_entries=7)
+
+    assert backend._query_cache is not None
+    assert backend._query_cache._max_entries == 7

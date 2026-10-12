@@ -25,7 +25,12 @@ or any third party. There is no tracking of any kind baked into the software.
 - **Trace and span data** returned by tools comes from whatever application your own
   observability backend is instrumenting. tracehub-mcp queries that backend using your
   credentials and returns the results to your MCP client (Claude, Cursor, etc.) — it does
-  not store, cache, or forward that data anywhere beyond that single request/response.
+  not persist or forward that data anywhere beyond that single request/response. The one
+  exception is the opt-in query cache (`QUERY_CACHE_TTL_SECONDS`, unset by default): when
+  enabled, query results are held in the server process's memory for up to the configured
+  TTL (at most one day), capped at `QUERY_CACHE_MAX_ENTRIES` results (default 1024, least
+  recently used evicted first), shared by every MCP session of that process and discarded
+  when it exits. Nothing is ever written to disk.
 - **Network calls** the running server makes are limited to: (1) the backend URL you
   configure (Jaeger/Tempo/Traceloop/Datadog/Sentry), and (2) if you enable
   `--transport http`, binding its own listening port for MCP clients to connect to. No

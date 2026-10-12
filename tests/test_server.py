@@ -1298,6 +1298,7 @@ class TestMainCli:
             max_traces_per_query=None,
             slow_request_threshold_ms=None,
             query_cache_ttl_seconds=None,
+            query_cache_max_entries=None,
         )
 
     def test_no_cli_flags_skips_apply_cli_overrides(self) -> None:
@@ -1650,6 +1651,37 @@ class TestPrintConfigFlag:
         resolved = json.loads(result.output)
         assert resolved["backend"]["type"] == "jaeger"
         mock_mcp.run.assert_not_called()
+
+    def test_includes_the_query_cache_bounds(self) -> None:
+        """Both cache knobs are ServerConfig fields and must be visible to
+        an operator checking what the process will actually run with."""
+        runner = CliRunner()
+        with patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(
+                server.main,
+                [
+                    "--print-config",
+                    "--query-cache-ttl-seconds",
+                    "30",
+                    "--query-cache-max-entries",
+                    "64",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        resolved = json.loads(result.output)
+        assert resolved["query_cache_ttl_seconds"] == 30.0
+        assert resolved["query_cache_max_entries"] == 64
+
+    def test_default_query_cache_max_entries_is_1024(self) -> None:
+        runner = CliRunner()
+        with patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(server.main, ["--print-config"])
+
+        resolved = json.loads(result.output)
+        assert resolved["query_cache_max_entries"] == 1024
 
     def test_redacts_api_key_and_app_key_to_boolean_presence(self) -> None:
         runner = CliRunner()
