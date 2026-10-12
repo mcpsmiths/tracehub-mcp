@@ -209,13 +209,24 @@ jobs:
                     exit 0
                   fi
 
+                  # The image's CMD binds 0.0.0.0, and since the bearer-token
+                  # gate (server.py _validate_http_listener_auth) the server
+                  # refuses to start on a non-loopback host without
+                  # MCP_HTTP_BEARER_TOKEN or the MCP_ALLOW_UNAUTHENTICATED_HTTP
+                  # opt-out (exit 2 -> the "exited" branch below). Exercise the
+                  # shipped default rather than the opt-out: a throwaway token
+                  # generated the way README tells operators to, so this step
+                  # also proves the image honours it (401 challenge on /mcp,
+                  # open /health) - not merely that uvicorn bound the port.
                   docker run -d --name smoke-test \
                     --platform "${{ matrix.docker-platform }}" \
                     -p 18000:8000 \
                     -e BACKEND_TYPE=jaeger \
                     -e BACKEND_URL=http://localhost:16686 \
+                    -e MCP_HTTP_BEARER_TOKEN="$(openssl rand -hex 32)" \
                     "tracehub-mcp-server:${{ github.sha }}-${{ matrix.platform }}"
 
+                  transport_up=false
                   for i in $(seq 1 15); do
                     if [ "$(docker inspect --format='{{.State.Status}}' smoke-test 2>/dev/null)" = "exited" ]; then
                       echo "::error::Container exited unexpectedly - entrypoint crashed"
@@ -232,20 +243,43 @@ jobs:
                     # echo 000` fallback on top of that concatenates into
                     # "000000" - which is != "000" and was wrongly treated
                     # as a real status code (confirmed live in CI).
-                    if status_code="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18000/mcp 2>/dev/null)"; then
-                      echo "HTTP transport is up and answering (got status ${status_code} from /mcp) after ${i} attempt(s)"
-                      docker logs smoke-test
-                      docker rm -f smoke-test
-                      exit 0
+                    if health_status="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:18000/health 2>/dev/null)"; then
+                      echo "HTTP transport is up and answering (got status ${health_status} from /health) after ${i} attempt(s)"
+                      transport_up=true
+                      break
                     fi
                     echo "Attempt ${i}/15: HTTP transport not answering yet, waiting 2s..."
                     sleep 2
                   done
 
-                  echo "::error::Container never started answering HTTP requests within 30s"
+                  if [ "${transport_up}" = false ]; then
+                    echo "::error::Container never started answering HTTP requests within 30s"
+                    docker logs smoke-test
+                    docker rm -f smoke-test
+                    exit 1
+                  fi
+
+                  # Both halves of the image's documented HTTP contract
+                  # (README "Security"): /health stays unauthenticated, and a
+                  # request to /mcp that carries no Authorization header is
+                  # refused with 401 plus a `WWW-Authenticate: Bearer`
+                  # challenge before any tool can run. `-D` dumps the
+                  # response headers so the assertion is on the real
+                  # challenge, not just the status code.
+                  failures=0
+                  if [ "${health_status}" != "200" ]; then
+                    echo "::error::GET /health answered ${health_status}, expected 200"
+                    failures=1
+                  fi
+                  mcp_status="$(curl -s -o /dev/null -D /tmp/smoke-mcp-headers -w '%{http_code}' http://localhost:18000/mcp || echo curl-failed)"
+                  if [ "${mcp_status}" != "401" ] || ! grep -qi '^www-authenticate: bearer' /tmp/smoke-mcp-headers; then
+                    echo "::error::unauthenticated GET /mcp answered ${mcp_status}, expected 401 with a WWW-Authenticate: Bearer challenge"
+                    cat /tmp/smoke-mcp-headers 2>/dev/null || true
+                    failures=1
+                  fi
                   docker logs smoke-test
                   docker rm -f smoke-test
-                  exit 1
+                  exit "${failures}"
 
             - name: Cache Trivy
               uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
