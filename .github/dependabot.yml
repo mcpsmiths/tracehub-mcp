@@ -20,6 +20,22 @@ updates:
         patterns: ["*"]
         update-types: ["minor", "patch"]
 
+  # Hash-pinned release/build toolchain (.github/requirements-*.txt). Dependabot
+  # rewrites the ==-pins and their --hash lines together; it never touches
+  # pyproject.toml's [build-system] pin, so tests/test_build_toolchain.py forces
+  # the two to move in step.
+  - package-ecosystem: "pip"
+    directory: "/.github"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "release-toolchain"
+    open-pull-requests-limit: 5
+
   # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"

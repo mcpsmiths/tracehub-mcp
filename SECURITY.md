@@ -32,6 +32,10 @@ For anyone auditing this project as a dependency:
 
 - All GitHub Actions third-party steps are pinned to a full commit SHA (not a mutable tag) across
   every workflow.
+- The release toolchain is hash-pinned in-tree: the release job installs Commitizen only from
+  `.github/requirements-release.txt` (`pip install --require-hashes --no-deps`), so no package is
+  resolved from PyPI at release time, and the checkout that receives the release token does not
+  persist it to disk.
 - CI runs [`ruff`](https://docs.astral.sh/ruff/) with the `S` (flake8-bandit) ruleset and
   [`pip-audit`](https://pypi.org/project/pip-audit/) against the resolved lockfile on every push.
 - Published container images (`ghcr.io/mcpsmiths/tracehub-mcp`) include build provenance
