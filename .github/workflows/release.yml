@@ -164,8 +164,13 @@ jobs:
   build-and-publish:
     name: Build and Publish to PyPI
     needs: bump-version
-    if: needs.bump-version.outputs.already_released == 'false'
+    # The PyPI trusted publisher for tracehub-mcp is bound to the `release`
+    # environment: an OIDC token minted outside it carries no environment
+    # claim and PyPI rejects it, and GitHub grants the environment only to
+    # runs from main. The ref check is defence in depth (see bump-version).
+    if: needs.bump-version.outputs.already_released == 'false' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       id-token: write  # Required for PyPI OIDC
     steps:

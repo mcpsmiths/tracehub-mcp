@@ -339,3 +339,46 @@ def test_security_md_documents_release_authorization() -> None:
     text = SECURITY_MD.read_text(encoding="utf-8")
     assert "Release authorization" in text
     assert "`release`" in text and "RELEASE_PAT" in text
+
+
+def test_build_and_publish_is_gated_on_the_release_environment_from_main() -> None:
+    """PyPI's trusted publisher is bound to this environment name; a token
+    minted outside it carries no `environment` claim and PyPI rejects it."""
+    job = _jobs(_load_yaml(RELEASE_YML))["build-and-publish"]
+    assert _environment_name(job) == "release", job.get("environment")
+    condition = str(job.get("if", ""))
+    assert "github.ref == 'refs/heads/main'" in condition, condition
+    assert "already_released == 'false'" in condition, condition
+
+
+def _mints_a_publishing_token(job: Job) -> bool:
+    permissions = job.get("permissions", {})
+    if not (isinstance(permissions, dict) and permissions.get("id-token") == "write"):
+        return False
+    return any(
+        _uses(step).startswith("pypa/gh-action-pypi-publish") or "mcp-publisher" in _run(step)
+        for step in _steps(job)
+    )
+
+
+def test_every_oidc_publishing_job_declares_the_release_environment() -> None:
+    publishing_jobs = {
+        f"{path.name}:{job_name}": job
+        for path in sorted(WORKFLOWS_DIR.glob("*.yml"))
+        for job_name, job in _jobs(_load_yaml(path)).items()
+        if _mints_a_publishing_token(job)
+    }
+    assert set(publishing_jobs) == {
+        "mcp-registry-publish.yml:publish-mcp",
+        "release.yml:build-and-publish",
+    }, set(publishing_jobs)
+    offenders = [
+        name for name, job in publishing_jobs.items() if _environment_name(job) != "release"
+    ]
+    assert offenders == [], offenders
+
+
+def test_security_md_binds_the_pypi_publisher_to_the_environment() -> None:
+    text = SECURITY_MD.read_text(encoding="utf-8")
+    section = text.split("### Release authorization", 1)[1].split("\n## ", 1)[0]
+    assert "PyPI" in section and "MCP Registry" in section, section

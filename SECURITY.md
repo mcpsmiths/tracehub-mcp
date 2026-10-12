@@ -52,9 +52,11 @@ credentials declare the `release` GitHub environment, whose deployment-branch po
 is the control that holds even against a branch carrying an edited copy of the workflow. The
 `RELEASE_PAT` used to push the bump commit and tag (a fine-grained token scoped to this repository
 with Contents read/write) is stored as a secret of that environment, is handed to the checkout
-without being persisted, and reaches the push step only as a step-level variable. Only repository
-administrators can dispatch the workflow; required reviewers on the environment are off while the
-project has a single maintainer.
+without being persisted, and reaches the push step only as a step-level variable. The PyPI trusted
+publisher for `tracehub-mcp` and the MCP Registry publish job mint their OIDC tokens only from jobs
+running under the same environment, so neither can be fed an unreviewed build from another ref.
+Only repository administrators can dispatch the workflow; required reviewers on the environment
+are off while the project has a single maintainer.
 
 ## Scope
 
