@@ -82,6 +82,13 @@ def test_ipv4_mapped_ipv6_metadata_is_rejected() -> None:
         BackendConfig(type="jaeger", url=HttpUrl("http://[::ffff:169.254.169.254]/"))
 
 
+def test_azure_wireserver_ip_is_rejected() -> None:
+    """168.63.129.16 (Azure WireServer) is a second metadata-class address
+    on every Azure VM, distinct from 169.254.169.254."""
+    with pytest.raises(ValidationError, match="metadata"):
+        BackendConfig(type="jaeger", url=HttpUrl("http://168.63.129.16/machine?comp=goalstate"))
+
+
 def test_private_ip_self_hosted_backend_is_still_allowed() -> None:
     """A private IP is a completely normal self-hosted deployment (VPC,
     Docker Compose network) and must never be blocked - only cloud

@@ -15,8 +15,16 @@ import time
 import httpx
 import pytest
 
-from opentelemetry_mcp.backends.base import MetadataEndpointBlockedError, _RetryingTransport
+from opentelemetry_mcp.backends.base import (
+    BaseBackend,
+    MetadataEndpointBlockedError,
+    RedirectTargetBlockedError,
+    _RetryingTransport,
+)
+from opentelemetry_mcp.backends.datadog import DatadogBackend
+from opentelemetry_mcp.backends.honeycomb import HoneycombBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
+from opentelemetry_mcp.backends.newrelic import NewRelicBackend
 
 
 async def test_connect_error_twice_then_success_eventually_succeeds() -> None:
@@ -330,6 +338,207 @@ class TestMetadataEndpointBlocking:
 
         assert response.status_code == 200
         assert response.json() == {"ok": True}
+
+
+class TestRedirectHostPin:
+    """A backend response (3xx Location) must never steer the shared client
+    to a host the operator did not configure. The metadata denylist stays
+    as a second layer, but is_cloud_metadata_host alone is bypassable by
+    non-dotted IPv4 spellings, DNS aliases and unlisted metadata hosts -
+    the host pin on _RetryingTransport closes all of those at once."""
+
+    @pytest.mark.parametrize(
+        "location",
+        [
+            "http://2852039166/latest/meta-data/",
+            "http://0xa9fea9fe/latest/meta-data/",
+            "http://169.254.43518/latest/meta-data/",
+            "http://0xa9.0xfe.0xa9.0xfe/latest/meta-data/",
+            "http://168.63.129.16/machine?comp=goalstate",
+            "http://metadata.attacker.example/latest/meta-data/",
+        ],
+    )
+    async def test_redirect_to_encoded_or_aliased_metadata_host_is_blocked(
+        self, location: str
+    ) -> None:
+        handler_calls = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal handler_calls
+            handler_calls += 1
+            if request.url.host == "backend.test":
+                return httpx.Response(302, headers={"Location": location})
+            raise AssertionError("the redirect hop must never reach the wrapped transport")
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            with pytest.raises((MetadataEndpointBlockedError, RedirectTargetBlockedError)):
+                await client.get("/search")
+
+        assert handler_calls == 1
+
+    async def test_same_host_redirect_is_still_followed(self) -> None:
+        """Host-only pin: a same-host scheme/port change (e.g. an http->https
+        upgrade) is the operator's own backend talking, so it stays allowed."""
+        handler_calls = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal handler_calls
+            handler_calls += 1
+            if str(request.url) == "http://backend.test/search":
+                return httpx.Response(302, headers={"Location": "https://backend.test/other"})
+            return httpx.Response(200, json={"ok": True})
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            response = await client.get("/search")
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+        assert handler_calls == 2
+
+    async def test_host_comparison_is_case_insensitive(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/search":
+                return httpx.Response(302, headers={"Location": "http://Backend.TEST/other"})
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            response = await client.get("/search")
+
+        assert response.status_code == 200
+
+    async def test_307_cross_host_redirect_is_blocked_before_body_resend(self) -> None:
+        """A 307/308 makes httpx re-send the original method AND body to the
+        new host; the hop must be refused before the wrapped transport ever
+        sees it, so the body is never sent off-host."""
+        bodies_seen: list[tuple[str, bytes]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            bodies_seen.append((request.url.host or "", request.content))
+            if request.url.host == "backend.test":
+                return httpx.Response(307, headers={"Location": "http://other.test/sink"})
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            with pytest.raises(RedirectTargetBlockedError):
+                await client.post("/search", content=b'{"q": "secret-query"}')
+
+        assert bodies_seen == [("backend.test", b'{"q": "secret-query"}')]
+
+    async def test_blocked_hop_is_not_retried(self) -> None:
+        """RedirectTargetBlockedError is deliberately not a retryable
+        transport exception - re-attempting the hop would be pointless."""
+        handler_calls = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal handler_calls
+            handler_calls += 1
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+        )
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(RedirectTargetBlockedError):
+                await client.get("http://other.test/anything")
+
+        assert handler_calls == 0
+
+    async def test_transport_without_allowed_host_keeps_following_cross_host_redirects(
+        self,
+    ) -> None:
+        """Test-convenience shape: a transport built with no allowed_host (as
+        every pre-existing test does) must behave exactly as before - the
+        pin is opt-in at construction, and BaseBackend.client is what opts
+        in for production (see test_backend_clients_pin_the_configured_host)."""
+        hosts_seen: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            hosts_seen.append(request.url.host or "")
+            if request.url.host == "backend.test":
+                return httpx.Response(302, headers={"Location": "http://other.test/sink"})
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            response = await client.get("/search")
+
+        assert response.status_code == 200
+        assert hosts_seen == ["backend.test", "other.test"]
+
+    async def test_cross_origin_hop_carries_no_authorization_header(self) -> None:
+        """Pins the trust assumption the audit's severity rests on (and the
+        Sentry backend's docstring relies on): httpx strips Authorization on
+        a cross-origin hop, so an unpinned transport leaks at most a blind
+        request, never the bearer credential. Uses an unpinned transport on
+        purpose - with the pin the hop never happens at all."""
+        auth_seen: dict[str, str | None] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            auth_seen[request.url.host or ""] = request.headers.get("Authorization")
+            if request.url.host == "backend.test":
+                return httpx.Response(302, headers={"Location": "http://other.test/sink"})
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://backend.test",
+            follow_redirects=True,
+            headers={"Authorization": "Bearer not-a-real-token"},
+        ) as client:
+            await client.get("/search")
+
+        assert auth_seen["backend.test"] == "Bearer not-a-real-token"
+        assert auth_seen["other.test"] is None
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        JaegerBackend(url="https://Backend.Example:16686"),
+        DatadogBackend(url="https://Backend.Example", api_key="k", app_key="a"),
+        NewRelicBackend(url="https://Backend.Example/graphql", api_key="k", account_id="1"),
+        HoneycombBackend(url="https://Backend.Example", api_key="k", dataset="d"),
+    ],
+    ids=["base", "datadog", "newrelic", "honeycomb"],
+)
+def test_backend_clients_pin_the_configured_host(backend: BaseBackend) -> None:
+    """BaseBackend.client and the three vendor overrides (which only differ
+    in follow_redirects) must all hand the configured host to the transport,
+    lower-cased, so the pin is never bypassed by one backend's own client."""
+    client = backend.client
+
+    assert isinstance(client._transport, _RetryingTransport)
+    assert client._transport._allowed_host == "backend.example"
 
 
 class TestRetryOn429:

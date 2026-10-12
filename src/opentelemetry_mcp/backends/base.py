@@ -68,6 +68,14 @@ class MetadataEndpointBlockedError(httpx.TransportError):
     """
 
 
+class RedirectTargetBlockedError(httpx.TransportError):
+    """Raised when a request (in practice a redirect hop chosen by the
+    backend's own 3xx response) targets a host other than the operator-
+    configured backend host. Like MetadataEndpointBlockedError, never
+    retried - the hop is refused before the wrapped transport sees it.
+    """
+
+
 # Only genuine transport-level failures - a connection that never completed
 # or a request that timed out - are worth retrying on their own. An HTTP
 # response with a 4xx/5xx status code is a *successful* transport exchange
@@ -134,6 +142,7 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         self,
         wrapped: httpx.AsyncBaseTransport | None = None,
         slow_request_threshold_ms: float | None = None,
+        allowed_host: str | None = None,
     ) -> None:
         """Wrap an underlying transport (defaults to a fresh AsyncHTTPTransport).
 
@@ -142,9 +151,16 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
             slow_request_threshold_ms: If set, log a warning for any request
                 that takes longer than this, independent of the configured
                 log level
+            allowed_host: If set, refuse (RedirectTargetBlockedError) any
+                request whose host differs from this one, case-insensitively.
+                Every backend's `client` sets it to the configured backend
+                host, so a 3xx Location chosen by the backend can never steer
+                the shared client elsewhere. Host-only on purpose: a same-host
+                scheme/port change (an http->https upgrade) stays allowed.
         """
         self._wrapped = wrapped if wrapped is not None else httpx.AsyncHTTPTransport()
         self._slow_request_threshold_ms = slow_request_threshold_ms
+        self._allowed_host = allowed_host.lower() if allowed_host is not None else None
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         """Delegate to the wrapped transport, retrying up to 3 total attempts
@@ -153,14 +169,27 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         429 rate-limit response.
         """
         # httpx re-invokes handle_async_request on every redirect hop when
-        # follow_redirects=True, so this single check - run before every
-        # attempt, including redirect targets - blocks a compromised or
-        # misbehaving backend from redirecting a request toward a cloud
-        # metadata endpoint, for all five backends, regardless of each
-        # backend's own follow_redirects setting.
+        # follow_redirects=True, so these checks - run before every attempt,
+        # including redirect targets - apply to every backend regardless of
+        # its own follow_redirects setting. Two layers: the metadata
+        # denylist (canonicalising encoded IPv4 spellings, see security.py)
+        # refuses the one class of host that is never legitimate even for
+        # the operator's own URL, and the host pin refuses any host the
+        # operator did not configure - which also covers DNS aliases of a
+        # metadata address and arbitrary internal hosts that no denylist
+        # could enumerate. A 307/308 is refused here before its body is
+        # re-sent anywhere.
         if is_cloud_metadata_host(request.url.host):
             raise MetadataEndpointBlockedError(
                 f"Refusing to connect to cloud metadata endpoint: {request.url.host}"
+            )
+        if (
+            self._allowed_host is not None
+            and (request.url.host or "").lower() != self._allowed_host
+        ):
+            raise RedirectTargetBlockedError(
+                f"Refusing request to {request.url.host!r}: the configured backend host is "
+                f"{self._allowed_host!r} and a backend response may not redirect elsewhere"
             )
 
         # A plain `async def` closure (rather than passing
@@ -278,11 +307,20 @@ class BaseBackend(ABC):
                 headers=self._create_headers(),
                 timeout=self.timeout,
                 follow_redirects=True,
-                transport=_RetryingTransport(
-                    slow_request_threshold_ms=self.slow_request_threshold_ms
-                ),
+                transport=self._create_transport(),
             )
         return self._client
+
+    def _create_transport(self) -> "_RetryingTransport":
+        """The one _RetryingTransport construction every backend shares -
+        the Datadog/New Relic/Honeycomb `client` overrides (which differ
+        from the base one only in follow_redirects) call this too, so a
+        transport-level control added here (host pin, slow-request logging)
+        can never be missed by one backend's own client."""
+        return _RetryingTransport(
+            slow_request_threshold_ms=self.slow_request_threshold_ms,
+            allowed_host=httpx.URL(self.url).host,
+        )
 
     @abstractmethod
     def _create_headers(self) -> dict[str, str]:

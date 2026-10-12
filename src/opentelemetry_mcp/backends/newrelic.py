@@ -70,7 +70,7 @@ from typing import Any, Literal
 import httpx
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes
-from opentelemetry_mcp.backends.base import BaseBackend, _RetryingTransport
+from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
 from opentelemetry_mcp.constants import Fields, Status
 from opentelemetry_mcp.models import (
@@ -259,9 +259,7 @@ class NewRelicBackend(BaseBackend):
                 headers=self._create_headers(),
                 timeout=self.timeout,
                 follow_redirects=False,
-                transport=_RetryingTransport(
-                    slow_request_threshold_ms=self.slow_request_threshold_ms
-                ),
+                transport=self._create_transport(),
             )
         return self._client
 
