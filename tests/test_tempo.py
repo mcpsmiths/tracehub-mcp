@@ -8,6 +8,7 @@ elements) - not a Python list handed directly to the parser.
 """
 
 import base64
+import logging
 import re
 from collections.abc import Callable
 from datetime import timedelta
@@ -989,3 +990,33 @@ class TestTempoPathSegmentSafety:
         assert len(results) >= 1
         fetches = [p for p in raw_paths if not p.startswith("/api/search")]
         assert fetches == ["/api/traces/abc"]
+
+    @pytest.mark.parametrize("search", ["search_traces", "search_spans"])
+    async def test_rows_with_only_unusable_ids_are_not_reported_as_an_outage(
+        self, search: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A row whose traceID cannot be one URL path segment is skipped
+        before it counts as an attempted fetch. When every row is like that,
+        no GET /api/traces/{id} was ever tried, so the all-fetches-failed
+        RuntimeError (pinned for real fetch failures by
+        test_search_*_raises_when_all_trace_fetches_fail) must not fire: the
+        result is simply empty, and each skipped row is logged."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/search":
+                return httpx.Response(200, json={"traces": [{"traceID": ".."}, {"traceID": "."}]})
+            return httpx.Response(200, json=_minimal_otlp_trace("abc", status_code=1))
+
+        backend, raw_paths = _wire_tempo_backend(handler)
+
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.backends.tempo"):
+            if search == "search_traces":
+                results: list[Any] = await backend.search_traces(TraceQuery(limit=10))
+            else:
+                results = await backend.search_spans(SpanQuery(limit=10))
+
+        assert results == []
+        assert [p for p in raw_paths if not p.startswith("/api/search")] == []
+        messages = [r.getMessage() for r in caplog.records]
+        assert sum("Skipping" in m for m in messages) == 2
+        assert not any("outage" in m for m in messages)

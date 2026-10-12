@@ -141,6 +141,27 @@ class TempoBackend(BaseBackend):
             FilterOperator.NOT_EXISTS,  # Via = nil
         }
 
+    @staticmethod
+    def _search_row_trace_id(trace_result: dict[str, Any]) -> tuple[str, str] | None:
+        """Return ``(trace_id, encoded path segment)`` for one /api/search row,
+        or None when the row carries no usable traceID.
+
+        A row whose id is empty, ".", "..", over-long or not a string cannot
+        be fetched as ``/api/traces/{id}`` at all; it is malformed search
+        output, not evidence of a /api/traces outage, so the hydration loops
+        skip it (logged) without counting it as an attempted fetch -
+        otherwise a result set made only of such rows would raise the
+        all-fetches-failed RuntimeError although no request was ever sent.
+        """
+        trace_id = trace_result.get("traceID")
+        if not trace_id:
+            return None
+        try:
+            return trace_id, safe_path_segment(trace_id, "trace_id")
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Skipping /api/search row with an unusable traceID: {e}")
+            return None
+
     async def search_traces(self, query: TraceQuery) -> list[TraceData]:
         """Search traces using TraceQL with hybrid filtering.
 
@@ -220,22 +241,22 @@ class TempoBackend(BaseBackend):
         last_fetch_error: Exception | None = None
 
         for trace_result in trace_results[:max_traces_to_fetch]:
-            trace_id = trace_result.get("traceID")
-            if trace_id:
-                attempted_fetches += 1
-                try:
-                    trace_response = await self.client.get(
-                        f"/api/traces/{safe_path_segment(trace_id, 'trace_id')}"
-                    )
-                    trace_response.raise_for_status()
-                    trace_data = trace_response.json()
-                    trace = self._parse_tempo_trace(trace_data, trace_id_hex=trace_id)
-                    if trace:
-                        traces.append(trace)
-                except Exception as e:
-                    failed_fetches += 1
-                    last_fetch_error = e
-                    logger.warning(f"Failed to fetch trace {trace_id}: {e}")
+            row = self._search_row_trace_id(trace_result)
+            if row is None:
+                continue
+            trace_id, encoded_trace_id = row
+            attempted_fetches += 1
+            try:
+                trace_response = await self.client.get(f"/api/traces/{encoded_trace_id}")
+                trace_response.raise_for_status()
+                trace_data = trace_response.json()
+                trace = self._parse_tempo_trace(trace_data, trace_id_hex=trace_id)
+                if trace:
+                    traces.append(trace)
+            except Exception as e:
+                failed_fetches += 1
+                last_fetch_error = e
+                logger.warning(f"Failed to fetch trace {trace_id}: {e}")
 
         # A total outage of /api/traces/{id} (while /api/search still works)
         # must not look identical to a genuine "no traces matched" result -
@@ -370,22 +391,22 @@ class TempoBackend(BaseBackend):
         last_fetch_error: Exception | None = None
 
         for trace_result in trace_results[:max_traces_to_fetch]:
-            trace_id = trace_result.get("traceID")
-            if trace_id:
-                attempted_fetches += 1
-                try:
-                    trace_response = await self.client.get(
-                        f"/api/traces/{safe_path_segment(trace_id, 'trace_id')}"
-                    )
-                    trace_response.raise_for_status()
-                    trace_data = trace_response.json()
-                    trace = self._parse_tempo_trace(trace_data, trace_id_hex=trace_id)
-                    if trace:
-                        all_spans.extend(trace.spans)
-                except Exception as e:
-                    failed_fetches += 1
-                    last_fetch_error = e
-                    logger.warning(f"Failed to fetch trace {trace_id}: {e}")
+            row = self._search_row_trace_id(trace_result)
+            if row is None:
+                continue
+            trace_id, encoded_trace_id = row
+            attempted_fetches += 1
+            try:
+                trace_response = await self.client.get(f"/api/traces/{encoded_trace_id}")
+                trace_response.raise_for_status()
+                trace_data = trace_response.json()
+                trace = self._parse_tempo_trace(trace_data, trace_id_hex=trace_id)
+                if trace:
+                    all_spans.extend(trace.spans)
+            except Exception as e:
+                failed_fetches += 1
+                last_fetch_error = e
+                logger.warning(f"Failed to fetch trace {trace_id}: {e}")
 
         # See search_traces for why an all-failed per-trace hydration must
         # raise rather than silently returning an empty span list.

@@ -462,14 +462,17 @@ class SentryBackend(BaseBackend):
         # search row) and is a URL *path* segment here. quote() alone leaves
         # "." / ".." intact and httpx collapses them during the base_url
         # merge, so the endpoint reached with the operator's credential must
-        # be pinned before any URL is built: Sentry trace ids are 32 hex
-        # characters, and safe_path_segment rejects the dot/empty segments
-        # (see backends/url_path.py).
+        # be pinned before any URL is built: safe_path_segment rejects the
+        # dot/empty segments and over-long values (see backends/url_path.py),
+        # and Sentry trace ids are 32 hex characters. The length cap runs
+        # first so an over-long value is rejected on its length alone and is
+        # never echoed into the error that _handle_tool_error logs; the
+        # format error below therefore echoes at most 256 characters.
+        encoded_trace_id = safe_path_segment(trace_id, "trace_id")
         if not _SENTRY_TRACE_ID_RE.fullmatch(trace_id):
             raise ValueError(
                 f"Invalid Sentry trace_id format: {trace_id!r} (expected 32 hex characters)"
             )
-        encoded_trace_id = safe_path_segment(trace_id, "trace_id")
         start, end = self._time_range(None, None, lookback=_DEFAULT_LOOKBACK)
 
         response = await self.client.get(

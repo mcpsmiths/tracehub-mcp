@@ -25,6 +25,7 @@ from opentelemetry_mcp.backends.sentry import (
     _SPAN_SEARCH_FIELDS,
     SentryBackend,
 )
+from opentelemetry_mcp.backends.url_path import MAX_PATH_SEGMENT_CHARS
 from opentelemetry_mcp.models import (
     Filter,
     FilterOperator,
@@ -944,6 +945,22 @@ class TestGetTracePathSegmentSafety:
         with pytest.raises(ValueError, match="Invalid Sentry trace_id format"):
             await backend.get_trace(trace_id)
 
+        assert raw_paths == []
+
+    async def test_overlong_id_is_rejected_on_length_alone_without_being_echoed(self) -> None:
+        """The path-segment length cap runs before the 32-hex check, so an
+        over-long id is rejected for its length and never echoed into the
+        ValueError that _handle_tool_error writes to the server log
+        (url_path.py withholds over-long values from its message on
+        purpose). All-hex, so only the length is wrong."""
+        long_id = "a" * (MAX_PATH_SEGMENT_CHARS + 1)
+        backend, raw_paths = _wire_backend(lambda request: httpx.Response(200, json=[]))
+
+        with pytest.raises(ValueError) as excinfo:
+            await backend.get_trace(long_id)
+
+        assert long_id not in str(excinfo.value)
+        assert str(MAX_PATH_SEGMENT_CHARS) in str(excinfo.value)
         assert raw_paths == []
 
     async def test_hex_id_emits_exactly_one_get_inside_the_trace_segment(self) -> None:
