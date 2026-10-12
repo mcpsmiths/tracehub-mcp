@@ -23,6 +23,9 @@ jobs:
       contents: write  # Required for pushing commits, tags, and creating releases
     outputs:
       new_version: ${{ steps.cz.outputs.version }}
+      # The exact commit cz created; build-and-publish builds this and nothing
+      # else (main may already have moved on by the time that job starts).
+      bump_sha: ${{ steps.bump_sha.outputs.sha }}
       already_released: ${{ steps.check_release.outputs.exists }}
     steps:
       - name: Checkout code
@@ -83,6 +86,10 @@ jobs:
           fi
           cz --no-raise 21 "${args[@]}"
           echo "version=$(cz version --project)" >> "$GITHUB_OUTPUT"
+
+      - name: Record bump commit
+        id: bump_sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Push bump commit and tag
         # The checkout did not persist RELEASE_PAT, so authenticate this one
@@ -154,10 +161,15 @@ jobs:
     permissions:
       id-token: write  # Required for PyPI OIDC
     steps:
-      - name: Checkout code (with new version)
+      - name: Checkout the bump commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
-          ref: main  # Get the version-bumped code
+          # Not `ref: main`: main is whatever it is when this job starts, so a
+          # merge landing between the bump push and this checkout would ship
+          # under the new version number. Build the bump commit itself.
+          ref: ${{ needs.bump-version.outputs.bump_sha }}
+          fetch-depth: 0  # tags are needed for the cross-check below
+          persist-credentials: false  # this job never pushes
 
       - name: Setup UV
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
@@ -169,6 +181,27 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.13"
+
+      - name: Verify checkout matches the release
+        # All three identities of the release must agree before anything is
+        # built: the tree checked out, the commit refs/tags/v<version> names
+        # (re-fetched so a re-pointed tag is noticed) and the version string
+        # hatchling will stamp on the artifact.
+        env:
+          NEW_VERSION: ${{ needs.bump-version.outputs.new_version }}
+          BUMP_SHA: ${{ needs.bump-version.outputs.bump_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$BUMP_SHA"
+          git fetch origin "+refs/tags/v${NEW_VERSION}:refs/tags/v${NEW_VERSION}"
+          test "$(git rev-parse "refs/tags/v${NEW_VERSION}^{commit}")" = "$BUMP_SHA"
+          python3 - "$NEW_VERSION" <<'PY'
+          import sys, tomllib
+          with open("pyproject.toml", "rb") as f:
+              declared = tomllib.load(f)["project"]["version"]
+          if declared != sys.argv[1]:
+              print(f"::error::pyproject.toml declares {declared}, release is {sys.argv[1]}")
+              sys.exit(1)
+          PY
 
       - name: Build package
         run: |

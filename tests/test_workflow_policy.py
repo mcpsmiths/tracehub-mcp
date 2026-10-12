@@ -249,3 +249,53 @@ def test_pre_bump_hook_docs_no_longer_describe_the_action_container() -> None:
     hook_text = SYNC_HOOK.read_text(encoding="utf-8")
     assert "container" not in cz_text and "python:3.10-alpine" not in cz_text
     assert "python:3.10-alpine" not in hook_text and "INSIDE commitizen-action" not in hook_text
+
+
+# --- build-and-publish: build exactly the bump commit the release names -----------
+
+
+def _build_and_publish_steps() -> list[Step]:
+    return _steps(_jobs(_load_yaml(RELEASE_YML))["build-and-publish"])
+
+
+def test_bump_version_exports_the_bump_commit_sha() -> None:
+    job = _jobs(_load_yaml(RELEASE_YML))["bump-version"]
+    assert job["outputs"]["bump_sha"] == "${{ steps.bump_sha.outputs.sha }}", job["outputs"]
+    steps = _steps(job)
+    idx = _step_index(steps, lambda s: s.get("id") == "bump_sha")
+    run = _run(steps[idx])
+    assert "sha=$(git rev-parse HEAD)" in run and "GITHUB_OUTPUT" in run, run
+    cz_idx = _step_index(steps, lambda s: s.get("id") == "cz")
+    assert idx > cz_idx, "the SHA must be recorded after the bump commit exists"
+
+
+def test_build_and_publish_checks_out_the_bump_commit_not_main() -> None:
+    """`ref: main` is whatever main is when the job starts - anything merged
+    between the bump push and the checkout (observed 251 s / 373 s windows on
+    past releases) would ship under the bumped version number."""
+    steps = _build_and_publish_steps()
+    checkout = steps[0]
+    assert _uses(checkout).startswith("actions/checkout"), checkout
+    assert _with(checkout).get("ref") == "${{ needs.bump-version.outputs.bump_sha }}", checkout
+    assert _with(checkout).get("persist-credentials") is False, checkout
+    for job_name, job in _jobs(_load_yaml(RELEASE_YML)).items():
+        for step in _steps(job):
+            if _uses(step).startswith("actions/checkout"):
+                assert _with(step).get("ref") != "main", (job_name, step)
+
+
+def test_build_and_publish_verifies_tag_and_version_before_building() -> None:
+    steps = _build_and_publish_steps()
+    checkout_idx = _step_index(steps, lambda s: _uses(s).startswith("actions/checkout"))
+    verify_idx = _step_index(
+        steps,
+        lambda s: "refs/tags/v${NEW_VERSION}^{commit}" in _run(s) and "pyproject.toml" in _run(s),
+    )
+    build_idx = _step_index(steps, lambda s: "uv build" in _run(s))
+    publish_idx = _step_index(steps, lambda s: _uses(s).startswith("pypa/gh-action-pypi-publish"))
+    assert checkout_idx < verify_idx < build_idx < publish_idx
+    verify_run = _run(steps[verify_idx])
+    assert "$BUMP_SHA" in verify_run, "HEAD must be compared with the recorded bump SHA"
+    env = steps[verify_idx].get("env", {})
+    assert env.get("BUMP_SHA") == "${{ needs.bump-version.outputs.bump_sha }}", env
+    assert env.get("NEW_VERSION") == "${{ needs.bump-version.outputs.new_version }}", env
