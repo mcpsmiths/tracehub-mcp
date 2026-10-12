@@ -44,6 +44,18 @@ For anyone auditing this project as a dependency:
   [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC), not a long-lived API
   token.
 
+### Release authorization
+
+Releases are cut only by dispatching `release.yml` from `main`. The jobs that hold release
+credentials declare the `release` GitHub environment, whose deployment-branch policy admits only
+`main`: GitHub refuses such a job before its first step when the run's ref is anything else, which
+is the control that holds even against a branch carrying an edited copy of the workflow. The
+`RELEASE_PAT` used to push the bump commit and tag (a fine-grained token scoped to this repository
+with Contents read/write) is stored as a secret of that environment, is handed to the checkout
+without being persisted, and reaches the push step only as a step-level variable. Only repository
+administrators can dispatch the workflow; required reviewers on the environment are off while the
+project has a single maintainer.
+
 ## Scope
 
 Trace and span data returned by this server is treated as untrusted input by design — it

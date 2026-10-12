@@ -19,6 +19,14 @@ jobs:
   bump-version:
     name: Bump Version & Create Release
     runs-on: ubuntu-latest
+    # RELEASE_PAT is an org-admin credential. It lives in the `release`
+    # environment, whose deployment-branch policy admits only main, so GitHub
+    # refuses this job before any step runs when the workflow is dispatched
+    # from any other ref - including from a branch carrying an edited copy of
+    # this file. The `if` is defence in depth for an accidental off-main
+    # dispatch of the unmodified file; the environment is the boundary.
+    if: github.ref == 'refs/heads/main'
+    environment: release
     permissions:
       contents: write  # Required for pushing commits, tags, and creating releases
     outputs:

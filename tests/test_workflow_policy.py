@@ -299,3 +299,43 @@ def test_build_and_publish_verifies_tag_and_version_before_building() -> None:
     env = steps[verify_idx].get("env", {})
     assert env.get("BUMP_SHA") == "${{ needs.bump-version.outputs.bump_sha }}", env
     assert env.get("NEW_VERSION") == "${{ needs.bump-version.outputs.new_version }}", env
+
+
+# --- release authorization: environment-gated jobs ----------------------------------
+
+
+def _environment_name(job: Job) -> str | None:
+    env = job.get("environment")
+    if isinstance(env, dict):
+        name = env.get("name")
+        return name if isinstance(name, str) else None
+    return env if isinstance(env, str) else None
+
+
+def _job_mentions(job: Job, needle: str) -> bool:
+    return needle in yaml.safe_dump(job)
+
+
+def test_bump_version_is_gated_on_the_release_environment_from_main() -> None:
+    """The environment's deployment-branch policy (main only) is the control
+    that survives a writer's branch copy of this file; the `if` is defence in
+    depth against an accidental off-main dispatch of the unmodified file."""
+    job = _jobs(_load_yaml(RELEASE_YML))["bump-version"]
+    assert _environment_name(job) == "release", job.get("environment")
+    assert "github.ref == 'refs/heads/main'" in str(job.get("if", "")), job.get("if")
+
+
+def test_every_job_touching_release_pat_declares_the_release_environment() -> None:
+    offenders = [
+        f"{path.name}:{job_name}"
+        for path in sorted(WORKFLOWS_DIR.glob("*.yml"))
+        for job_name, job in _jobs(_load_yaml(path)).items()
+        if _job_mentions(job, "secrets.RELEASE_PAT") and _environment_name(job) != "release"
+    ]
+    assert offenders == [], offenders
+
+
+def test_security_md_documents_release_authorization() -> None:
+    text = SECURITY_MD.read_text(encoding="utf-8")
+    assert "Release authorization" in text
+    assert "`release`" in text and "RELEASE_PAT" in text
