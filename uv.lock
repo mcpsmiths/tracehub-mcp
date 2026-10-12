@@ -11,6 +11,16 @@ resolution-markers = [
     "(python_full_version < '3.12' and sys_platform == 'emscripten') or (python_full_version < '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32')",
 ]
 
+[manifest]
+build-constraints = [
+    { name = "hatchling", specifier = "==1.32.4" },
+    { name = "packaging", specifier = "==26.3" },
+    { name = "pathspec", specifier = "==1.1.1" },
+    { name = "pluggy", specifier = "==1.6.0" },
+    { name = "tomlkit", specifier = "==0.15.1" },
+    { name = "trove-classifiers", specifier = "==2026.9.21.13" },
+]
+
 [[package]]
 name = "aiofile"
 version = "3.9.0"
