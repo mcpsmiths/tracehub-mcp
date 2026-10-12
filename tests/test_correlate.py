@@ -16,6 +16,7 @@ from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery
 from opentelemetry_mcp.tools.correlate import (
     _LIMITATIONS,
     _MAX_SEARCH_WINDOW,
+    _MAX_SERVICE_QUERIES,
     _SEARCH_WINDOW_PAD,
     correlate_trace,
 )
@@ -345,13 +346,15 @@ class TestHeuristicFallback:
         secondary.get_trace.side_effect = ValueError("not found")
         secondary.search_traces.return_value = []
 
-        await correlate_trace(primary, secondary, "t1")
+        result = await correlate_trace(primary, secondary, "t1")
 
         assert secondary.search_traces.await_count == 2
         queried_services = {
             call.args[0].service_name for call in secondary.search_traces.await_args_list
         }
         assert queried_services == {"svc-a", "svc-b"}
+        # Under the cap there is no truncation note.
+        assert result.limitations == _LIMITATIONS
 
 
 class TestSearchWindowCap:
@@ -426,4 +429,108 @@ class TestSearchWindowCap:
         query: TraceQuery = secondary.search_traces.await_args.args[0]
         assert query.start_time is not None and query.end_time is not None
         assert query.end_time - query.start_time == 2 * _SEARCH_WINDOW_PAD
+        assert result.limitations == _LIMITATIONS
+
+
+class TestServiceFanoutCap:
+    """service.name is a resource attribute every telemetry producer sets
+    freely and most backends' get_trace returns every span of a trace, so
+    without a cap one correlate_trace call became one secondary search per
+    distinct name under the operator's secondary credential."""
+
+    @staticmethod
+    def _queried_services(secondary: AsyncMock) -> list[str]:
+        return [call.args[0].service_name for call in secondary.search_traces.await_args_list]
+
+    async def test_secondary_search_count_is_capped_for_wide_primary_traces(self) -> None:
+        primary = _backend()
+        primary.get_trace.return_value = _trace(
+            [_span(f"p{i}", service_name=f"svc-{i:04d}") for i in range(1000)]
+        )
+        secondary = _backend()
+        secondary.get_trace.side_effect = ValueError("not found")
+        secondary.search_traces.return_value = []
+
+        result = await correlate_trace(primary, secondary, "t1")
+
+        assert secondary.search_traces.await_count == _MAX_SERVICE_QUERIES == 10
+        assert result.limitations[: len(_LIMITATIONS)] == _LIMITATIONS
+        cap_notes = [note for note in result.limitations if "most-represented" in note]
+        assert len(cap_notes) == 1
+        assert "1000 services" in cap_notes[0]
+        assert len(_LIMITATIONS) == 4  # the module-level fixed list is never mutated
+
+    async def test_most_represented_services_are_queried_first(self) -> None:
+        # svc-00 has 15 spans, svc-01 has 14, ... svc-14 has 1: the ten
+        # queried names are the ten highest span counts, most-represented
+        # first, so the services that dominate the primary trace are the
+        # ones correlation is actually attempted for.
+        spans = [
+            _span(f"p{i}-{j}", service_name=f"svc-{i:02d}")
+            for i in range(15)
+            for j in range(15 - i)
+        ]
+        primary = _backend()
+        primary.get_trace.return_value = _trace(spans)
+        secondary = _backend()
+        secondary.get_trace.side_effect = ValueError("not found")
+        secondary.search_traces.return_value = []
+
+        await correlate_trace(primary, secondary, "t1")
+
+        assert self._queried_services(secondary) == [f"svc-{i:02d}" for i in range(10)]
+
+    async def test_equal_span_counts_are_tie_broken_by_name(self) -> None:
+        # Every service has exactly one span, so the cap falls back to the
+        # name order - deterministic across processes (str hashing is
+        # randomized per process, so set order alone would not be).
+        names = [f"svc-{c}" for c in "mlkjihgfedcba"]  # 13 services, deliberately unsorted
+        primary = _backend()
+        primary.get_trace.return_value = _trace(
+            [_span(f"p{i}", service_name=name) for i, name in enumerate(names)]
+        )
+        secondary = _backend()
+        secondary.get_trace.side_effect = ValueError("not found")
+        secondary.search_traces.return_value = []
+
+        await correlate_trace(primary, secondary, "t1")
+
+        assert self._queried_services(secondary) == sorted(names)[:10]
+
+    async def test_fanout_cap_holds_when_every_secondary_query_fails(self) -> None:
+        # Per-query exceptions are swallowed so a throttling secondary does
+        # not abort the loop - which is exactly why the loop itself has to
+        # be bounded: a 429 storm must not become 25 retried searches.
+        primary = _backend()
+        primary.get_trace.return_value = _trace(
+            [_span(f"p{i}", service_name=f"svc-{i:02d}") for i in range(25)]
+        )
+        secondary = _backend()
+        secondary.get_trace.side_effect = ValueError("not found")
+        secondary.search_traces.side_effect = RuntimeError("429 Too Many Requests")
+
+        result = await correlate_trace(primary, secondary, "t1")
+
+        assert secondary.search_traces.await_count == 10
+        assert result.matches == []
+        assert any("most-represented" in note for note in result.limitations)
+
+    async def test_empty_service_name_is_never_queried(self) -> None:
+        # An empty/whitespace service_name would turn the per-service
+        # search into an unscoped search of the whole window.
+        primary = _backend()
+        primary.get_trace.return_value = _trace(
+            [
+                _span("p1", service_name="svc-a"),
+                _span("p2", service_name=""),
+                _span("p3", service_name="   "),
+            ]
+        )
+        secondary = _backend()
+        secondary.get_trace.side_effect = ValueError("not found")
+        secondary.search_traces.return_value = []
+
+        result = await correlate_trace(primary, secondary, "t1")
+
+        assert self._queried_services(secondary) == ["svc-a"]
         assert result.limitations == _LIMITATIONS

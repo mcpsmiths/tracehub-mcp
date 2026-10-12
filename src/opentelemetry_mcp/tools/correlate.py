@@ -18,6 +18,7 @@ limitations rather than presenting a heuristic match as a guaranteed join.
 """
 
 import logging
+from collections import Counter
 from datetime import timedelta
 
 from opentelemetry_mcp.backends.base import BaseBackend
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 _SEARCH_WINDOW_PAD = timedelta(seconds=5)
 _MAX_SEARCH_WINDOW = timedelta(hours=24)
 _MAX_CANDIDATES_PER_SERVICE_QUERY = 20
+_MAX_SERVICE_QUERIES = 10
 _MAX_REPORTED_MATCHES = 5
 
 _LIMITATIONS = [
@@ -108,7 +110,9 @@ async def correlate_trace(
         to this kind of best-effort cross-backend correlation, plus any
         per-call truncation notes - the heuristic search window is capped
         at _MAX_SEARCH_WINDOW (24 h) after the primary trace's start, however
-        wide an extent the primary trace's spans claim.
+        wide an extent the primary trace's spans claim, and at most
+        _MAX_SERVICE_QUERIES (10) primary services - the most-represented by
+        span count - are searched for in the secondary backend.
     """
     primary_trace = await primary_backend.get_trace(trace_id)
     primary_services = {span.service_name for span in primary_trace.spans}
@@ -168,12 +172,31 @@ async def correlate_trace(
     start_time = primary_trace.start_time - _SEARCH_WINDOW_PAD
     end_time = primary_trace.start_time + extent + _SEARCH_WINDOW_PAD
     candidates_by_id: dict[str, TraceData] = {}
+    # service.name is a resource attribute every telemetry producer sets
+    # freely, and most backends' get_trace returns every span of the trace,
+    # so the distinct-name count - and therefore the number of searches
+    # issued below under the operator's secondary credential - is
+    # telemetry-author controlled. Bound it at the loop itself: query the
+    # services most represented in the primary trace (most spans first,
+    # name as the tie-break), skip the rest and say so in the result. An
+    # empty/whitespace name is dropped outright - it would turn the
+    # per-service search into an unscoped search of the whole window.
     # Sorted rather than iterated directly off the set: str hashing (and
     # therefore set iteration order) is randomized per-process by default
     # (PYTHONHASHSEED), which would otherwise make candidates_by_id's
     # insertion order - and thus which candidate wins a tie in the ranked
     # sort below - non-deterministic across runs for the exact same input.
-    for service_name in sorted(primary_services):
+    span_counts = Counter(span.service_name for span in primary_trace.spans)
+    ordered_services = sorted(
+        (name for name in primary_services if name.strip()),
+        key=lambda name: (-span_counts[name], name),
+    )
+    if len(ordered_services) > _MAX_SERVICE_QUERIES:
+        limitations.append(
+            f"Primary trace spans {len(ordered_services)} services; only the "
+            f"{_MAX_SERVICE_QUERIES} most-represented were searched in the secondary backend."
+        )
+    for service_name in ordered_services[:_MAX_SERVICE_QUERIES]:
         query = TraceQuery(
             service_name=service_name,
             start_time=start_time,
