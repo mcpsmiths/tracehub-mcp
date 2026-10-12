@@ -63,8 +63,19 @@ with Contents read/write) is stored as a secret of that environment, is handed t
 without being persisted, and reaches the push step only as a step-level variable. The PyPI trusted
 publisher for `tracehub-mcp` and the MCP Registry publish job mint their OIDC tokens only from jobs
 running under the same environment, so neither can be fed an unreviewed build from another ref.
-Only repository administrators can dispatch the workflow; required reviewers on the environment
-are off while the project has a single maintainer.
+GitHub has no per-workflow dispatch permission: any collaborator with write access can dispatch
+`release.yml`, but a dispatch from `main` runs only the reviewed workflow file on `main`, and the
+`release` environment refuses every other ref. Required reviewers on the environment are off while
+the project has a single maintainer and should be enabled before a non-admin writer is added.
+Published container tags rest on one more control: `docker-publish.yml` builds `:X.Y.Z` and
+`:latest` only from the tree behind `refs/tags/vX.Y.Z`, so the `protect-release-tags` ruleset
+(`refs/tags/v*`; no update or deletion except by bypass actors) is what stops a writer from
+re-pointing a release tag at another tree.
+
+The environment's deployment-branch policy, the environment-scoped `RELEASE_PAT` secret, the PyPI
+publisher's environment name and the tag ruleset are repository and PyPI settings configured by the
+maintainer, not by files in this repository: the workflow-side declarations above are inert until
+they are configured, and each protection holds only once its setting is in place.
 
 ## Scope
 

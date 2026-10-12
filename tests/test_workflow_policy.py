@@ -395,6 +395,22 @@ def test_security_md_binds_the_pypi_publisher_to_the_environment() -> None:
     assert "PyPI" in section and "MCP Registry" in section, section
 
 
+def test_security_md_release_authorization_claims_only_controls_that_exist() -> None:
+    """GitHub has no per-workflow dispatch permission: any collaborator with
+    write access can run workflow_dispatch, and the environment's branch policy
+    restricts the ref, not the actor. The section must not claim an actor
+    restriction, must name the tag ruleset that GHCR tag integrity depends on,
+    and must say that the environment/PyPI/ruleset settings are configured by
+    the maintainer rather than by this repository's files."""
+    text = SECURITY_MD.read_text(encoding="utf-8")
+    section = text.split("### Release authorization", 1)[1].split("\n## ", 1)[0]
+    prose = " ".join(section.split())  # the file is hard-wrapped; phrases may span lines
+    assert "administrators can dispatch" not in prose, prose
+    assert "write access can dispatch" in prose, prose
+    assert "protect-release-tags" in prose, prose
+    assert "inert until they are configured" in prose, prose
+
+
 # --- docker-publish: :latest and :<X.Y.Z> only from the tree behind refs/tags/vX.Y.Z --
 
 IMAGE = "ghcr.io/mcpsmiths/tracehub-mcp"
