@@ -1,0 +1,12 @@
+# Read by `mcpb pack` (the CLI never consults .gitignore): everything under
+# mcpb/ that is not matched here or by mcpb's built-in patterns is archived
+# into the bundle. These are local build artifacts that must never ship - a
+# co-located uv.lock would pin the bundle to whatever version was last
+# resolved here (0.4.0 once), .venv/pyvenv.cfg leaks the packer's home path,
+# and dotenv files may hold real credentials.
+uv.lock
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*

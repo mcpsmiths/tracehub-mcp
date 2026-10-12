@@ -10,7 +10,11 @@ __pycache__/
 .Python
 
 # MCPB bundle build artifact (mcpb/ has the source; the packed .mcpb is
-# rebuilt on demand via `mcpb pack mcpb/ tracehub-mcp.mcpb`, not committed)
+# rebuilt on demand via `mcpb pack mcpb/ tracehub-mcp.mcpb`, not committed).
+# NOTE: `mcpb pack` archives EVERYTHING under mcpb/ that mcpb/.mcpbignore (and
+# the CLI's built-in patterns) does not exclude - it never reads this file, so
+# the mcpb/uv.lock and mcpb/.venv/ entries below only keep them out of git,
+# not out of the bundle.
 *.mcpb
 build/
 develop-eggs/

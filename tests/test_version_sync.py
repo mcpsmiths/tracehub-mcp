@@ -10,11 +10,18 @@ its wiring, and fail CI if the two files ever disagree again.
 """
 
 import importlib.util
+import json
+import shutil
+import subprocess
 import tomllib
+import zipfile
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+from packaging.requirements import Requirement
+
+import opentelemetry_mcp
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOK_PATH = REPO_ROOT / "scripts" / "sync_uv_lock_version.py"
@@ -127,3 +134,74 @@ def test_hook_main_reads_new_version_from_commitizen_env(
     assert hook.main() == 0
     assert _project_lock_version(lock.read_text(), "tracehub-mcp") == "0.12.3"
     assert hook.main() == 0, "second run is a no-op, not an error"
+
+
+# --- MCPB launcher: the bundle labelled X runs tracehub-mcp==X and ships only its sources --
+
+MCPB_DIR = REPO_ROOT / "mcpb"
+LAUNCHER_FILES = {"manifest.json", "pyproject.toml", "src/server.py"}
+
+
+def _mcpb_launcher_pin() -> str:
+    launcher = tomllib.loads((MCPB_DIR / "pyproject.toml").read_text())
+    deps = [Requirement(d) for d in launcher["project"]["dependencies"]]
+    (dep,) = [d for d in deps if d.name == "tracehub-mcp"]
+    specs = list(dep.specifier)
+    assert len(specs) == 1 and specs[0].operator == "==", (
+        f"mcpb/pyproject.toml must pin tracehub-mcp exactly, got {dep!s}"
+    )
+    return specs[0].version
+
+
+def test_mcpb_launcher_pin_and_manifest_match_release_version() -> None:
+    """A bare `tracehub-mcp` dependency let a co-located stale uv.lock (or
+    simply the newest PyPI release) decide what a 0.12.3-labelled bundle ran."""
+    root = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["version"]
+    manifest = json.loads((MCPB_DIR / "manifest.json").read_text())["version"]
+    launcher = tomllib.loads((MCPB_DIR / "pyproject.toml").read_text())["project"]["version"]
+    assert root == manifest == launcher == _mcpb_launcher_pin() == opentelemetry_mcp.__version__
+
+
+def test_mcpbignore_excludes_local_build_artifacts() -> None:
+    """`mcpb pack` archives everything under mcpb/ except its built-in
+    patterns and this file - it never reads .gitignore."""
+    path = MCPB_DIR / ".mcpbignore"
+    assert path.is_file(), "mcpb/.mcpbignore is missing"
+    entries = {
+        line.strip()
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    assert {"uv.lock", ".venv/", "__pycache__/", "*.pyc", ".env", ".env.*"} <= entries, entries
+
+
+def test_cz_bumps_the_mcpb_launcher_pin() -> None:
+    cz = tomllib.loads((REPO_ROOT / ".cz.toml").read_text())
+    assert "mcpb/pyproject.toml:tracehub-mcp==" in cz["tool"]["commitizen"]["version_files"]
+
+
+@pytest.mark.skipif(shutil.which("mcpb") is None, reason="@anthropic-ai/mcpb CLI not installed")
+def test_mcpb_pack_ships_only_the_tracked_launcher_files(tmp_path: Path) -> None:
+    """Pack a copy of mcpb/ with the artifacts the documented command used to
+    archive planted next to the sources; none may reach the bundle."""
+    bundle_src = tmp_path / "mcpb"
+    shutil.copytree(
+        MCPB_DIR, bundle_src, ignore=shutil.ignore_patterns(".venv", "uv.lock", "__pycache__")
+    )
+    (bundle_src / "uv.lock").write_text("version = 1\n")
+    (bundle_src / ".venv").mkdir()
+    (bundle_src / ".venv" / "pyvenv.cfg").write_text("home = /Users/someone/.local/bin\n")
+    (bundle_src / "src" / "__pycache__").mkdir()
+    (bundle_src / "src" / "__pycache__" / "server.cpython-313.pyc").write_bytes(b"\x00")
+    (bundle_src / ".env").write_text("BACKEND_API_KEY=not-a-real-key\n")
+    (bundle_src / ".env.datadog").write_text("BACKEND_APP_KEY=not-a-real-key\n")
+    mcpb = shutil.which("mcpb")
+    assert mcpb is not None
+    bundle = tmp_path / "check.mcpb"
+    result = subprocess.run(  # noqa: S603 - fixed arguments, scratch copy of mcpb/
+        [mcpb, "pack", str(bundle_src), str(bundle)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    with zipfile.ZipFile(bundle) as archive:
+        entries = {name for name in archive.namelist() if not name.endswith("/")}
+    assert entries == LAUNCHER_FILES, entries
