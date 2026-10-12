@@ -6,6 +6,7 @@ test_investigate.py's convention - the real span_tree.py error-chain walk
 only the backend I/O itself is faked.
 """
 
+import tracemalloc
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from unittest.mock import AsyncMock
@@ -18,6 +19,7 @@ from opentelemetry_mcp.tools.correlate import (
     _MAX_SEARCH_WINDOW,
     _MAX_SERVICE_QUERIES,
     _SEARCH_WINDOW_PAD,
+    _error_signal,
     correlate_trace,
 )
 
@@ -196,7 +198,7 @@ class TestRootCauseConsistency:
 class TestUnreachableErrorDetection:
     async def test_error_in_a_disconnected_cycle_is_still_detected(self) -> None:
         # a's parent is b and b's parent is a - both present, so no
-        # root-first walk (including find_all_error_chains from a real
+        # root-first walk (including find_deepest_error_chain from a real
         # root) can discover this cluster at all. Before this fix,
         # _error_signal would report has_error=False for a trace that
         # genuinely contains an ERROR span.
@@ -534,3 +536,47 @@ class TestServiceFanoutCap:
 
         assert self._queried_services(secondary) == ["svc-a"]
         assert result.limitations == _LIMITATIONS
+
+
+class TestErrorSignalBounds:
+    def test_8000_span_broom_error_signal_is_linear_in_memory(self) -> None:
+        # Security regression: _error_signal runs once for the primary trace
+        # and once per heuristic candidate, so a "broom" (4000 chained ERROR
+        # spans whose last span has 4000 ERROR children, all tied at the
+        # maximal depth) that cost 127 MiB and 1.1 s per call while every
+        # tied leaf's path was rebuilt multiplied across every candidate
+        # secondary trace. One chain is materialized now; the blamed service
+        # is still the deepest (leaf) span's. Same tracemalloc delta
+        # protocol as test_triage.py's bounds tests.
+        handle = 4000
+        leaves = 4000
+        spans = [_span("s0", service_name="svc-handle", status="ERROR")]
+        for i in range(1, handle):
+            spans.append(
+                _span(
+                    f"s{i}", parent_span_id=f"s{i - 1}", service_name="svc-handle", status="ERROR"
+                )
+            )
+        for j in range(leaves):
+            spans.append(
+                _span(
+                    f"leaf{j}",
+                    parent_span_id=f"s{handle - 1}",
+                    service_name="svc-leaf",
+                    status="ERROR",
+                )
+            )
+        trace = _trace(spans)
+
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            before, _ = tracemalloc.get_traced_memory()
+            has_error, blamed_service = _error_signal(trace)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert has_error is True
+        assert blamed_service == "svc-leaf"
+        assert peak - before < 50 * 1024 * 1024

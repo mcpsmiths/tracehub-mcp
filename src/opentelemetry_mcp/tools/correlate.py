@@ -57,11 +57,9 @@ def _error_signal(trace: TraceData) -> tuple[bool, str | None]:
 
     children_map = span_tree.build_children_map(spans)
     roots = span_tree.find_roots(children_map) or [spans[0]]
-    error_count, deepest_chains = span_tree.find_deepest_error_chains_across_roots(
-        roots, children_map
-    )
-    if error_count:
-        return True, deepest_chains[0][-1].service_name
+    deepest = span_tree.find_deepest_error_chain_across_roots(roots, children_map)
+    if deepest.chain:
+        return True, deepest.chain[-1].service_name
 
     # No root-reachable error chain, but an error can still be trapped in a
     # disconnected/cyclic parent chain no root-first walk can discover (see

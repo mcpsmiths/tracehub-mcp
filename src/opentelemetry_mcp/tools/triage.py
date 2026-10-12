@@ -75,12 +75,12 @@ async def triage_trace(
     # forget spans, or partial context propagation across services) - an
     # error chain anywhere under ANY root is relevant, not just the first
     # one, so every root's subtree is searched rather than picking one
-    # arbitrarily up front. Only the deepest chain(s) are ever materialized:
-    # the walk is linear in the span count, so a telemetry author cannot
-    # make one trace_id cost quadratic time and memory on the event loop.
-    total_error_count, deepest_chains = span_tree.find_deepest_error_chains_across_roots(
-        roots, children_map
-    )
+    # arbitrarily up front. Exactly one chain is ever materialized - the
+    # first at the global maximal depth - and equally-deep errors are
+    # counted rather than rebuilt: the walk is linear in the span count, so
+    # a telemetry author cannot make one trace_id cost quadratic time and
+    # memory on the event loop.
+    deepest = span_tree.find_deepest_error_chain_across_roots(roots, children_map)
     top_contributors = span_tree.rank_by_latency_contribution(spans, children_map)
 
     error_chain_summaries: list[TriagedSpanSummary] | None = None
@@ -90,13 +90,13 @@ async def triage_trace(
     # real root always takes priority over this fallback.
     unreachable_errors = (
         []
-        if total_error_count
+        if deepest.error_count
         else span_tree.find_unreachable_error_spans(spans, roots, children_map)
     )
 
-    if deepest_chains:
-        chain = deepest_chains[0]
-        confidence: Literal["high", "medium"] = "high" if len(deepest_chains) == 1 else "medium"
+    if deepest.chain:
+        chain = deepest.chain
+        confidence: Literal["high", "medium"] = "high" if deepest.tie_count == 1 else "medium"
 
         error_chain_summaries = [
             _summarize(span, span_tree.compute_self_time_ms(span, children_map)) for span in chain
@@ -112,7 +112,7 @@ async def triage_trace(
             "deep from the root)."
             if confidence == "high"
             else (
-                f"{len(deepest_chains)} equally-deep error chains found in this trace; "
+                f"{deepest.tie_count} equally-deep error chains found in this trace; "
                 "picked the first one, but blame is ambiguous between them."
             )
         )

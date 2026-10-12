@@ -16,6 +16,8 @@ stack has no special handling for a cycle, and a long-but-acyclic chain -
 e.g. a deep recursive agent/tool-calling loop - hits the same limit).
 """
 
+from typing import NamedTuple
+
 from opentelemetry_mcp.models import SpanData
 
 
@@ -88,7 +90,7 @@ def find_unreachable_error_spans(
     is missing or self-referential; a longer cycle where every span in it
     has a present, non-self parent (A's parent is B, B's parent is A, both
     in `spans`) has no entry point any root-first walk can discover, so
-    find_deepest_error_chains from the real root(s) alone silently misses an
+    find_deepest_error_chain from the real root(s) alone silently misses an
     error trapped there. Returns spans in no particular order - there is no
     reachable root to build a path from, so callers that want a "chain" for
     one of these can only treat the span itself as a standalone root (see
@@ -193,94 +195,121 @@ def rank_by_latency_contribution(
     return ranked[:top_n]
 
 
-def find_deepest_error_chains(
+class DeepestErrorChain(NamedTuple):
+    """What find_deepest_error_chain / find_deepest_error_chain_across_roots
+    report about a trace's errors - the only three facts either caller
+    (triage_trace, correlate_trace._error_signal) has ever used, so nothing
+    else is materialized: `error_count` is the number of ERROR-status spans
+    reachable from the root(s); `tie_count` is how many of them sit at the
+    maximal depth (1 is an unambiguous verdict, more means blame is
+    ambiguous between equally-deep failures and `chain` is just the first
+    of them the walk reached; 0 iff error_count == 0); `chain` is the
+    root-to-span path of that first maximal-depth ERROR span, empty iff
+    error_count == 0."""
+
+    error_count: int
+    tie_count: int
+    chain: list[SpanData]
+
+
+def find_deepest_error_chain(
     root: SpanData, children_map: dict[str | None, list[SpanData]]
-) -> tuple[int, list[list[SpanData]]]:
-    """(number of ERROR spans reachable from `root`, root-to-span paths of
-    maximal depth) for the subtree reachable from `root` - root included if
-    it errors itself; `(0, [])` if no span in the subtree has status ==
-    "ERROR". The deepest error span (by path length) is the most likely
-    actual root cause, since the leaf-most failure in a call chain is
-    typically closest to where the error originated; every span at that
-    maximal depth gets its own path, in the order the walk pops them, so
-    callers can tell an unambiguous verdict from a tie.
+) -> DeepestErrorChain:
+    """Count the ERROR spans reachable from `root` and materialize exactly
+    one root-to-span path: the first ERROR span the walk pops at the
+    maximal depth, root included if it errors itself. The deepest error
+    span (by path length) is the most likely actual root cause, since the
+    leaf-most failure in a call chain is typically closest to where the
+    error originated; equally-deep ERROR spans are counted (tie_count) in
+    the same pop order as before, so callers can still tell an unambiguous
+    verdict from a tie without a path per tied span.
 
     Linear in the number of reachable spans, by construction: the walk
-    keeps one predecessor-map entry and one depth per visited span and
-    materializes only the deepest path(s) afterwards by following
-    predecessors back to the root. The previous all-chains walk copied the
-    whole path on every edge and retained one path per ERROR span, which a
-    telemetry author could turn into N(N+1)/2 retained pointers (about
-    1.6 GB for a 20 000-span all-ERROR chain) blocking the shared event
-    loop - the deepest-only result is all either caller ever reported.
+    keeps one predecessor-map entry and one depth per visited span plus a
+    single deepest span and a counter, and follows predecessors back to
+    the root once afterwards. Both earlier shapes were superlinear on
+    telemetry-authored input - the all-chains walk copied the whole path
+    on every edge and retained one path per ERROR span (N(N+1)/2 pointers,
+    about 1.6 GB for a 20 000-span all-ERROR chain), and a deepest-only
+    walk that still rebuilt every tied path was quadratic on a "broom" (a
+    chain of N/2 spans whose last span has N/2 ERROR children, all tied at
+    the maximal depth: 814 MiB and 7 s at 20 000 spans) - even though both
+    callers only ever reported the first chain and the number of ties.
 
     Iterative (explicit stack, not recursion) so a long-but-acyclic chain
     (e.g. a deep recursive agent/tool-calling loop) doesn't raise
-    RecursionError. Membership in the predecessor map is the cycle guard:
-    build_children_map files every span under exactly one parent and
-    redirects self-references, so each span reachable from `root` has a
-    single incoming edge and a global visited set is exactly as selective
-    as the per-path set it replaces - a cycle terminates that branch
-    instead of looping forever.
+    RecursionError. The predecessor map is keyed by object identity and
+    membership in it is the cycle guard: every SpanData object is pushed at
+    most once, so a cycle among valid span IDs (A's parent is B, B's parent
+    is A) terminates that branch instead of looping forever, and a
+    malformed trace that reuses one span_id for two different spans (which
+    build_children_map files under their respective parents without
+    deduplicating) still walks and counts both copies, as the old per-path
+    guard did - a span_id-keyed guard would skip whichever copy is popped
+    second and let pop order decide which copy gets blamed. Where the
+    duplicated id is itself a parent, its children are reached through
+    whichever copy is popped first only; the old walk enumerated every
+    simple path through such duplicates (exponential in their number), so
+    on malformed input the reported chain is best-effort rather than the
+    longest simple path.
     """
-    pred: dict[str, SpanData | None] = {root.span_id: None}
-    depth: dict[str, int] = {root.span_id: 1}
+    pred: dict[int, SpanData | None] = {id(root): None}
+    depth: dict[int, int] = {id(root): 1}
     stack: list[SpanData] = [root]
     error_count = 0
     max_depth = 0
-    deepest: list[SpanData] = []
+    tie_count = 0
+    deepest: SpanData | None = None
     while stack:
         span = stack.pop()
-        span_depth = depth[span.span_id]
+        span_depth = depth[id(span)]
         if span.status == "ERROR":
             error_count += 1
             if span_depth > max_depth:
                 max_depth = span_depth
-                deepest = [span]
+                tie_count = 1
+                deepest = span
             elif span_depth == max_depth:
-                deepest.append(span)
+                tie_count += 1
         for child in children_map.get(span.span_id, []):
-            if child.span_id in pred:
+            if id(child) in pred:
                 continue
-            pred[child.span_id] = span
-            depth[child.span_id] = span_depth + 1
+            pred[id(child)] = span
+            depth[id(child)] = span_depth + 1
             stack.append(child)
 
-    chains: list[list[SpanData]] = []
-    for span in deepest:
-        chain: list[SpanData] = []
-        current: SpanData | None = span
-        while current is not None:
-            chain.append(current)
-            current = pred[current.span_id]
-        chain.reverse()
-        chains.append(chain)
-    return error_count, chains
+    chain: list[SpanData] = []
+    current = deepest
+    while current is not None:
+        chain.append(current)
+        current = pred[id(current)]
+    chain.reverse()
+    return DeepestErrorChain(error_count, tie_count, chain)
 
 
-def find_deepest_error_chains_across_roots(
+def find_deepest_error_chain_across_roots(
     roots: list[SpanData], children_map: dict[str | None, list[SpanData]]
-) -> tuple[int, list[list[SpanData]]]:
-    """find_deepest_error_chains over every root of a multi-root trace
-    (async fire-and-forget spans, partial context propagation): the total
-    reachable ERROR count, and the chain(s) at the GLOBAL maximal depth
-    across all roots - ties keep every root's chains in `roots` order, so a
-    deeper error chain hanging off a later root wins over a shallower one
-    under the first, exactly as the previous flatten-then-max selection
-    did. Shared by triage_trace and correlate_trace so both blame the same
-    span for the same trace."""
+) -> DeepestErrorChain:
+    """find_deepest_error_chain over every root of a multi-root trace (async
+    fire-and-forget spans, partial context propagation): the total
+    reachable ERROR count, the number of ERROR spans at the GLOBAL maximal
+    depth across all roots, and the chain of the first root (in `roots`
+    order) that reaches that depth - so a deeper error chain hanging off a
+    later root wins over a shallower one under the first, exactly as the
+    original flatten-then-max selection did, while ties within and across
+    roots are summed rather than materialized. Shared by triage_trace and
+    correlate_trace so both blame the same span for the same trace."""
     total_error_count = 0
-    max_depth = 0
-    deepest: list[list[SpanData]] = []
+    tie_count = 0
+    deepest_chain: list[SpanData] = []
     for root in roots:
-        error_count, chains = find_deepest_error_chains(root, children_map)
-        total_error_count += error_count
-        if not chains:
+        root_result = find_deepest_error_chain(root, children_map)
+        total_error_count += root_result.error_count
+        if not root_result.chain:
             continue
-        root_depth = len(chains[0])
-        if root_depth > max_depth:
-            max_depth = root_depth
-            deepest = list(chains)
-        elif root_depth == max_depth:
-            deepest.extend(chains)
-    return total_error_count, deepest
+        if len(root_result.chain) > len(deepest_chain):
+            deepest_chain = root_result.chain
+            tie_count = root_result.tie_count
+        elif len(root_result.chain) == len(deepest_chain):
+            tie_count += root_result.tie_count
+    return DeepestErrorChain(total_error_count, tie_count, deepest_chain)

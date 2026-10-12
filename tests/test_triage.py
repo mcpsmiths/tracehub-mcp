@@ -292,3 +292,40 @@ class TestAlgorithmicBounds:
         assert result.error_chain[0].span_id == "s0"
         assert result.error_chain[-1].span_id == f"s{depth - 1}"
         assert peak - before < 50 * 1024 * 1024
+
+    async def test_8000_span_broom_of_equally_deep_errors_triages_in_linear_memory(self) -> None:
+        # Security regression: a "broom" - 4000 chained ERROR spans whose
+        # last span has 4000 ERROR children - ties every leaf at the maximal
+        # depth. Rebuilding a root-to-leaf path per tied leaf cost 135 MiB
+        # and 1.8 s on the event loop at this size, even though the verdict
+        # only ever used the first chain and the number of ties; now exactly
+        # one chain is materialized and the ties are counted. Same
+        # tracemalloc delta protocol as the chain test above.
+        handle = 4000
+        leaves = 4000
+        spans = [_span("s0", status="ERROR")]
+        for i in range(1, handle):
+            spans.append(_span(f"s{i}", parent_span_id=f"s{i - 1}", status="ERROR"))
+        for j in range(leaves):
+            spans.append(_span(f"leaf{j}", parent_span_id=f"s{handle - 1}", status="ERROR"))
+        backend = _backend()
+        backend.get_trace.return_value = _trace(spans)
+
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            before, _ = tracemalloc.get_traced_memory()
+            result = await triage_trace(backend, "t1")
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert result.verdict.confidence == "medium"
+        assert f"{leaves} equally-deep error chains" in result.verdict.reasoning
+        assert result.verdict.likely_root_cause is not None
+        assert result.verdict.likely_root_cause.span_id == f"leaf{leaves - 1}"
+        assert result.error_chain is not None
+        assert len(result.error_chain) == handle + 1
+        assert result.error_chain[0].span_id == "s0"
+        assert result.error_chain[-2].span_id == f"s{handle - 1}"
+        assert peak - before < 50 * 1024 * 1024
