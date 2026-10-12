@@ -151,6 +151,41 @@ class TestRootCauseConsistency:
 
         assert result.matches[0].root_cause_consistent is False
 
+    async def test_deepest_chain_under_a_later_root_is_the_blamed_service(self) -> None:
+        # Parity guard for the deepest-only error-chain walk: a two-root
+        # primary whose shallow error (depth 2) hangs off the FIRST root and
+        # whose deeper error (depth 3) hangs off the SECOND root must still
+        # blame the deeper chain's service - the global maximum across all
+        # roots, not the first root's own maximum - exactly as the previous
+        # flatten-then-max selection did.
+        root1 = _span("root1", service_name="svc-shallow", status="OK")
+        shallow_error = _span(
+            "shallow_error", parent_span_id="root1", service_name="svc-shallow", status="ERROR"
+        )
+        root2 = _span("root2", service_name="svc-deep", status="OK")
+        mid = _span("mid", parent_span_id="root2", service_name="svc-deep", status="OK")
+        deep_error = _span(
+            "deep_error", parent_span_id="mid", service_name="svc-deep", status="ERROR"
+        )
+        primary = _backend()
+        primary.get_trace.return_value = _trace([root1, shallow_error, root2, mid, deep_error])
+
+        blames_deep = _backend()
+        blames_deep.get_trace.return_value = _trace(
+            [_span("s1", service_name="svc-deep", status="ERROR")]
+        )
+        blames_shallow = _backend()
+        blames_shallow.get_trace.return_value = _trace(
+            [_span("s1", service_name="svc-shallow", status="ERROR")]
+        )
+
+        assert (await correlate_trace(primary, blames_deep, "t1")).matches[
+            0
+        ].root_cause_consistent is True
+        assert (await correlate_trace(primary, blames_shallow, "t1")).matches[
+            0
+        ].root_cause_consistent is False
+
 
 class TestUnreachableErrorDetection:
     async def test_error_in_a_disconnected_cycle_is_still_detected(self) -> None:

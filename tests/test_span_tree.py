@@ -1,5 +1,6 @@
 """Tests for the span-tree/critical-path utilities in tools/span_tree.py."""
 
+import tracemalloc
 from datetime import datetime, timedelta
 from typing import Literal
 
@@ -251,20 +252,21 @@ class TestRankByLatencyContribution:
         assert [span.span_id for span, _ in ranked] == ["s4", "s3"]
 
 
-class TestFindAllErrorChains:
-    def test_no_error_spans_returns_empty_list(self) -> None:
+class TestFindDeepestErrorChains:
+    def test_no_error_spans_returns_zero_count_and_no_chains(self) -> None:
         root = _span("root")
         child = _span("child", parent_span_id="root")
         children_map = span_tree.build_children_map([root, child])
 
-        assert span_tree.find_all_error_chains(root, children_map) == []
+        assert span_tree.find_deepest_error_chains(root, children_map) == (0, [])
 
     def test_root_itself_erroring_is_its_own_chain(self) -> None:
         root = _span("root", status="ERROR")
         children_map = span_tree.build_children_map([root])
 
-        chains = span_tree.find_all_error_chains(root, children_map)
+        error_count, chains = span_tree.find_deepest_error_chains(root, children_map)
 
+        assert error_count == 1
         assert len(chains) == 1
         assert [s.span_id for s in chains[0]] == ["root"]
 
@@ -276,22 +278,45 @@ class TestFindAllErrorChains:
         leaf = _span("leaf", parent_span_id="mid", status="ERROR")
         children_map = span_tree.build_children_map([root, mid, leaf])
 
-        chains = span_tree.find_all_error_chains(root, children_map)
+        error_count, chains = span_tree.find_deepest_error_chains(root, children_map)
 
+        assert error_count == 1
         assert len(chains) == 1
         assert [s.span_id for s in chains[0]] == ["root", "mid", "leaf"]
 
-    def test_multiple_error_spans_produce_one_chain_each(self) -> None:
+    def test_two_branch_tree_reports_only_the_deepest_chain(self) -> None:
+        # Both error spans are counted, but only the deepest root-to-error
+        # path is materialized - the shallower ("root", "error_a") chain is
+        # never built, which is what keeps the walk linear in the span count.
         root = _span("root", status="OK")
         error_a = _span("error_a", parent_span_id="root", status="ERROR")
         mid = _span("mid", parent_span_id="root", status="OK")
         error_b = _span("error_b", parent_span_id="mid", status="ERROR")
         children_map = span_tree.build_children_map([root, error_a, mid, error_b])
 
-        chains = span_tree.find_all_error_chains(root, children_map)
+        error_count, chains = span_tree.find_deepest_error_chains(root, children_map)
 
-        chain_ids = {tuple(s.span_id for s in chain) for chain in chains}
-        assert chain_ids == {("root", "error_a"), ("root", "mid", "error_b")}
+        assert error_count == 2
+        assert [[s.span_id for s in chain] for chain in chains] == [["root", "mid", "error_b"]]
+
+    def test_equal_depth_error_leaves_are_all_returned_in_pop_order(self) -> None:
+        # Two error leaves at the same depth are both reported, in the order
+        # the explicit-stack DFS pops them (children are pushed in
+        # children_map order, so the LAST child is popped first) - the same
+        # order the previous all-chains walk produced, which triage_trace's
+        # "medium confidence, picked the first one" tie rule depends on.
+        root = _span("root", status="OK")
+        error_a = _span("error_a", parent_span_id="root", status="ERROR")
+        error_b = _span("error_b", parent_span_id="root", status="ERROR")
+        children_map = span_tree.build_children_map([root, error_a, error_b])
+
+        error_count, chains = span_tree.find_deepest_error_chains(root, children_map)
+
+        assert error_count == 2
+        assert [[s.span_id for s in chain] for chain in chains] == [
+            ["root", "error_b"],
+            ["root", "error_a"],
+        ]
 
     def test_long_linear_chain_does_not_raise_recursion_error(self) -> None:
         # A deep recursive agent/tool-calling loop is a realistic shape for
@@ -304,8 +329,9 @@ class TestFindAllErrorChains:
             spans.append(_span(f"s{i}", parent_span_id=f"s{i - 1}", status=status))
         children_map = span_tree.build_children_map(spans)
 
-        chains = span_tree.find_all_error_chains(spans[0], children_map)
+        error_count, chains = span_tree.find_deepest_error_chains(spans[0], children_map)
 
+        assert error_count == 1
         assert len(chains) == 1
         assert len(chains[0]) == depth
         assert chains[0][-1].span_id == f"s{depth - 1}"
@@ -315,10 +341,44 @@ class TestFindAllErrorChains:
         b = _span("b", parent_span_id="a", status="OK")
         children_map = span_tree.build_children_map([a, b])
 
-        chains = span_tree.find_all_error_chains(a, children_map)
+        error_count, chains = span_tree.find_deepest_error_chains(a, children_map)
 
+        assert error_count == 1
         assert len(chains) == 1
         assert [s.span_id for s in chains[0]] == ["a"]
+
+    def test_deep_all_error_chain_is_linear_in_time_and_memory(self) -> None:
+        # Security regression: a telemetry author can plant one trace whose
+        # N spans form a deep parent chain with every span in ERROR. The
+        # previous walk copied the whole root-to-span path on every edge and
+        # retained one full path per ERROR span - N(N+1)/2 pointers, about
+        # 1.6 GB for this fixture - synchronously on the shared event loop.
+        # The deepest-only walk keeps a predecessor map instead, so the
+        # memory it allocates during the walk stays linear in N. Measured as
+        # the tracemalloc peak DELTA of the walk alone: tracing starts only
+        # after the fixture is built, so the 20k pydantic spans themselves
+        # are not what is being asserted on.
+        depth = 20_000
+        spans = [_span("s0", status="ERROR")]
+        for i in range(1, depth):
+            spans.append(_span(f"s{i}", parent_span_id=f"s{i - 1}", status="ERROR"))
+        children_map = span_tree.build_children_map(spans)
+
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            before, _ = tracemalloc.get_traced_memory()
+            error_count, chains = span_tree.find_deepest_error_chains(spans[0], children_map)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert error_count == depth
+        assert len(chains) == 1
+        assert len(chains[0]) == depth
+        assert chains[0][0].span_id == "s0"
+        assert chains[0][-1].span_id == f"s{depth - 1}"
+        assert peak - before < 50 * 1024 * 1024
 
 
 class TestFindUnreachableErrorSpans:

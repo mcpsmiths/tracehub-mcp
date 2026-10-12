@@ -75,24 +75,26 @@ async def triage_trace(
     # forget spans, or partial context propagation across services) - an
     # error chain anywhere under ANY root is relevant, not just the first
     # one, so every root's subtree is searched rather than picking one
-    # arbitrarily up front.
-    error_chains = [
-        chain for root in roots for chain in span_tree.find_all_error_chains(root, children_map)
-    ]
+    # arbitrarily up front. Only the deepest chain(s) are ever materialized:
+    # the walk is linear in the span count, so a telemetry author cannot
+    # make one trace_id cost quadratic time and memory on the event loop.
+    total_error_count, deepest_chains = span_tree.find_deepest_error_chains_across_roots(
+        roots, children_map
+    )
     top_contributors = span_tree.rank_by_latency_contribution(spans, children_map)
 
     error_chain_summaries: list[TriagedSpanSummary] | None = None
     # None of the real root(s) can reach an error trapped in a disconnected
     # cyclic parent chain (malformed instrumentation) - checked only when
-    # find_all_error_chains came back empty, since a genuine error chain
-    # from a real root always takes priority over this fallback.
+    # no root reaches any ERROR span, since a genuine error chain from a
+    # real root always takes priority over this fallback.
     unreachable_errors = (
-        [] if error_chains else span_tree.find_unreachable_error_spans(spans, roots, children_map)
+        []
+        if total_error_count
+        else span_tree.find_unreachable_error_spans(spans, roots, children_map)
     )
 
-    if error_chains:
-        max_depth = max(len(chain) for chain in error_chains)
-        deepest_chains = [chain for chain in error_chains if len(chain) == max_depth]
+    if deepest_chains:
         chain = deepest_chains[0]
         confidence: Literal["high", "medium"] = "high" if len(deepest_chains) == 1 else "medium"
 

@@ -6,6 +6,7 @@ through the real span_tree.py algorithms - only backend.get_trace itself is
 faked, everything downstream is exercised for real.
 """
 
+import tracemalloc
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from unittest.mock import AsyncMock
@@ -255,3 +256,39 @@ class TestBackendInteraction:
         await triage_trace(backend, "specific-trace-id")
 
         backend.get_trace.assert_awaited_once_with("specific-trace-id")
+
+
+class TestAlgorithmicBounds:
+    async def test_8000_span_all_error_chain_triage_is_linear(self) -> None:
+        # Security regression: one telemetry-authored trace whose spans form
+        # a deep parent chain with every span in ERROR used to cost
+        # N(N+1)/2 retained path pointers (about 270 MB at this size) and
+        # quadratic CPU, synchronously on the shared event loop, before the
+        # verdict kept only the deepest chain. The deepest-only walk must
+        # give the same verdict while allocating linearly. tracemalloc
+        # starts only after the fixture is built, so the assertion is on
+        # the peak delta of triage_trace itself, not the 8000 pydantic spans.
+        depth = 8000
+        spans = [_span("s0", status="ERROR")]
+        for i in range(1, depth):
+            spans.append(_span(f"s{i}", parent_span_id=f"s{i - 1}", status="ERROR"))
+        backend = _backend()
+        backend.get_trace.return_value = _trace(spans)
+
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            before, _ = tracemalloc.get_traced_memory()
+            result = await triage_trace(backend, "t1")
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert result.verdict.confidence == "high"
+        assert result.verdict.likely_root_cause is not None
+        assert result.verdict.likely_root_cause.span_id == f"s{depth - 1}"
+        assert result.error_chain is not None
+        assert len(result.error_chain) == depth
+        assert result.error_chain[0].span_id == "s0"
+        assert result.error_chain[-1].span_id == f"s{depth - 1}"
+        assert peak - before < 50 * 1024 * 1024
