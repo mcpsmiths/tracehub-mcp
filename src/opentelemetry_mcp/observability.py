@@ -37,6 +37,12 @@ logger = logging.getLogger(__name__)
 _TRACER_NAME = "opentelemetry_mcp"
 _METER_NAME = "opentelemetry_mcp"
 _MAX_RESULT_ATTRIBUTE_CHARS = 2000
+# The one label a tools/call may carry when its name does not resolve to a
+# registered, enabled tool (see McpServerTracingMiddleware._bounded_tool_label).
+_UNKNOWN_TOOL_LABEL = "unknown"
+# Hard cap on a label before the registry is even consulted - no real tool
+# name approaches this, and it bounds the lookup cost for a hostile peer.
+_MAX_TOOL_NAME_LABEL_CHARS = 128
 
 # Field-name fragments that signal the value next to them is a credential,
 # not application data. Built up from parts rather than one literal list
@@ -243,11 +249,41 @@ class McpServerTracingMiddleware(Middleware):
             description="Count of MCP tools/call requests, labeled by tool name and error status.",
         )
 
+    @staticmethod
+    async def _bounded_tool_label(context: MiddlewareContext[Any]) -> str:
+        """The tools/call name as a metric label / span name, bounded by the
+        server's own tool registry plus one fixed sentinel.
+
+        fastmcp runs the middleware chain *before* it resolves the tool, so
+        a peer-chosen string that matches no registered tool still reaches
+        on_call_tool; echoing it verbatim into gen_ai.tool.name made every
+        distinct unknown name a new, never-evicted aggregation in the
+        opentelemetry-sdk (no cardinality limit) and two new exported
+        series. The same registry lookup fastmcp performs afterwards
+        (FastMCP.get_tool, async, honours disables and session transforms)
+        decides whether the raw name is used; anything else - a non-string,
+        an over-long name, no fastmcp context (unit tests, odd transports),
+        a dead weakref, or any lookup error - collapses to the sentinel.
+        Fail-closed by construction: it does not depend on which exception
+        fastmcp raises for an unknown tool.
+        """
+        raw = getattr(context.message, "name", None)
+        if not isinstance(raw, str) or len(raw) > _MAX_TOOL_NAME_LABEL_CHARS:
+            return _UNKNOWN_TOOL_LABEL
+        fastmcp_context = context.fastmcp_context
+        if fastmcp_context is None:
+            return _UNKNOWN_TOOL_LABEL
+        try:
+            tool = await fastmcp_context.fastmcp.get_tool(raw)
+        except Exception:
+            return _UNKNOWN_TOOL_LABEL
+        return raw if tool is not None else _UNKNOWN_TOOL_LABEL
+
     async def on_call_tool(
         self, context: MiddlewareContext[Any], call_next: CallNext[Any, Any]
     ) -> Any:
         """Wrap a tools/call request in a spec-shaped mcp.server span."""
-        tool_name = getattr(context.message, "name", "unknown")
+        tool_name = await self._bounded_tool_label(context)
         span_name = f"tools/call {tool_name}"
 
         attributes: dict[str, str] = {

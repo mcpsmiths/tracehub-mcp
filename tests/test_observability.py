@@ -30,10 +30,13 @@ false-positive frictions.
 # mypy: disable-error-code="arg-type, attr-defined"
 
 import logging
+from collections.abc import Generator
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastmcp import Client
 from fastmcp.server.middleware import MiddlewareContext
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -41,8 +44,13 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
+from pydantic import HttpUrl
+from starlette.middleware import Middleware
+from starlette.testclient import TestClient
 
-from opentelemetry_mcp import observability
+from opentelemetry_mcp import observability, server
+from opentelemetry_mcp.config import BackendConfig, ServerConfig
+from opentelemetry_mcp.models import SearchTracesResult
 from opentelemetry_mcp.observability import (
     McpServerTracingMiddleware,
     TraceContextLogFilter,
@@ -50,6 +58,8 @@ from opentelemetry_mcp.observability import (
     configure_tracing,
     install_trace_context_log_filter,
 )
+from opentelemetry_mcp.server import OriginValidationMiddleware, RateLimitMiddleware
+from tests.streamable_http_client import call_tool, open_session, sse_json
 
 
 def _tracer_with_exporter() -> tuple[Any, InMemorySpanExporter]:
@@ -87,11 +97,35 @@ def _last_span_attrs(exporter: InMemorySpanExporter) -> dict[str, Any]:
     return dict(span.attributes)
 
 
+class _FakeFastMCPContext:
+    """Minimal stand-in for fastmcp's Context as the middleware sees it: a
+    tool registry that resolves only ``registered`` names (FastMCP.get_tool
+    is async and returns None for anything unknown or disabled) and no
+    session, like the stdio transport (Context.session_id raises)."""
+
+    def __init__(self, registered: frozenset[str] = frozenset({"search_traces"})) -> None:
+        self.fastmcp = SimpleNamespace(
+            get_tool=AsyncMock(side_effect=lambda name: object() if name in registered else None)
+        )
+
+    @property
+    def session_id(self) -> str:
+        raise RuntimeError("no session")
+
+
+_DEFAULT_FASTMCP_CONTEXT = object()
+
+
 def _context(
-    *, tool_name: str = "search_traces", arguments: dict[str, Any] | None = None
+    *,
+    tool_name: Any = "search_traces",
+    arguments: dict[str, Any] | None = None,
+    fastmcp_context: Any = _DEFAULT_FASTMCP_CONTEXT,
 ) -> MiddlewareContext[Any]:
     message = type("Msg", (), {"name": tool_name, "arguments": arguments})()
-    return MiddlewareContext(message=message, method="tools/call", fastmcp_context=None)
+    if fastmcp_context is _DEFAULT_FASTMCP_CONTEXT:
+        fastmcp_context = _FakeFastMCPContext()
+    return MiddlewareContext(message=message, method="tools/call", fastmcp_context=fastmcp_context)
 
 
 class TestConfigureTracing:
@@ -501,9 +535,150 @@ class TestMcpServerTracingMiddlewareSessionId:
         async def call_next(ctx: MiddlewareContext[Any]) -> str:
             return "ok"
 
-        await middleware.on_call_tool(_context(), call_next)
+        await middleware.on_call_tool(_context(fastmcp_context=None), call_next)
 
         assert "mcp.session.id" not in _last_span_attrs(exporter)
+
+
+class TestMcpServerTracingMiddlewareCardinality:
+    """The gen_ai.tool.name label (and the span name) must be bounded by the
+    server's own registry plus one sentinel. fastmcp runs the middleware
+    chain *before* it resolves the tool, so a never-registered name still
+    reaches on_call_tool; the opentelemetry-sdk keeps one aggregation per
+    distinct attribute set for the life of the process with no cardinality
+    limit, so echoing a peer-chosen string grew process memory and the
+    exported series without bound (about 2.85 KB and two series per name)."""
+
+    @pytest.fixture(autouse=True)
+    def _real_server_state(self) -> Generator[None]:
+        """A real minimal config/backend so the registered-tool control can
+        reach the patched search_traces, plus the add_middleware restore
+        pattern from test_double_tracing_regression.py."""
+        original_middleware = list(server.mcp.middleware)
+        server._config = ServerConfig(
+            backend=BackendConfig(type="jaeger", url=HttpUrl("http://localhost:16686"))
+        )
+        server._backend = AsyncMock()
+        server.mcp.auth = None
+        yield
+        server.mcp.middleware = original_middleware
+        server._config = None
+        server._backend = None
+
+    @staticmethod
+    def _install_instrumented_middleware() -> tuple[InMemorySpanExporter, InMemoryMetricReader]:
+        tracer, exporter = _tracer_with_exporter()
+        duration, counter, reader = _instruments_with_reader()
+        server.mcp.add_middleware(
+            McpServerTracingMiddleware(
+                tracer=tracer, tool_call_duration=duration, tool_call_counter=counter
+            )
+        )
+        return exporter, reader
+
+    async def test_fifty_unknown_names_collapse_to_one_sentinel_label(self) -> None:
+        exporter, reader = self._install_instrumented_middleware()
+
+        async with Client(server.mcp) as client:
+            for i in range(50):
+                result = await client.call_tool(f"never_registered_{i}", {}, raise_on_error=False)
+                assert result.is_error
+
+        count_points = _metric_data_points(reader, "mcp.server.tool.call.count")
+        duration_points = _metric_data_points(reader, "mcp.server.tool.call.duration")
+        assert len(count_points) == 1
+        assert count_points[0].attributes == {"gen_ai.tool.name": "unknown", "error": "true"}
+        assert count_points[0].value == 50
+        assert len(duration_points) == 1
+        assert duration_points[0].count == 50
+        span_names = {s.name for s in exporter.get_finished_spans() if "tools/call" in s.name}
+        assert span_names == {"tools/call unknown"}
+
+    async def test_registered_tool_keeps_its_real_name(self) -> None:
+        exporter, reader = self._install_instrumented_middleware()
+        sentinel = SearchTracesResult(count=0, traces=[])
+
+        with patch.object(server.search, "search_traces", AsyncMock(return_value=sentinel)):
+            async with Client(server.mcp) as client:
+                result = await client.call_tool("search_traces", {"limit": 5})
+
+        assert not result.is_error
+        count_points = _metric_data_points(reader, "mcp.server.tool.call.count")
+        assert count_points[0].attributes == {"gen_ai.tool.name": "search_traces", "error": "false"}
+        assert [s.name for s in exporter.get_finished_spans()] == ["tools/call search_traces"]
+
+    @pytest.mark.parametrize(
+        ("tool_name", "fastmcp_context"),
+        [
+            ("x" * 129, _DEFAULT_FASTMCP_CONTEXT),
+            (123, _DEFAULT_FASTMCP_CONTEXT),
+            (None, _DEFAULT_FASTMCP_CONTEXT),
+            ("search_traces", None),
+        ],
+        ids=["over-length", "non-str", "missing-name", "no-fastmcp-context"],
+    )
+    async def test_unresolvable_names_collapse_to_the_sentinel(
+        self, tool_name: Any, fastmcp_context: Any
+    ) -> None:
+        tracer, exporter = _tracer_with_exporter()
+        duration, counter, reader = _instruments_with_reader()
+        middleware = McpServerTracingMiddleware(
+            tracer=tracer, tool_call_duration=duration, tool_call_counter=counter
+        )
+
+        async def call_next(ctx: MiddlewareContext[Any]) -> str:
+            return "ok"
+
+        await middleware.on_call_tool(
+            _context(tool_name=tool_name, fastmcp_context=fastmcp_context), call_next
+        )
+
+        assert exporter.get_finished_spans()[0].name == "tools/call unknown"
+        assert _last_span_attrs(exporter)["gen_ai.tool.name"] == "unknown"
+        count_points = _metric_data_points(reader, "mcp.server.tool.call.count")
+        assert count_points[0].attributes["gen_ai.tool.name"] == "unknown"
+
+    async def test_name_at_the_length_cap_still_resolves(self) -> None:
+        tracer, exporter = _tracer_with_exporter()
+        middleware = McpServerTracingMiddleware(tracer=tracer)
+        long_but_registered = "y" * 128
+
+        async def call_next(ctx: MiddlewareContext[Any]) -> str:
+            return "ok"
+
+        await middleware.on_call_tool(
+            _context(
+                tool_name=long_but_registered,
+                fastmcp_context=_FakeFastMCPContext(frozenset({long_but_registered})),
+            ),
+            call_next,
+        )
+
+        assert _last_span_attrs(exporter)["gen_ai.tool.name"] == long_but_registered
+
+    def test_http_peer_cannot_mint_labels(self) -> None:
+        """The attack surface is the streamable-HTTP listener: a peer that
+        sends no Origin header passes OriginValidationMiddleware and gets
+        an ordinary isError result for every unknown name."""
+        _exporter, reader = self._install_instrumented_middleware()
+        app = server.mcp.http_app(
+            transport="streamable-http",
+            middleware=[
+                Middleware(OriginValidationMiddleware),
+                Middleware(RateLimitMiddleware, max_requests=100, window_seconds=60.0),
+            ],
+        )
+
+        with TestClient(app) as client:
+            session_id = open_session(client)
+            for i in range(5):
+                response = call_tool(client, session_id, f"minted_{i}", request_id=10 + i)
+                assert response.status_code == 200
+                assert sse_json(response)["result"]["isError"] is True
+
+        count_points = _metric_data_points(reader, "mcp.server.tool.call.count")
+        assert [p.attributes["gen_ai.tool.name"] for p in count_points] == ["unknown"]
+        assert count_points[0].value == 5
 
     async def test_session_id_omitted_when_accessing_it_raises(self) -> None:
         """Context.session_id raises RuntimeError if no session is
