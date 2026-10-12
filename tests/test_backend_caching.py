@@ -9,6 +9,8 @@ import asyncio
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
 
 
@@ -84,3 +86,33 @@ def test_health_check_is_excluded_from_query_caching() -> None:
     at a call-count level."""
     assert not hasattr(JaegerBackend.health_check, "__wrapped__")
     assert hasattr(JaegerBackend.list_services, "__wrapped__")
+
+
+async def test_cancelling_a_follower_does_not_fail_the_leader_end_to_end() -> None:
+    """Through a real cache-wrapped backend method (not the cache class in
+    isolation): a client that cancels its own coalesced list_services() call
+    must not fail the leader's identical in-flight request."""
+    backend, mock_get = _mocked_backend({"data": ["svc-a"]})
+    backend.configure_query_cache(60.0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_get(*args: Any, **kwargs: Any) -> AsyncMock:
+        started.set()
+        await release.wait()
+        return _fake_response({"data": ["svc-a"]})
+
+    mock_get.side_effect = gated_get
+
+    leader = asyncio.create_task(backend.list_services())
+    await started.wait()
+    follower = asyncio.create_task(backend.list_services())
+    await asyncio.sleep(0)  # the follower joins the leader's in-flight future
+
+    follower.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await follower
+
+    release.set()
+    assert await asyncio.wait_for(leader, timeout=1.0) == ["svc-a"]
+    assert mock_get.call_count == 1

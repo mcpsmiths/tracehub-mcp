@@ -70,8 +70,22 @@ class TTLCoalescingCache:
         # finishes to store the result and clean up _inflight - awaiting
         # the future while still holding the lock would deadlock the
         # leader against itself.
+        #
+        # Shielded, because Task.cancel() on a follower cancels the Future
+        # that follower is awaiting - and that is the one future every
+        # coalesced caller shares. Unshielded, one follower's cancellation
+        # (an MCP client timing out and sending notifications/cancelled is
+        # routine) left the leader calling set_result()/set_exception() on
+        # an already-cancelled future: InvalidStateError failed the leader's
+        # own request although the backend had answered, and on a failing
+        # compute the raise happened before the in-flight slot was popped,
+        # so the cancelled future stayed registered and every later
+        # identical query from any session raised CancelledError without a
+        # backend call until the process restarted. With the shield the
+        # follower's cancellation reaches only the follower; the shared
+        # future still carries the leader's real outcome to everyone else.
         if not is_leader:
-            return await future
+            return await asyncio.shield(future)
 
         try:
             result = await compute()
@@ -81,27 +95,39 @@ class TTLCoalescingCache:
             # skip this whole block for a cancelled leader (e.g. an MCP
             # request cancelled by the client, or a timeout), leaving
             # `future` forever pending and `key` forever in `_inflight`.
-            # Every follower already coalesced onto it (line 54's `await
-            # future`) - and every future caller, since the poisoned entry
-            # is never popped - would then hang indefinitely on this exact
-            # key. Explicitly catching it here (rather than bare
+            # Every follower already coalesced onto it (the shielded `await
+            # future` above) - and every future caller, since the poisoned
+            # entry is never popped - would then hang indefinitely on this
+            # exact key. Explicitly catching it here (rather than bare
             # `BaseException`, which would also swallow SystemExit/
             # KeyboardInterrupt) ensures followers instead see the same
             # CancelledError propagate into their own await, an honest
             # "this shared computation never completed" outcome.
-            future.set_exception(exc)
-            future.exception()  # mark retrieved: avoids an "exception never
-            # retrieved" asyncio warning when no coalesced caller ever
-            # awaits this future (only the leader raises here directly).
-            async with self._lock:
-                self._inflight.pop(key, None)
+            #
+            # `done()` guard: the leader is the only writer of this future
+            # now that followers are shielded, so this is defence in depth -
+            # completing a future twice raises InvalidStateError, which would
+            # otherwise replace the real error the caller should see.
+            if not future.done():
+                future.set_exception(exc)
+                future.exception()  # mark retrieved: avoids an "exception
+                # never retrieved" asyncio warning when no coalesced caller
+                # ever awaits this future (only the leader raises here).
             raise
         else:
             async with self._lock:
                 self._entries[key] = (now + self._ttl_seconds, result)
-                self._inflight.pop(key, None)
-            future.set_result(result)
+            if not future.done():
+                future.set_result(result)
             return result
+        finally:
+            # Always release the slot - on success, on error AND on
+            # cancellation - so no key can stay unservable. Identity-checked:
+            # clear() may already have dropped this slot and a newer leader
+            # may own the key by now; its slot must not be removed by us.
+            async with self._lock:
+                if self._inflight.get(key) is future:
+                    del self._inflight[key]
 
     async def clear(self) -> None:
         # Every other read/write of _entries/_inflight in this class holds
@@ -109,5 +135,14 @@ class TTLCoalescingCache:
         # concurrent get_or_compute() call and drop an entry that call is
         # mid-write into (e.g. clear() during shutdown racing a request
         # that's still in flight).
+        #
+        # _inflight is dropped too, so close()/clear() shed a stuck or
+        # poisoned computation instead of leaving its key unservable until
+        # the process restarts. Dropping the slot is deliberately all this
+        # does - the dropped futures are NOT cancelled: the old leader still
+        # completes its own future (so its shielded followers receive the
+        # real outcome), and the next caller for the key simply becomes a
+        # fresh leader.
         async with self._lock:
             self._entries.clear()
+            self._inflight.clear()

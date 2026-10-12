@@ -191,3 +191,116 @@ async def test_different_keys_are_independent() -> None:
     assert result_a == "a-result"
     assert result_b == "b-result"
     assert calls == ["a", "b"]
+
+
+async def test_cancelling_a_follower_does_not_fail_the_leader_on_success() -> None:
+    # Task.cancel() on a follower cancels the Future the follower is awaiting.
+    # Without asyncio.shield that is the SHARED in-flight future, so the
+    # leader's later set_result() raised InvalidStateError and its own
+    # request failed although the backend had answered.
+    cache = TTLCoalescingCache(ttl_seconds=60.0)
+    call_count = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def compute() -> str:
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        await release.wait()
+        return "data"
+
+    leader = asyncio.create_task(cache.get_or_compute("key", compute))
+    await started.wait()
+    cancelled_follower = asyncio.create_task(cache.get_or_compute("key", compute))
+    follower = asyncio.create_task(cache.get_or_compute("key", compute))
+    await asyncio.sleep(0)  # both followers join the leader's in-flight future
+
+    cancelled_follower.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_follower
+
+    release.set()
+    assert await asyncio.wait_for(leader, timeout=1.0) == "data"
+    assert await asyncio.wait_for(follower, timeout=1.0) == "data"
+    assert call_count == 1
+    assert "key" not in cache._inflight
+    assert "key" in cache._entries
+
+
+async def test_cancelling_a_follower_does_not_poison_a_failing_key() -> None:
+    # On a failing compute the unguarded set_exception() raised
+    # InvalidStateError BEFORE the _inflight.pop, so the cancelled future
+    # stayed registered and every later identical call joined it and raised
+    # CancelledError without touching the backend - until process restart.
+    cache = TTLCoalescingCache(ttl_seconds=60.0)
+    call_count = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def failing_compute() -> str:
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        await release.wait()
+        raise ValueError("boom")
+
+    leader = asyncio.create_task(cache.get_or_compute("key", failing_compute))
+    await started.wait()
+    follower = asyncio.create_task(cache.get_or_compute("key", failing_compute))
+    await asyncio.sleep(0)
+
+    follower.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await follower
+
+    release.set()
+    with pytest.raises(ValueError, match="boom"):
+        await asyncio.wait_for(leader, timeout=1.0)
+
+    assert "key" not in cache._inflight
+
+    async def succeeding_compute() -> str:
+        nonlocal call_count
+        call_count += 1
+        return "ok"
+
+    result = await asyncio.wait_for(cache.get_or_compute("key", succeeding_compute), timeout=1.0)
+    assert result == "ok"
+    assert call_count == 2
+
+
+async def test_clear_sheds_a_stuck_inflight_computation() -> None:
+    # clear() (reached via BaseBackend.close()) used to empty only _entries,
+    # so a stuck or poisoned in-flight slot survived it. Dropping the slot is
+    # enough: the next caller becomes a fresh leader, and the old leader still
+    # completes its own (shielded) future for anyone already coalesced on it.
+    cache = TTLCoalescingCache(ttl_seconds=60.0)
+    call_count = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_compute() -> str:
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        await release.wait()
+        return "late"
+
+    old_leader = asyncio.create_task(cache.get_or_compute("key", blocking_compute))
+    await started.wait()
+
+    await cache.clear()
+    assert "key" not in cache._inflight
+
+    async def fresh_compute() -> str:
+        nonlocal call_count
+        call_count += 1
+        return "fresh"
+
+    result = await asyncio.wait_for(cache.get_or_compute("key", fresh_compute), timeout=1.0)
+    assert result == "fresh"
+    assert call_count == 2
+
+    release.set()
+    assert await asyncio.wait_for(old_leader, timeout=1.0) == "late"
