@@ -168,6 +168,8 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `OTEL_EXPORTER_OTLP_ENDPOINT` - Optional: Enables opt-in OTel self-instrumentation of tool calls when set (unset by default - no TracerProvider is configured and no middleware is registered, so there is zero overhead if you don't opt in)
 - `OTEL_SERVICE_NAME` - Optional: Service name reported in self-instrumentation spans (default: `tracehub-mcp`)
 - `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` - Optional: Env-var equivalents of `--rate-limit-max-requests`/`--rate-limit-window-seconds` (HTTP transport only, defaults: `100`/`60.0`)
+- `SESSION_IDLE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--session-idle-timeout-seconds` (HTTP transport only, must be > 0, default: `1800.0` = the mcp SDK default). fastmcp's own default is `None`/never, so `server._build_http_app` always passes a finite bound; an idle session's id answers `404` and clients re-initialize. `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT` is a no-code stopgap for already-deployed containers
+- `MCP_STATELESS_HTTP` - Optional: Env-var equivalent of `--stateless-http` (HTTP transport only, default: `false`). Stateless mode keeps no per-peer session state at all but drops the GET SSE stream for server-initiated notifications
 - `SHUTDOWN_DRAIN_SECONDS` - Optional: Env-var equivalent of `--shutdown-drain-seconds` (HTTP transport only, default: `0.0`/disabled)
 - `BACKEND_CLOSE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--backend-close-timeout-seconds` (HTTP transport only, default: `5.0`)
 - `GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--graceful-shutdown-timeout-seconds` (HTTP transport only, default: `2`)
@@ -182,6 +184,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `--include-args-in-spans` - Overrides `MCP_INCLUDE_ARGS_IN_SPANS`
 - `--http-bearer-token <token>` / `--allow-unauthenticated-http` - HTTP transport only. Override `MCP_HTTP_BEARER_TOKEN` / `MCP_ALLOW_UNAUTHENTICATED_HTTP`; prefer the env var for the token since argv is visible via `ps`
 - `--rate-limit-max-requests <int>` / `--rate-limit-window-seconds <float>` - HTTP transport only. Per-client-IP fixed-window rate limit (defaults: 100 requests / 60s window). Set `--rate-limit-max-requests 0` to disable.
+- `--session-idle-timeout-seconds <float>` / `--stateless-http` - HTTP transport only. Override `SESSION_IDLE_TIMEOUT_SECONDS` / `MCP_STATELESS_HTTP` (see above).
 - `--shutdown-drain-seconds <float>` - HTTP transport only. On shutdown, wait this many seconds inside the ASGI shutdown handler (after uvicorn has already finished draining in-flight connections) before closing the shared backend HTTP client (default: `0.0`/disabled).
 - `--backend-close-timeout-seconds <float>` - HTTP transport only. Abandon closing the shared backend HTTP client during shutdown if it does not finish within this many seconds - uvicorn places no timeout of its own around this wait (default: `5.0`).
 - `--graceful-shutdown-timeout-seconds <int>` - HTTP transport only. uvicorn's own bound on waiting for in-flight connections/tasks to finish on shutdown before cancelling them - passed straight through as `uvicorn.Config(timeout_graceful_shutdown=)`, which only accepts whole seconds (default: `2`).

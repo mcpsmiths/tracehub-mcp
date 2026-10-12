@@ -1114,6 +1114,11 @@ class TestMainCli:
         mock_mcp.http_app.assert_called_once()
         http_app_kwargs = mock_mcp.http_app.call_args.kwargs
         assert http_app_kwargs["transport"] == "streamable-http"
+        # fastmcp's own default for session_idle_timeout is None ("never
+        # expire"), overriding the mcp SDK's 1800 s - main() must always
+        # pass a finite bound in stateful mode (see _build_http_app).
+        assert http_app_kwargs["session_idle_timeout"] == 1800.0
+        assert http_app_kwargs["stateless_http"] is False
         # HTTP transport must wire in the Origin-validation middleware
         # (Tier 1 security fix: fastmcp disables DNS-rebinding protection
         # by default, see OriginValidationMiddleware's docstring), and the
@@ -1129,6 +1134,58 @@ class TestMainCli:
         assert config_arg.host == "127.0.0.1"
         assert config_arg.port == 9001
         mock_server_cls.return_value.serve.assert_awaited_once()
+
+    def test_session_idle_timeout_flag_is_forwarded(self) -> None:
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(
+                server.main,
+                ["--transport", "http", "--session-idle-timeout-seconds", "0.5"],
+            )
+
+        assert result.exit_code == 0, result.output
+        http_app_kwargs = mock_mcp.http_app.call_args.kwargs
+        assert http_app_kwargs["session_idle_timeout"] == 0.5
+        assert http_app_kwargs["stateless_http"] is False
+
+    def test_stateless_http_flag_drops_the_idle_timeout(self) -> None:
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(server.main, ["--transport", "http", "--stateless-http"])
+
+        assert result.exit_code == 0, result.output
+        http_app_kwargs = mock_mcp.http_app.call_args.kwargs
+        assert http_app_kwargs["stateless_http"] is True
+        assert http_app_kwargs["session_idle_timeout"] is None
+
+    @pytest.mark.parametrize("value", ["0", "-1"])
+    def test_non_positive_session_idle_timeout_is_a_usage_error(self, value: str) -> None:
+        """The SDK raises ValueError for a non-positive idle timeout at
+        lifespan start - far too late and far too cryptic. click.FloatRange
+        (min=0, min_open=True) rejects it up front with exit code 2."""
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(
+                server.main,
+                ["--transport", "http", "--session-idle-timeout-seconds", value],
+            )
+
+        assert result.exit_code == 2, result.output
+        assert "--session-idle-timeout-seconds" in result.output
+        assert "not in the range" in result.output
+        mock_mcp.http_app.assert_not_called()
 
     def test_rate_limit_disabled_when_max_requests_is_zero(self) -> None:
         runner = CliRunner()
@@ -1319,6 +1376,8 @@ class TestPrintConfigFlag:
         assert resolved["enabled_tools"] == "search_traces,get_trace"
         assert resolved["http_bearer_token_set"] is False
         assert resolved["allow_unauthenticated_http"] is False
+        assert resolved["session_idle_timeout_seconds"] == 1800.0
+        assert resolved["stateless_http"] is False
 
 
 class TestDoctorCli:

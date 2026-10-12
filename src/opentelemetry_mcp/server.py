@@ -1469,6 +1469,38 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+# Parity with the mcp SDK's own DEFAULT_SESSION_IDLE_TIMEOUT (30 min), which
+# every other mcp-based streamable-HTTP server already applies; fastmcp 4.0.5
+# is the odd one out in overriding it to "never" (see _build_http_app).
+_DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS = 1800.0
+
+
+def _build_http_app(
+    middleware: list[Middleware], *, session_idle_timeout_seconds: float, stateless_http: bool
+) -> StarletteWithLifespan:
+    """The one place main() turns `mcp` into the streamable-HTTP Starlette app.
+
+    fastmcp 4.0.5's http_app() resolves an unset session_idle_timeout from
+    its own ``settings.http_session_idle_timeout``, whose default is None -
+    "sessions never expire from inactivity" - and forwards that None into
+    the mcp SDK's StreamableHTTPSessionManager, overriding the SDK's own
+    1800 s default. With the SDK's 10,000-session cap left in place, one
+    peer could then fill the shared session table with bare initialize
+    POSTs and make every new client's initialize answer 503 until restart.
+    Always passing a finite bound here restores the SDK behaviour; an idle
+    session's id answers 404 and spec-compliant clients re-initialize.
+
+    In stateless mode no per-peer state exists, so the timeout is passed as
+    None (the SDK ignores it there anyway).
+    """
+    return mcp.http_app(
+        transport="streamable-http",
+        middleware=middleware,
+        stateless_http=stateless_http,
+        session_idle_timeout=None if stateless_http else session_idle_timeout_seconds,
+    )
+
+
 _BACKEND_CLOSE_TIMEOUT_SECONDS = 5.0
 
 
@@ -1786,6 +1818,28 @@ def _backend_config_options(f: Any) -> Any:
     "RATE_LIMIT_WINDOW_SECONDS env var)",
 )
 @click.option(
+    "--session-idle-timeout-seconds",
+    # min_open exists on click 8.x's FloatRange (verified at runtime); the
+    # pinned types-click 7.1.8 stubs predate it, hence the targeted ignore.
+    type=click.FloatRange(min=0, min_open=True),  # type: ignore[call-arg]
+    default=_DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS,
+    envvar="SESSION_IDLE_TIMEOUT_SECONDS",
+    help="Close a streamable-HTTP session that has had no request for this "
+    "many seconds; its id then answers 404 and the client re-initializes "
+    "(only for --transport http, must be > 0, default: "
+    f"{_DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS:g} - the mcp SDK's own default, "
+    "overrides SESSION_IDLE_TIMEOUT_SECONDS env var)",
+)
+@click.option(
+    "--stateless-http/--no-stateless-http",
+    default=False,
+    envvar="MCP_STATELESS_HTTP",
+    help="Serve each /mcp request on a fresh transport with no session "
+    "tracking at all, so no per-peer state outlives a request - at the cost "
+    "of the GET SSE stream used for server-initiated notifications (only for "
+    "--transport http, default: stateful, overrides MCP_STATELESS_HTTP env var)",
+)
+@click.option(
     "--query-cache-ttl-seconds",
     type=float,
     default=None,
@@ -1854,6 +1908,8 @@ def main(
     slow_request_threshold_ms: float | None,
     rate_limit_max_requests: int,
     rate_limit_window_seconds: float,
+    session_idle_timeout_seconds: float,
+    stateless_http: bool,
     query_cache_ttl_seconds: float | None,
     shutdown_drain_seconds: float,
     backend_close_timeout_seconds: float,
@@ -1977,6 +2033,8 @@ def main(
                 "enabled_tools": enabled_tools,
                 "rate_limit_max_requests": rate_limit_max_requests,
                 "rate_limit_window_seconds": rate_limit_window_seconds,
+                "session_idle_timeout_seconds": session_idle_timeout_seconds,
+                "stateless_http": stateless_http,
                 "shutdown_drain_seconds": shutdown_drain_seconds,
                 "backend_close_timeout_seconds": backend_close_timeout_seconds,
                 "graceful_shutdown_timeout_seconds": graceful_shutdown_timeout_seconds,
@@ -2030,7 +2088,11 @@ def main(
                         window_seconds=rate_limit_window_seconds,
                     )
                 )
-            app = mcp.http_app(transport="streamable-http", middleware=middleware)
+            app = _build_http_app(
+                middleware,
+                session_idle_timeout_seconds=session_idle_timeout_seconds,
+                stateless_http=stateless_http,
+            )
             _install_shutdown_drain(
                 app,
                 drain_seconds=shutdown_drain_seconds,
