@@ -104,7 +104,19 @@ jobs:
         # push with a per-step extraheader: the PAT is never written to
         # .git/config or into a remote URL. Pushes HEAD and exactly the tag cz
         # just created (never --tags). When nothing was bumped, HEAD and the
-        # tag already exist upstream and this is a no-op.
+        # tag v<current> already exist upstream and this is a no-op.
+        #
+        # Two cases fail closed by design rather than being papered over:
+        # - a no-increment run whose current version has no tag locally or
+        #   upstream (deleted, or never tagged): `git push` exits with
+        #   "src refspec refs/tags/v<current> does not match any" instead of
+        #   quietly pushing nothing; restore the tag (or land a bump-worthy
+        #   commit) and re-run;
+        # - a merge landing on main between this job's checkout and the push:
+        #   HEAD:main is then non-fast-forward and is rejected; re-run the
+        #   dispatch. There is deliberately no fetch/rebase here - rebasing
+        #   the bump commit onto a moved main would publish a tree nobody
+        #   reviewed as the release.
         env:
           RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
           NEW_VERSION: ${{ steps.cz.outputs.version }}
