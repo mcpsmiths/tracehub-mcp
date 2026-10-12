@@ -242,6 +242,46 @@ class TestSearchSpansFilterValidation:
         backend.search_spans.assert_not_awaited()
 
 
+class TestSearchSpansCardinalityCaps:
+    """Mirror of TestSearchTracesCardinalityCaps for the span path: the caps
+    (100 IN values per filter, 50 filters, 50 tags) sit on SpanQuery/Filter,
+    so an oversized request never reaches the backend.
+
+    Audit: src/opentelemetry_mcp/models.py:Filter.values:unbounded-filter-cardinality-backend-query-clause-fanout
+    """
+
+    async def test_filter_with_101_in_values_raises_before_backend_call(self) -> None:
+        backend = _fake_backend()
+        too_many_values = {
+            "field": "gen_ai.request.model",
+            "operator": "in",
+            "values": [f"model-{i}" for i in range(101)],
+            "value_type": "string",
+        }
+
+        with pytest.raises(ValidationError):
+            await search_spans(backend, filters=[too_many_values])
+        backend.search_spans.assert_not_awaited()
+
+    async def test_51_filters_raise_before_backend_call(self) -> None:
+        backend = _fake_backend()
+        filters = [
+            {"field": f"attr.{i}", "operator": "equals", "value": "x", "value_type": "string"}
+            for i in range(51)
+        ]
+
+        with pytest.raises(ValidationError):
+            await search_spans(backend, filters=filters)
+        backend.search_spans.assert_not_awaited()
+
+    async def test_51_tags_raise_before_backend_call(self) -> None:
+        backend = _fake_backend()
+
+        with pytest.raises(ValidationError):
+            await search_spans(backend, tags={f"k{i}": "v" for i in range(51)})
+        backend.search_spans.assert_not_awaited()
+
+
 class TestSearchSpansQueryValidation:
     """Invalid query-level parameters (caught by SpanQuery's own field
     constraints) must also raise, not become error JSON."""

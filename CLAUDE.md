@@ -528,6 +528,15 @@ Each filter is an object with:
 - **values**: List of values for `in`, `not_in`, `between` operators
 - **value_type**: Type of value(s) - `"string"`, `"number"`, or `"boolean"`
 
+### Limits and Validation
+
+Enforced on the `Filter`/`TraceQuery`/`SpanQuery` models in `models.py` (constants `MAX_FILTER_VALUES`, `MAX_FILTERS_PER_QUERY`, `MAX_TAGS_PER_QUERY`, `MAX_FILTER_FIELD_CHARS`), so both search tools and every backend builder inherit them:
+
+- At most **50 `filters`** and **50 `tags`** per query; at most **100 `values`** per `in`/`not_in` filter; `field` is 1-256 characters
+- Operands are normalised to the declared `value_type` before validation: `"number"` accepts int/float or a finite numeric string (`"5000"` -> `5000`) and rejects anything else (including booleans); `"boolean"` accepts a bool or the strings `"true"`/`"false"`; `"string"` stringifies int/float/bool scalars
+- Unknown keys on a filter object are rejected (`extra="forbid"`)
+- Any violation is a `ValidationError` raised before the backend is called, so the tool returns `isError`
+
 ### Supported Operators
 
 **String Operators:**

@@ -46,6 +46,20 @@ class FilterType(StrEnum):
     BOOLEAN = "boolean"
 
 
+# Cardinality caps on the generic filter system. Every backend builder renders
+# one query clause per IN/NOT_IN value, per explicit filter and per tag, and
+# Jaeger JSON-encodes every tag into one URL parameter, so without a bound a
+# single search_traces/search_spans call could emit an arbitrarily wide
+# backend query under the operator's credential (and feed an arbitrarily
+# large list into the client-side FilterEngine). The caps are enforced here,
+# on the query models both tools pass through, and documented in README
+# "Generic Filter System"; no documented query shape comes near them.
+MAX_FILTER_VALUES = 100
+MAX_FILTERS_PER_QUERY = 50
+MAX_TAGS_PER_QUERY = 50
+MAX_FILTER_FIELD_CHARS = 256
+
+
 def _parse_number_operand(text: str) -> int | float:
     """Parse a string-encoded NUMBER operand ("5000", "1.5", "1e3") into a
     genuine, finite int/float; anything else is rejected."""
@@ -121,14 +135,19 @@ class Filter(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     field: str = Field(
-        ..., min_length=1, description="Field name in dotted notation (e.g., 'gen_ai.system')"
+        ...,
+        min_length=1,
+        max_length=MAX_FILTER_FIELD_CHARS,
+        description="Field name in dotted notation (e.g., 'gen_ai.system')",
     )
     operator: FilterOperator = Field(..., description="Comparison operator")
     value: str | int | float | bool | None = Field(
         default=None, description="Single value for most operators"
     )
     values: Sequence[str | int | float | bool] | None = Field(
-        default=None, description="Multiple values for 'in', 'not_in', 'between' operators"
+        default=None,
+        max_length=MAX_FILTER_VALUES,
+        description="Multiple values for 'in', 'not_in', 'between' operators",
     )
     value_type: FilterType = Field(..., description="Type of the value(s)")
 
@@ -612,7 +631,7 @@ class TraceQuery(BaseModel):
     end_time: datetime | None = None
     min_duration_ms: int | None = Field(default=None, ge=0)
     max_duration_ms: int | None = Field(default=None, ge=0)
-    tags: dict[str, str] = Field(default_factory=dict)
+    tags: dict[str, str] = Field(default_factory=dict, max_length=MAX_TAGS_PER_QUERY)
     limit: int = Field(default=100, ge=1, le=1000)
     has_error: bool | None = None
 
@@ -622,7 +641,11 @@ class TraceQuery(BaseModel):
     gen_ai_response_model: str | None = None  # Filter by actual model used
 
     # New generic filter system
-    filters: list[Filter] = Field(default_factory=list, description="Generic filter conditions")
+    filters: list[Filter] = Field(
+        default_factory=list,
+        max_length=MAX_FILTERS_PER_QUERY,
+        description="Generic filter conditions",
+    )
     logical_operator: Literal["AND"] = Field(
         default="AND", description="Logical operator for combining filters (currently only AND)"
     )
@@ -767,7 +790,7 @@ class SpanQuery(BaseModel):
     end_time: datetime | None = None
     min_duration_ms: int | None = Field(default=None, ge=0)
     max_duration_ms: int | None = Field(default=None, ge=0)
-    tags: dict[str, str] = Field(default_factory=dict)
+    tags: dict[str, str] = Field(default_factory=dict, max_length=MAX_TAGS_PER_QUERY)
     limit: int = Field(default=100, ge=1, le=1000)
     has_error: bool | None = None
 
@@ -777,7 +800,11 @@ class SpanQuery(BaseModel):
     gen_ai_response_model: str | None = None
 
     # Generic filter system
-    filters: list[Filter] = Field(default_factory=list, description="Generic filter conditions")
+    filters: list[Filter] = Field(
+        default_factory=list,
+        max_length=MAX_FILTERS_PER_QUERY,
+        description="Generic filter conditions",
+    )
     logical_operator: Literal["AND"] = Field(
         default="AND", description="Logical operator for combining filters (currently only AND)"
     )

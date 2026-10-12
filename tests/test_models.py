@@ -12,6 +12,7 @@ from opentelemetry_mcp.models import (
     FilterType,
     LLMSpanAttributes,
     SpanData,
+    SpanQuery,
     TraceData,
     TraceQuery,
     UsageMetrics,
@@ -340,3 +341,76 @@ class TestFilterOperandNormalization:
     def test_exists_operator_still_accepts_no_operand(self) -> None:
         f = Filter(field="x", operator=FilterOperator.EXISTS, value_type=FilterType.NUMBER)
         assert f.value is None and f.values is None
+
+
+# -- Filter / query cardinality caps -----------------------------------------
+# Audit: src/opentelemetry_mcp/models.py:Filter.values:unbounded-filter-cardinality-backend-query-clause-fanout
+#
+# The limits below are the documented contract (README "Generic Filter
+# System"), pinned here as literals on purpose so a silent change to the
+# constants cannot drift away from the docs unnoticed.
+
+
+def _string_filter(index: int) -> Filter:
+    return Filter(
+        field=f"attr.{index}",
+        operator=FilterOperator.EQUALS,
+        value="x",
+        value_type=FilterType.STRING,
+    )
+
+
+class TestFilterCardinalityCaps:
+    def test_in_values_accepts_100_and_rejects_101(self) -> None:
+        ok = Filter(
+            field="x",
+            operator=FilterOperator.IN,
+            values=[f"v{i}" for i in range(100)],
+            value_type=FilterType.STRING,
+        )
+        assert len(ok.values or []) == 100
+
+        with pytest.raises(ValidationError, match="too_long|at most 100"):
+            Filter(
+                field="x",
+                operator=FilterOperator.IN,
+                values=[f"v{i}" for i in range(101)],
+                value_type=FilterType.STRING,
+            )
+
+    def test_field_name_accepts_256_chars_and_rejects_257(self) -> None:
+        assert (
+            len(
+                Filter(
+                    field="x" * 256,
+                    operator=FilterOperator.EQUALS,
+                    value="a",
+                    value_type=FilterType.STRING,
+                ).field
+            )
+            == 256
+        )
+        with pytest.raises(ValidationError, match="too_long|at most 256"):
+            Filter(
+                field="x" * 257,
+                operator=FilterOperator.EQUALS,
+                value="a",
+                value_type=FilterType.STRING,
+            )
+
+    @pytest.mark.parametrize("query_cls", [TraceQuery, SpanQuery])
+    def test_filters_accept_50_and_reject_51(self, query_cls: type[TraceQuery | SpanQuery]) -> None:
+        assert len(query_cls(filters=[_string_filter(i) for i in range(50)]).filters) == 50
+        with pytest.raises(ValidationError, match="too_long|at most 50"):
+            query_cls(filters=[_string_filter(i) for i in range(51)])
+
+    @pytest.mark.parametrize("query_cls", [TraceQuery, SpanQuery])
+    def test_tags_accept_50_and_reject_51(self, query_cls: type[TraceQuery | SpanQuery]) -> None:
+        query = query_cls(tags={f"k{i}": "v" for i in range(50)})
+        assert len(query.tags) == 50
+        converted = query.get_all_filters()
+        assert len(converted) == 50
+        assert all(f.operator == FilterOperator.EQUALS for f in converted)
+
+        with pytest.raises(ValidationError, match="too_long|at most 50"):
+            query_cls(tags={f"k{i}": "v" for i in range(51)})

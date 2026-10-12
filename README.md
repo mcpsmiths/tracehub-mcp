@@ -735,10 +735,12 @@ Returns error messages, error types, truncated stack traces, and LLM-specific er
 }
 ```
 
-- **`field`** — dotted attribute name, e.g. `gen_ai.usage.prompt_tokens`, `traceloop.span.kind`, `service.name`
+- **`field`** — dotted attribute name, e.g. `gen_ai.usage.prompt_tokens`, `traceloop.span.kind`, `service.name` (1–256 characters)
 - **`operator`** — see table below
-- **`value`** — single value (most operators) or **`values`** — list (for `in`, `not_in`, `between`)
+- **`value`** — single value (most operators) or **`values`** — list (for `in`, `not_in`, `between`; at most 100 values)
 - **`value_type`** — `"string"`, `"number"`, or `"boolean"`
+
+**Limits and validation.** One call accepts at most **50 `filters`** and **50 `tags`**, each `in`/`not_in` filter at most **100 `values`**, and a `field` name is 1–256 characters, so a single query can only ever produce a bounded number of backend clauses. Operands are normalised to their declared `value_type` before anything is sent: a numeric string such as `"5000"` under `"number"` is accepted and coerced, a non-numeric one (`"abc"`) is rejected; `"boolean"` accepts a JSON boolean or the strings `"true"`/`"false"`; `"string"` accepts a number or boolean and stringifies it. A filter object with an unknown key is rejected rather than silently ignored. Exceeding a limit or failing validation returns a tool error before any backend request is made.
 
 | Category    | Operators                                                            |
 | ----------- | --------------------------------------------------------------------- |
