@@ -1136,7 +1136,44 @@ class TestMainCli:
         assert config_arg.app is mock_mcp.http_app.return_value
         assert config_arg.host == "127.0.0.1"
         assert config_arg.port == 9001
+        # uvicorn's own default trusts X-Forwarded-For from 127.0.0.1; the
+        # limiter keys on request.client.host, so that trust is opt-in only.
+        assert config_arg.proxy_headers is False
         mock_server_cls.return_value.serve.assert_awaited_once()
+
+    def test_forwarded_allow_ips_flag_enables_proxy_headers(self) -> None:
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp"),
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(
+                server.main, ["--transport", "http", "--forwarded-allow-ips", "10.0.0.1"]
+            )
+
+        assert result.exit_code == 0, result.output
+        config_arg = mock_server_cls.call_args.args[0]
+        assert config_arg.proxy_headers is True
+        assert config_arg.forwarded_allow_ips == "10.0.0.1"
+
+    def test_forwarded_allow_ips_env_var_keeps_uvicorns_name(self) -> None:
+        """Operators who already set uvicorn's FORWARDED_ALLOW_IPS see
+        identical behaviour - the option deliberately reuses that name."""
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp"),
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(
+                server.main, ["--transport", "http"], env={"FORWARDED_ALLOW_IPS": "127.0.0.1"}
+            )
+
+        assert result.exit_code == 0, result.output
+        config_arg = mock_server_cls.call_args.args[0]
+        assert config_arg.proxy_headers is True
+        assert config_arg.forwarded_allow_ips == "127.0.0.1"
 
     def test_allowed_hosts_flag_is_parsed_into_the_origin_middleware(self) -> None:
         runner = CliRunner()
@@ -1401,6 +1438,7 @@ class TestPrintConfigFlag:
         assert resolved["session_idle_timeout_seconds"] == 1800.0
         assert resolved["stateless_http"] is False
         assert resolved["allowed_hosts"] is None
+        assert resolved["forwarded_allow_ips"] is None
 
 
 class TestDoctorCli:

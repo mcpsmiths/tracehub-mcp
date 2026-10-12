@@ -1494,13 +1494,16 @@ class _FixedWindowRateLimiter:
 
         Known, accepted limitation (see RateLimitMiddleware's own
         docstring for the full rationale): this sweep - like the limiter
-        as a whole - is keyed on request.client.host only. A source
-        rotating its IP on every request always starts a brand-new,
-        never-before-seen bucket at count 0, so the per-IP cap never
-        engages against that source's aggregate volume. That is a
-        structural limitation of pure per-IP fixed-window limiting, not
-        something this sweep (or a bigger one) can fix - it would need
-        additional infra (e.g. a WAF) to address.
+        as a whole - is keyed on request.client.host, i.e. the TCP peer
+        address (or, only for connections from a proxy listed in
+        --forwarded-allow-ips, the right-most untrusted X-Forwarded-For
+        entry uvicorn substitutes for it). A source rotating its address
+        on every request always starts a brand-new, never-before-seen
+        bucket at count 0, so the per-peer cap never engages against that
+        source's aggregate volume. That is a structural limitation of pure
+        per-peer fixed-window limiting, not something this sweep (or a
+        bigger one) can fix - it would need additional infra (e.g. a WAF)
+        to address.
         """
         if now - self._last_swept < self._window_seconds:
             return
@@ -1528,21 +1531,27 @@ class _FixedWindowRateLimiter:
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Per-client-IP fixed-window rate limiter for the streamable-http
+    """Per-peer fixed-window rate limiter for the streamable-http
     transport. Bare 429 on breach.
 
-    Known v1 limitation: keys on request.client.host only, with no
-    X-Forwarded-For parsing - this codebase has no trusted-proxy allowlist
-    anywhere to validate that header against, and trusting a client-
-    supplied header without one would make the limiter trivially
-    bypassable. A direct consequence: a source rotating its IP on every
-    request is never capped, since each never-before-seen IP always
-    starts its own bucket at count 0 - the per-IP cap only ever bounds a
-    single, stable IP's own volume, never a rotating source's aggregate
-    volume. This is a known, accepted structural limitation of pure
-    per-IP fixed-window limiting, not something fixable at this layer -
-    mitigating it would need additional infra (e.g. a WAF) in front of
-    this server.
+    The key is request.client.host - the TCP peer address as the served
+    process sees it. This middleware parses no X-Forwarded-For itself, but
+    uvicorn's ProxyHeadersMiddleware (defaulted ON by uvicorn, trusting
+    127.0.0.1 or FORWARDED_ALLOW_IPS implicitly) rewrites scope["client"]
+    from that header for connections it trusts *before* this code runs,
+    which would let any loopback peer - a pass-through proxy, an ssh -L /
+    socat tunnel, another local user - pick its own key. main() therefore
+    builds the uvicorn.Config with proxy_headers disabled unless the
+    operator names the proxies via --forwarded-allow-ips /
+    FORWARDED_ALLOW_IPS (see _build_uvicorn_config); only then, and only
+    for connections from those addresses, does the right-most untrusted
+    X-Forwarded-For entry replace the TCP peer as the key.
+
+    Known structural limitation: a source rotating its address on every
+    request is never capped, since each never-before-seen address starts
+    its own bucket at count 0 - the per-peer cap bounds a single, stable
+    peer's own volume, never a rotating source's aggregate. Mitigating
+    that would need additional infra (e.g. a WAF) in front of this server.
     """
 
     def __init__(
@@ -1592,6 +1601,43 @@ def _build_http_app(
         middleware=middleware,
         stateless_http=stateless_http,
         session_idle_timeout=None if stateless_http else session_idle_timeout_seconds,
+    )
+
+
+def _build_uvicorn_config(
+    app: Any,
+    *,
+    host: str,
+    port: int,
+    graceful_shutdown_timeout_seconds: int,
+    forwarded_allow_ips: str | None,
+) -> uvicorn.Config:
+    """The uvicorn.Config main() serves the HTTP app with.
+
+    uvicorn 0.40.0 defaults ``proxy_headers=True`` and, when
+    ``forwarded_allow_ips`` is None, resolves the trusted set from the
+    FORWARDED_ALLOW_IPS environment variable or "127.0.0.1" - so by default
+    any loopback peer's X-Forwarded-For rewrote request.client.host, the
+    RateLimitMiddleware key. Passing ``proxy_headers=forwarded_allow_ips is
+    not None`` means uvicorn's implicit fallback is never consulted: the
+    header is honoured only for connections from the proxies the operator
+    named (the CLI option deliberately reuses uvicorn's FORWARDED_ALLOW_IPS
+    env var name, so operators who already set it see identical behaviour).
+    """
+    return uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        lifespan="on",
+        # Preserves run_http_async's own default (lost by bypassing it) for
+        # the connection/task-draining wait uvicorn does BEFORE dispatching
+        # lifespan.shutdown - unrelated to the drain feature itself, which
+        # fires after this. Exposed as --graceful-shutdown-timeout-seconds
+        # so a real signal-timing test can widen it deterministically
+        # instead of relying on this project's own default margin.
+        timeout_graceful_shutdown=graceful_shutdown_timeout_seconds,
+        proxy_headers=forwarded_allow_ips is not None,
+        forwarded_allow_ips=forwarded_allow_ips,
     )
 
 
@@ -1862,6 +1908,17 @@ def _backend_config_options(f: Any) -> Any:
     "MCP_ALLOWED_HOSTS env var)",
 )
 @click.option(
+    "--forwarded-allow-ips",
+    type=str,
+    default=None,
+    envvar="FORWARDED_ALLOW_IPS",
+    help="Comma-separated proxy IPs/CIDRs (or '*') whose X-Forwarded-For may "
+    "replace the TCP peer address as the rate-limit key. Unset (default): the "
+    "header is never trusted, not even from 127.0.0.1 - uvicorn's own implicit "
+    "default is deliberately not applied. Same env var uvicorn honours (only "
+    "for --transport http, overrides FORWARDED_ALLOW_IPS env var)",
+)
+@click.option(
     "--include-args-in-spans",
     is_flag=True,
     default=False,
@@ -2007,6 +2064,7 @@ def main(
     http_bearer_token: str | None,
     allow_unauthenticated_http: bool,
     allowed_hosts: str | None,
+    forwarded_allow_ips: str | None,
     include_args_in_spans: bool,
     log_level: str | None,
     max_traces_per_query: int | None,
@@ -2136,6 +2194,7 @@ def main(
                 "http_bearer_token_set": http_bearer_token is not None,
                 "allow_unauthenticated_http": allow_unauthenticated_http,
                 "allowed_hosts": allowed_hosts,
+                "forwarded_allow_ips": forwarded_allow_ips,
                 "include_args_in_spans": include_args_in_spans,
                 "disable_tools": disable_tools,
                 "enabled_tools": enabled_tools,
@@ -2212,19 +2271,12 @@ def main(
                 drain_seconds=shutdown_drain_seconds,
                 close_timeout_seconds=backend_close_timeout_seconds,
             )
-            uvicorn_config = uvicorn.Config(
+            uvicorn_config = _build_uvicorn_config(
                 app,
                 host=host,
                 port=port,
-                lifespan="on",
-                # Preserves run_http_async's own default (lost by bypassing
-                # it) for the connection/task-draining wait uvicorn does
-                # BEFORE dispatching lifespan.shutdown - unrelated to the
-                # drain feature itself, which fires after this. Exposed as
-                # --graceful-shutdown-timeout-seconds so a real signal-timing
-                # test can widen it deterministically instead of relying on
-                # this project's own default margin.
-                timeout_graceful_shutdown=graceful_shutdown_timeout_seconds,
+                graceful_shutdown_timeout_seconds=graceful_shutdown_timeout_seconds,
+                forwarded_allow_ips=forwarded_allow_ips,
             )
             asyncio.run(uvicorn.Server(uvicorn_config).serve())
         else:
