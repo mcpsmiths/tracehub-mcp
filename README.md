@@ -142,12 +142,16 @@ Use this if you're developing locally, want to pin to a specific commit, or want
 ### Option 4: Docker
 
 ```bash
+# The image's CMD binds 0.0.0.0 inside the container, so a caller token is
+# mandatory: clients send it as `Authorization: Bearer $MCP_HTTP_BEARER_TOKEN`.
+export MCP_HTTP_BEARER_TOKEN=$(openssl rand -hex 32)
 docker run --rm -p 8000:8000 \
   -e BACKEND_TYPE=jaeger -e BACKEND_URL=http://host.docker.internal:16686 \
+  -e MCP_HTTP_BEARER_TOKEN \
   ghcr.io/mcpsmiths/tracehub-mcp:latest
 ```
 
-Runs HTTP transport by default (the image's `CMD`); clients connect to `http://localhost:8000/mcp`. This is also the form to use for MCP clients whose config takes a `command`/`args` pair pointing at `docker` directly (Cursor, Windsurf) instead of a local binary.
+Runs HTTP transport by default (the image's `CMD`) and refuses to start without `MCP_HTTP_BEARER_TOKEN` - or the explicit `-e MCP_ALLOW_UNAUTHENTICATED_HTTP=true` opt-out, which hands every peer that can reach the published port your backend's full read scope. Clients connect to `http://localhost:8000/mcp` with `Authorization: Bearer <token>`; `/health` and `/ready` (the image's `HEALTHCHECK`) never need the token. This is also the form to use for MCP clients whose config takes a `command`/`args` pair pointing at `docker` directly (Cursor, Windsurf) instead of a local binary - pass the same `-e MCP_HTTP_BEARER_TOKEN=...` in `args`.
 
 **Prerequisites:** Python 3.11+, plus [uv](https://github.com/astral-sh/uv) for Options 1 and 3; Docker for Option 4.
 
@@ -188,7 +192,9 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 | `LOG_LEVEL`              | string  | `INFO`   | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (`--log-level`)    |
 | `MAX_TRACES_PER_QUERY`   | integer | `500`    | Server-wide ceiling (1-1000, `--max-traces-per-query`) - caps every tool's `limit` argument before it reaches a backend query, regardless of what the calling agent requests |
 | `SLOW_REQUEST_THRESHOLD_MS` | float | unset  | Logs a WARNING for any backend request slower than this, independent of `LOG_LEVEL` (`--slow-request-threshold-ms`) |
-| `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` | string/int | `stdio`/`0.0.0.0`/`8000` | Env-var equivalents of `--transport`/`--host`/`--port` |
+| `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` | string/int | `stdio`/`127.0.0.1`/`8000` | Env-var equivalents of `--transport`/`--host`/`--port`. HTTP binds loopback by default; a non-loopback `MCP_HOST` (e.g. `0.0.0.0`) requires `MCP_HTTP_BEARER_TOKEN` or `MCP_ALLOW_UNAUTHENTICATED_HTTP` |
+| `MCP_HTTP_BEARER_TOKEN` | string | unset | HTTP transport only. Shared bearer token every `/mcp` request must present as `Authorization: Bearer <token>` (at least 32 characters, e.g. `openssl rand -hex 32`). Required when `MCP_HOST` is not loopback unless `MCP_ALLOW_UNAUTHENTICATED_HTTP` is set; `/health` and `/ready` stay unauthenticated. `--http-bearer-token` exists but prefer the env var - argv is visible to every local user via `ps` |
+| `MCP_ALLOW_UNAUTHENTICATED_HTTP` | bool | `false` | HTTP transport only. Acknowledge serving `/mcp` on a non-loopback host with no token: every network peer that can reach the port runs every tool under the operator's backend credential (`--allow-unauthenticated-http`) |
 | `MCP_INCLUDE_ARGS_IN_SPANS` | bool | `false` | Include tool call arguments/results as OTel span attributes when self-instrumentation is enabled below - off by default since they may contain sensitive data. Known credential shapes (Bearer tokens, `api_key=`/`secret=`/`password=`-style fields, AWS/GitHub/common vendor key prefixes) are redacted before export, but this is a pattern match, not a guarantee - trace_id/span_id and other legitimate trace data are deliberately left untouched (`--include-args-in-spans`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | URL | unset | Enables opt-in OTel self-instrumentation of tool calls when set; unset means zero overhead (no TracerProvider configured, no middleware registered) |
 | `OTEL_SERVICE_NAME`      | string  | `tracehub-mcp` | Service name reported in self-instrumentation spans                |
@@ -352,12 +358,16 @@ tracehub-mcp                      # pipx/pip install
 uv run tracehub-mcp               # from-source install
 
 # HTTP — remote access, multiple clients, network deployment, sample applications
+# Loopback (the default --host) needs no token: same-machine clients use http://127.0.0.1:8000/mcp
+uvx tracehub-mcp --transport http --port 8000
+# Every interface: a caller token is mandatory (or the explicit --allow-unauthenticated-http opt-out)
+export MCP_HTTP_BEARER_TOKEN=$(openssl rand -hex 32)
 uvx tracehub-mcp --transport http --host 0.0.0.0 --port 8000
 tracehub-mcp --transport http --host 0.0.0.0 --port 8000              # pipx/pip install
 uv run tracehub-mcp --transport http --host 0.0.0.0 --port 8000       # from-source install
 ```
 
-With HTTP transport, clients connect to `http://<host>:<port>/mcp` (streamable-HTTP, for compatibility across MCP clients).
+With HTTP transport, clients connect to `http://<host>:<port>/mcp` (streamable-HTTP, for compatibility across MCP clients) and, whenever `MCP_HTTP_BEARER_TOKEN` is set, send `Authorization: Bearer <token>` on every request - a missing or wrong token answers `401` with a `WWW-Authenticate: Bearer` challenge and never opens a session.
 
 > **Fly.io:** the one-click `fly mcp launch` command only supports stdio-transport servers — it
 > can't deploy this server's `--transport http` mode. Running tracehub-mcp on Fly.io with HTTP
@@ -396,6 +406,7 @@ Secrets (`--api-key`/`--app-key`) are reported as `api_key_set`/`app_key_set` bo
 
 Trace and span data returned by this server — attribute values, error messages, operation names — comes from whatever application your observability backend is instrumenting, not from tracehub-mcp itself. That makes it fundamentally the same category of untrusted external content as a webpage or a file, even though it's a trusted server (this one) handing it back to your MCP client.
 
+- **The HTTP transport runs every tool under your backend credential, so authenticate its callers.** `--transport http` binds loopback (`127.0.0.1`) by default. Serving on a network interface (`--host 0.0.0.0`, the Docker image's `CMD`) requires `MCP_HTTP_BEARER_TOKEN` (clients send `Authorization: Bearer <token>`); the server refuses to start without it unless you pass `--allow-unauthenticated-http` to accept that every peer able to reach the port gets your backend's full read scope. Alternatively keep the loopback bind and front it with an authenticating reverse proxy on a private network. `/health` and `/ready` never require the token.
 - **Treat backend data as untrusted input.** An LLM client consuming trace/span data from tracehub-mcp should apply the same caution it would to any other external tool output — a span attribute or error message is application data to reason about, not an instruction to follow, no matter how it's phrased.
 - **This is a known MCP risk category, not a tracehub-mcp-specific one.** OWASP's GenAI Security Project covers it in their [Practical Guide for Secure MCP Server Development](https://genai.owasp.org/resource/a-practical-guide-for-secure-mcp-server-development/), and Anthropic's own engineering guidance, [How We Contain Claude](https://www.anthropic.com/engineering/how-we-contain-claude), states plainly that tool output is an attack surface even when the tool itself is trusted.
 - **Practical implication:** if you're querying traces from an application that processes untrusted user input (e.g. a customer-facing chatbot), be aware that adversarial content a user fed into that application could end up in a span attribute this server returns — and from there, in your LLM client's context.

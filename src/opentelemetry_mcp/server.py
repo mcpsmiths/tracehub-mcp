@@ -1,6 +1,7 @@
 """Opentelemetry MCP Server - Main entry point."""
 
 import asyncio
+import hmac
 import json
 import logging
 import re
@@ -13,6 +14,7 @@ from typing import Any, Literal, NoReturn
 import click
 import uvicorn
 from fastmcp import FastMCP
+from fastmcp.server.auth.auth import AccessToken, TokenVerifier
 from fastmcp.server.http import StarletteWithLifespan
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
@@ -45,6 +47,7 @@ from opentelemetry_mcp.observability import (
     configure_tracing,
     install_trace_context_log_filter,
 )
+from opentelemetry_mcp.security import is_loopback_host
 from opentelemetry_mcp.tools import (
     compare,
     correlate,
@@ -1242,6 +1245,66 @@ def _apply_tool_gating(disable_tools: str | None, enabled_tools: str | None) -> 
         logger.info(f"Tools disabled via --disable-tools: {sorted(disable)}")
 
 
+_MIN_HTTP_BEARER_TOKEN_CHARS = 32
+
+
+class OperatorTokenVerifier(TokenVerifier):
+    """Binds every /mcp request on the HTTP transport to the operator's own
+    shared bearer token.
+
+    fastmcp 4.0.5 only installs RequireAuthMiddleware around the /mcp route
+    when ``FastMCP.auth`` is set (fastmcp/server/http.py, the ``if auth:``
+    branch of create_streamable_http_app); with it unset every network peer
+    that can reach the port runs all 19 tools under the operator's backend
+    credential. This is the smallest AuthProvider that closes that gap for
+    the shared-secret case: no OAuth routes, no metadata endpoints, one
+    constant-time comparison. fastmcp's own StaticTokenVerifier is
+    deliberately not used - its docstring says it must never be used in
+    production (it keeps a plaintext token table and compares with ``==``).
+
+    JWT/OIDC resource-server mode (fastmcp's JWTVerifier / RemoteAuthProvider)
+    is additive through the same ``mcp.auth`` seam if ever wanted.
+    """
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._expected = token.encode()
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if hmac.compare_digest(token.encode(), self._expected):
+            return AccessToken(token=token, client_id="operator", scopes=[])
+        return None
+
+
+def _validate_http_listener_auth(
+    *, host: str, http_bearer_token: str | None, allow_unauthenticated_http: bool
+) -> None:
+    """Startup gate for ``--transport http``: serving on a non-loopback
+    interface without caller authentication requires an explicit operator
+    acknowledgement. Raises click.UsageError (exit code 2, message on
+    stderr) - called from main() *before* its ``try:`` so the catch-all
+    ``except Exception`` there can never swallow the usage error into a
+    logged 'Server error' and exit 1."""
+    if http_bearer_token is not None:
+        if len(http_bearer_token) < _MIN_HTTP_BEARER_TOKEN_CHARS:
+            raise click.UsageError(
+                "MCP_HTTP_BEARER_TOKEN / --http-bearer-token must be at least "
+                f"{_MIN_HTTP_BEARER_TOKEN_CHARS} characters (got {len(http_bearer_token)}); "
+                "generate one with `openssl rand -hex 32`."
+            )
+        return
+    if is_loopback_host(host) or allow_unauthenticated_http:
+        return
+    raise click.UsageError(
+        f"--transport http on a non-loopback host ({host}) exposes every tool to any "
+        "network peer with no authentication. Either set MCP_HTTP_BEARER_TOKEN (preferred; "
+        "clients then send `Authorization: Bearer <token>`), bind loopback with "
+        "`--host 127.0.0.1` behind an authenticating reverse proxy, or pass "
+        "--allow-unauthenticated-http (MCP_ALLOW_UNAUTHENTICATED_HTTP=true) to accept "
+        "that risk explicitly."
+    )
+
+
 _LOCAL_ORIGIN_PATTERN = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$", re.IGNORECASE)
 
 
@@ -1624,10 +1687,12 @@ def _backend_config_options(f: Any) -> Any:
 @click.option(
     "--host",
     type=str,
-    default="0.0.0.0",  # noqa: S104 - HTTP transport is documented for network/Docker deployment, where binding only to loopback would make the exposed port unreachable; pass --host 127.0.0.1 explicitly for a loopback-only server.
+    default="127.0.0.1",
     envvar="MCP_HOST",
     help="Host to bind HTTP server to (only for --transport http, default: "
-    "0.0.0.0, overrides MCP_HOST env var)",
+    "127.0.0.1 per the MCP spec's loopback guidance; a non-loopback host such "
+    "as 0.0.0.0 additionally requires MCP_HTTP_BEARER_TOKEN or "
+    "--allow-unauthenticated-http, overrides MCP_HOST env var)",
 )
 @click.option(
     "--port",
@@ -1636,6 +1701,27 @@ def _backend_config_options(f: Any) -> Any:
     envvar="MCP_PORT",
     help="Port for HTTP server (only for --transport http, default: 8000, "
     "overrides MCP_PORT env var)",
+)
+@click.option(
+    "--http-bearer-token",
+    type=str,
+    default=None,
+    envvar="MCP_HTTP_BEARER_TOKEN",
+    help="Shared bearer token every /mcp request must present as "
+    "`Authorization: Bearer <token>` (only for --transport http; at least "
+    f"{_MIN_HTTP_BEARER_TOKEN_CHARS} characters, e.g. `openssl rand -hex 32`). "
+    "Prefer the MCP_HTTP_BEARER_TOKEN env var over this flag: argv is visible "
+    "to every local user via `ps`. /health and /ready stay unauthenticated.",
+)
+@click.option(
+    "--allow-unauthenticated-http",
+    is_flag=True,
+    default=False,
+    envvar="MCP_ALLOW_UNAUTHENTICATED_HTTP",
+    help="Acknowledge serving --transport http on a non-loopback --host with "
+    "no MCP_HTTP_BEARER_TOKEN, i.e. every network peer runs every tool under "
+    "the operator's backend credential (default: refuse to start; overrides "
+    "MCP_ALLOW_UNAUTHENTICATED_HTTP env var)",
 )
 @click.option(
     "--include-args-in-spans",
@@ -1758,6 +1844,8 @@ def main(
     transport: str,
     host: str,
     port: int,
+    http_bearer_token: str | None,
+    allow_unauthenticated_http: bool,
     include_args_in_spans: bool,
     log_level: str | None,
     max_traces_per_query: int | None,
@@ -1785,11 +1873,12 @@ def main(
       # Run with stdio transport (default, for Claude Desktop)
       tracehub-mcp --backend traceloop
 
-      # Run with HTTP transport for network access
+      # Run with HTTP transport on loopback (the default host)
       tracehub-mcp --transport http --port 8000
 
-      # Run with HTTP on specific host/port
-      tracehub-mcp --transport http --host 127.0.0.1 --port 9000
+      # Run with HTTP on every interface - requires a caller token
+      MCP_HTTP_BEARER_TOKEN=$(openssl rand -hex 32) \\
+        tracehub-mcp --transport http --host 0.0.0.0 --port 9000
 
       # Validate a candidate config without starting the server
       tracehub-mcp doctor --backend jaeger --url http://localhost:16686
@@ -1801,6 +1890,20 @@ def main(
         return
 
     global _config
+
+    # Before the try: a click.UsageError raised here reaches click's own
+    # handler (exit 2, message on stderr) instead of the catch-all below.
+    if transport == "http":
+        _validate_http_listener_auth(
+            host=host,
+            http_bearer_token=http_bearer_token,
+            allow_unauthenticated_http=allow_unauthenticated_http,
+        )
+    elif http_bearer_token is not None:
+        logger.warning(
+            "MCP_HTTP_BEARER_TOKEN is set but --transport is stdio: the token only "
+            "guards the HTTP listener and is ignored for stdio"
+        )
 
     try:
         # Load configuration from environment
@@ -1867,6 +1970,8 @@ def main(
                 "transport": transport,
                 "host": host,
                 "port": port,
+                "http_bearer_token_set": http_bearer_token is not None,
+                "allow_unauthenticated_http": allow_unauthenticated_http,
                 "include_args_in_spans": include_args_in_spans,
                 "disable_tools": disable_tools,
                 "enabled_tools": enabled_tools,
@@ -1902,6 +2007,20 @@ def main(
             logger.info(f"Starting MCP server with HTTP transport on {host}:{port}")
             logger.info("Using streamable-http transport for better compatibility")
             logger.info(f"Connect clients to: http://{host}:{port}/mcp")
+            if http_bearer_token is not None:
+                # FastMCP.http_app forwards self.auth at call time, so
+                # setting it here is enough for RequireAuthMiddleware to
+                # wrap /mcp; /health and /ready are plain custom routes.
+                mcp.auth = OperatorTokenVerifier(http_bearer_token)
+                logger.info("Bearer-token authentication enabled for /mcp")
+            else:
+                logger.warning(
+                    "Serving /mcp with NO caller authentication on %s:%d - every peer that "
+                    "can reach this port runs every tool under the configured backend "
+                    "credential",
+                    host,
+                    port,
+                )
             middleware = [Middleware(OriginValidationMiddleware)]
             if rate_limit_max_requests > 0:
                 middleware.append(
@@ -1941,6 +2060,10 @@ def main(
     except KeyboardInterrupt:
         logger.info("Server stopped by user")
         sys.exit(0)
+    except click.ClickException:
+        # click.UsageError is an Exception subclass: let click render it
+        # (exit 2, message on stderr) rather than logging 'Server error'.
+        raise
     except Exception as e:
         logger.error(f"Server error: {e}", exc_info=True)
         sys.exit(1)

@@ -17,6 +17,7 @@ from collections.abc import Generator
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import click
 import pytest
 from click.testing import CliRunner
 from fastmcp import Client
@@ -76,12 +77,16 @@ def reset_server_globals() -> Generator[None]:
     server._backend = None
     server._secondary_backend = None
     server._config = None
+    server.mcp.auth = None
     yield
     server._backend = None
     server._secondary_backend = None
     server._config = None
     server._get_backend = real_get_backend
     server._get_secondary_backend = real_get_secondary_backend
+    # main()'s HTTP branch installs the bearer-token verifier on the shared
+    # FastMCP singleton; leave it unauthenticated for the next test.
+    server.mcp.auth = None
 
 
 class TestCreateBackend:
@@ -1167,6 +1172,21 @@ class TestMainCli:
 
         assert result.exit_code == 1
 
+    def test_click_usage_error_inside_the_try_is_not_swallowed(self) -> None:
+        """click.UsageError is an Exception subclass: without an explicit
+        `except click.ClickException: raise` ahead of the catch-all, a usage
+        error raised anywhere inside main()'s try would be logged as
+        'Server error' and exit 1 instead of click's own exit 2 with the
+        message on stderr."""
+        runner = CliRunner()
+        with patch.object(
+            ServerConfig, "from_env", side_effect=click.UsageError("bad combination of flags")
+        ):
+            result = runner.invoke(server.main, [])
+
+        assert result.exit_code == 2
+        assert "bad combination of flags" in result.output
+
     def test_bare_invocation_still_works_after_group_conversion(self) -> None:
         """main() converted from a flat @click.command() to a
         @click.group(invoke_without_command=True) to add the doctor
@@ -1297,6 +1317,8 @@ class TestPrintConfigFlag:
         assert resolved["port"] == 9001
         assert resolved["disable_tools"] == "get_trace"
         assert resolved["enabled_tools"] == "search_traces,get_trace"
+        assert resolved["http_bearer_token_set"] is False
+        assert resolved["allow_unauthenticated_http"] is False
 
 
 class TestDoctorCli:

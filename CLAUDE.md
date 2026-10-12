@@ -161,7 +161,9 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `LOG_LEVEL` - Optional: Logging level (default: INFO)
 - `MAX_TRACES_PER_QUERY` - Optional: Result limit (default: 500, 1-1000)
 - `SLOW_REQUEST_THRESHOLD_MS` - Optional: Logs a WARNING for any backend request slower than this, independent of `LOG_LEVEL` (default: unset/disabled)
-- `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` - Optional: Env-var equivalents of `--transport`/`--host`/`--port` (see CLI flags below)
+- `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` - Optional: Env-var equivalents of `--transport`/`--host`/`--port` (see CLI flags below). HTTP binds loopback (`127.0.0.1`) by default; a non-loopback host requires `MCP_HTTP_BEARER_TOKEN` or `MCP_ALLOW_UNAUTHENTICATED_HTTP`
+- `MCP_HTTP_BEARER_TOKEN` - Optional, HTTP transport only: shared bearer token every `/mcp` request must present as `Authorization: Bearer <token>` (at least 32 characters). Installs `server.OperatorTokenVerifier` (constant-time compare) as `mcp.auth`, which makes fastmcp wrap `/mcp` in `RequireAuthMiddleware`; `/health` and `/ready` stay unauthenticated. Ignored (with a WARNING) under stdio
+- `MCP_ALLOW_UNAUTHENTICATED_HTTP` - Optional, HTTP transport only: explicit acknowledgement for serving `/mcp` on a non-loopback host with no token (default: `false` - `main()` raises a `click.UsageError`, exit code 2, before anything starts)
 - `MCP_INCLUDE_ARGS_IN_SPANS` - Optional: Env-var equivalent of `--include-args-in-spans` (default: `false`). Known credential shapes are redacted before export (`observability._redact_secrets`) - a pattern match, not a guarantee.
 - `OTEL_EXPORTER_OTLP_ENDPOINT` - Optional: Enables opt-in OTel self-instrumentation of tool calls when set (unset by default - no TracerProvider is configured and no middleware is registered, so there is zero overhead if you don't opt in)
 - `OTEL_SERVICE_NAME` - Optional: Service name reported in self-instrumentation spans (default: `tracehub-mcp`)
@@ -178,6 +180,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `--enabled-tools <name1,name2,...>` - Allowlist: every tool not named here is removed from this server instance
 - `--slow-request-threshold-ms <float>` - Overrides `SLOW_REQUEST_THRESHOLD_MS`
 - `--include-args-in-spans` - Overrides `MCP_INCLUDE_ARGS_IN_SPANS`
+- `--http-bearer-token <token>` / `--allow-unauthenticated-http` - HTTP transport only. Override `MCP_HTTP_BEARER_TOKEN` / `MCP_ALLOW_UNAUTHENTICATED_HTTP`; prefer the env var for the token since argv is visible via `ps`
 - `--rate-limit-max-requests <int>` / `--rate-limit-window-seconds <float>` - HTTP transport only. Per-client-IP fixed-window rate limit (defaults: 100 requests / 60s window). Set `--rate-limit-max-requests 0` to disable.
 - `--shutdown-drain-seconds <float>` - HTTP transport only. On shutdown, wait this many seconds inside the ASGI shutdown handler (after uvicorn has already finished draining in-flight connections) before closing the shared backend HTTP client (default: `0.0`/disabled).
 - `--backend-close-timeout-seconds <float>` - HTTP transport only. Abandon closing the shared backend HTTP client during shutdown if it does not finish within this many seconds - uvicorn places no timeout of its own around this wait (default: `5.0`).
@@ -186,7 +189,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 
 **`tracehub-mcp doctor`** - Subcommand (not a flag) that runs startup diagnostics against the resolved backend config: config load, backend construction, `health_check()`, and a real read-only connectivity probe (`list_services`). Also validates the optional secondary backend (`SECONDARY_BACKEND_*`) the same way, if one is configured. Prints `[OK]`/`[FAIL]` per step and exits non-zero on any failure - unlike the server's own lazy backend initialization, which deliberately swallows a failed health check and keeps running. Accepts the same `--backend`/`--url`/etc. override flags as the main command, so a candidate config can be validated before committing to it (the secondary backend has no such override flags - it's resolved from env vars only).
 
-**HTTP Endpoints** (streamable-http transport only, registered via `FastMCP.custom_route` - not applicable to stdio): `GET /health` - liveness only, always `200 {"status": "ok"}`, no backend I/O. `GET /ready` - readiness, reuses the server's own cached backend (never closes it), `200` when `health_check`/`list_services` both succeed, `503` with details otherwise.
+**HTTP Endpoints** (streamable-http transport only, registered via `FastMCP.custom_route` - not applicable to stdio): `GET /health` - liveness only, always `200 {"status": "ok"}`, no backend I/O. `GET /ready` - readiness, reuses the server's own cached backend (never closes it), `200` when `health_check`/`list_services` both succeed, `503` with details otherwise. Neither requires `MCP_HTTP_BEARER_TOKEN`; only `/mcp` does.
 
 **Configuration Precedence:** CLI args > environment variables > defaults
 
