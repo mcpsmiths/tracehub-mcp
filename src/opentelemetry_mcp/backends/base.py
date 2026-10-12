@@ -139,15 +139,27 @@ class _BoundedResponse(httpx.Response):
 # never retried via this mechanism. 429 is retried too, but as a *result*
 # condition (see _is_rate_limited) rather than an exception, since asking to
 # slow down and retry is exactly what 429 means - unlike a genuine 4xx/5xx
-# error, which should reach the caller immediately.
+# error, which should reach the caller immediately. The retry sleep runs
+# here in the transport, OUTSIDE the per-attempt httpx timeout, so a
+# backend-chosen Retry-After is honoured only up to _MAX_RETRY_AFTER_SECONDS
+# (the same ceiling as the exponential fallback): a 429 asking for more is
+# not retried at all and reaches the caller after the current attempt.
 _RETRYABLE_TRANSPORT_EXCEPTIONS = (httpx.ConnectError, httpx.TimeoutException)
 
-_DEFAULT_RETRY_WAIT = wait_exponential(multiplier=1, max=10)
+_MAX_ATTEMPTS = 3
+_MAX_RETRY_AFTER_SECONDS = 10.0
+_DEFAULT_RETRY_WAIT = wait_exponential(multiplier=1, max=_MAX_RETRY_AFTER_SECONDS)
 
 
 def _is_rate_limited(response: Any) -> bool:
-    """True if a completed (non-exception) attempt was a 429 response."""
-    return isinstance(response, httpx.Response) and response.status_code == 429
+    """True if a completed (non-exception) attempt was a 429 whose
+    Retry-After (if any) fits the retry budget. A 429 asking for a longer
+    wait is not retried; tenacity hands the real response back and the
+    backend's own raise_for_status() surfaces it immediately."""
+    if not (isinstance(response, httpx.Response) and response.status_code == 429):
+        return False
+    retry_after = _retry_after_seconds(response)
+    return retry_after is None or retry_after <= _MAX_RETRY_AFTER_SECONDS
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
@@ -163,7 +175,10 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     if value is None:
         return None
     value = value.strip()
-    if value.isdigit():
+    # isascii() too: str.isdigit() is true for non-ASCII digits such as
+    # U+00B2, which float() then rejects - a ValueError escaping the wait
+    # strategy would surface out of tenacity as an unrelated crash.
+    if value.isascii() and value.isdigit():
         return float(value)
     try:
         retry_time: datetime = parsedate_to_datetime(value)
@@ -175,16 +190,17 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
 
 
 def _wait_for_retry(retry_state: RetryCallState) -> float:
-    """Respect a 429 response's Retry-After header when present, otherwise
-    fall back to the same exponential backoff used for connect/timeout
-    retries."""
+    """Respect a 429 response's Retry-After header when present, up to
+    _MAX_RETRY_AFTER_SECONDS (belt and braces behind _is_rate_limited, which
+    already refuses to retry an over-cap 429), otherwise fall back to the
+    same exponential backoff used for connect/timeout retries."""
     outcome = retry_state.outcome
     if outcome is not None and not outcome.failed:
         response = outcome.result()
         if isinstance(response, httpx.Response):
             retry_after = _retry_after_seconds(response)
             if retry_after is not None:
-                return retry_after
+                return min(retry_after, _MAX_RETRY_AFTER_SECONDS)
     return _DEFAULT_RETRY_WAIT(retry_state)
 
 
@@ -227,9 +243,11 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         """Delegate to the wrapped transport, retrying up to 3 total attempts
-        (with exponential backoff, capped around 10s, or a 429's own
-        Retry-After header when present) on connect/timeout failures or a
-        429 rate-limit response.
+        (with exponential backoff capped at 10 s, or a 429's own Retry-After
+        header when present and no larger than that same 10 s ceiling) on
+        connect/timeout failures or a 429 rate-limit response. A 429 whose
+        Retry-After exceeds the ceiling is returned after the current attempt
+        with no retry sleep - the backend may not park this process.
         """
         # httpx re-invokes handle_async_request on every redirect hop when
         # follow_redirects=True, so these checks - run before every attempt,
@@ -262,8 +280,20 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         # integration tests) expose handle_async_request as a *sync* function
         # that returns a coroutine, which tenacity's coroutine-callable
         # detection can miss, silently returning an unawaited coroutine.
+        attempt = 0
+
         async def _send() -> httpx.Response:
-            return await self._wrapped.handle_async_request(request)
+            nonlocal attempt
+            attempt += 1
+            response = await self._wrapped.handle_async_request(request)
+            if attempt < _MAX_ATTEMPTS and _is_rate_limited(response):
+                # tenacity is about to discard this response and retry:
+                # release its pooled connection now rather than leaving the
+                # unread body to garbage collection. Only when a retry WILL
+                # happen - the final attempt's response, and an over-cap 429,
+                # go back to the caller unread and must stay open.
+                await response.aclose()
+            return response
 
         retrying = AsyncRetrying(
             retry=retry_any(
@@ -271,7 +301,7 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
                 retry_if_result(_is_rate_limited),
             ),
             wait=_wait_for_retry,
-            stop=stop_after_attempt(3),
+            stop=stop_after_attempt(_MAX_ATTEMPTS),
             reraise=True,
         )
         start = time.perf_counter()

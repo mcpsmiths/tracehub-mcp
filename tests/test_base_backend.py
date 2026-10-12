@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 import pytest
+from tenacity import AsyncRetrying, RetryCallState
 
 from opentelemetry_mcp.backends.base import (
     DEFAULT_MAX_RESPONSE_BYTES,
@@ -24,7 +25,10 @@ from opentelemetry_mcp.backends.base import (
     MetadataEndpointBlockedError,
     RedirectTargetBlockedError,
     ResponseTooLargeError,
+    _is_rate_limited,
+    _retry_after_seconds,
     _RetryingTransport,
+    _wait_for_retry,
 )
 from opentelemetry_mcp.backends.datadog import DatadogBackend
 from opentelemetry_mcp.backends.honeycomb import HoneycombBackend
@@ -870,3 +874,164 @@ class TestRetryOn429:
 
         assert response.status_code == 503
         assert call_count == 1
+
+
+class TestRetryAfterCeiling:
+    """A backend-controlled Retry-After must never park a tool call (and,
+    with QUERY_CACHE_TTL_SECONDS, every coalesced identical query) beyond
+    the retry budget: the tenacity sleep runs inside the transport, outside
+    the per-attempt httpx timeout, so the only bound is the one here."""
+
+    async def test_retry_after_above_cap_returns_429_without_sleeping(self) -> None:
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(429, headers={"Retry-After": "100000"}, text="slow down")
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        start = time.monotonic()
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            # wait_for: on the unfixed code this parks for 100000 s, so bound
+            # the test itself rather than hanging the suite.
+            response = await asyncio.wait_for(client.get("/search"), timeout=5.0)
+        elapsed = time.monotonic() - start
+
+        # The real response reaches the caller (backends raise_for_status()
+        # on it themselves), unread-but-readable, after a single attempt.
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == "100000"
+        assert response.text == "slow down"
+        assert call_count == 1
+        assert elapsed < 1.0
+
+    async def test_retry_after_far_future_http_date_is_not_honoured(self) -> None:
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(429, headers={"Retry-After": "Fri, 31 Dec 2099 23:59:59 GMT"})
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        start = time.monotonic()
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await asyncio.wait_for(client.get("/search"), timeout=5.0)
+        elapsed = time.monotonic() - start
+
+        assert response.status_code == 429
+        assert call_count == 1
+        assert elapsed < 1.0
+
+    async def test_retry_after_at_or_below_cap_is_still_honoured(self) -> None:
+        """Keeps the existing Retry-After semantics for well-behaved
+        backends: a small delta is still a retry, not an immediate 429."""
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                return httpx.Response(429, headers={"Retry-After": "0"})
+            return httpx.Response(200, json={"ok": True})
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/search")
+
+        assert response.status_code == 200
+        assert call_count == 2
+
+    @pytest.mark.parametrize(
+        ("retry_after", "retryable"),
+        [(None, True), ("0", True), ("10", True), ("11", False), ("100000", False)],
+    )
+    def test_is_rate_limited_refuses_an_over_cap_429(
+        self, retry_after: str | None, retryable: bool
+    ) -> None:
+        headers = {} if retry_after is None else {"Retry-After": retry_after}
+
+        assert _is_rate_limited(httpx.Response(429, headers=headers)) is retryable
+
+    def test_is_rate_limited_is_false_for_other_statuses_and_non_responses(self) -> None:
+        assert _is_rate_limited(httpx.Response(200)) is False
+        assert _is_rate_limited(httpx.Response(503, headers={"Retry-After": "1"})) is False
+        assert _is_rate_limited(None) is False
+
+    def test_wait_for_retry_never_exceeds_the_ceiling(self) -> None:
+        """Belt and braces behind _is_rate_limited: even if an over-cap 429
+        reached the wait strategy, the sleep is clamped to the budget."""
+        state = RetryCallState(AsyncRetrying(), None, (), {})
+        state.set_result(httpx.Response(429, headers={"Retry-After": "100000"}))
+
+        assert _wait_for_retry(state) <= 10.0
+
+    def test_wait_for_retry_honours_a_small_retry_after(self) -> None:
+        state = RetryCallState(AsyncRetrying(), None, (), {})
+        state.set_result(httpx.Response(429, headers={"Retry-After": "3"}))
+
+        assert _wait_for_retry(state) == 3.0
+
+    def test_non_ascii_digits_fall_back_to_backoff_instead_of_raising(self) -> None:
+        """U+00B2 (superscript two) passes str.isdigit() but float() rejects
+        it - a ValueError escaping the wait strategy would surface out of
+        tenacity as an unrelated crash. Sent as a latin-1 header byte, as it
+        arrives off the wire."""
+        response = httpx.Response(429, headers=[(b"Retry-After", b"\xb2")])
+
+        assert response.headers["Retry-After"] == "\u00b2"
+        assert _retry_after_seconds(response) is None
+
+    async def test_retried_429_is_closed_before_the_next_attempt(self) -> None:
+        """Hygiene folded in from the audit: a 429 tenacity is about to
+        discard used to rely on garbage collection to release its pooled
+        connection. It must be closed deterministically - and only when a
+        retry will actually happen (the final response stays open for the
+        caller to read)."""
+        streams: list[_RecordingStream] = []
+        closed_before_attempt: list[list[bool]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            closed_before_attempt.append([s.closed for s in streams])
+            if len(streams) < 2:
+                stream = _RecordingStream(b"rate limited")
+                streams.append(stream)
+                return httpx.Response(429, headers={"Retry-After": "0"}, stream=stream)
+            return httpx.Response(200, json={"ok": True})
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/search")
+
+        assert response.status_code == 200
+        # attempt 1 saw nothing yet; attempt 2 saw the first 429 closed;
+        # attempt 3 saw both earlier 429s closed.
+        assert closed_before_attempt == [[], [True], [True, True]]
+
+    async def test_final_429_is_handed_to_the_caller_unclosed(self) -> None:
+        final_stream = _RecordingStream(b"still rate limited")
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                return httpx.Response(429, headers={"Retry-After": "0"})
+            return httpx.Response(429, headers={"Retry-After": "0"}, stream=final_stream)
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/search")
+
+        assert response.status_code == 429
+        assert call_count == 3
+        # httpx read the body for the caller: the stream was iterated once,
+        # i.e. the transport did not close it before handing it back.
+        assert final_stream.reads == 1
+        assert response.text == "still rate limited"
