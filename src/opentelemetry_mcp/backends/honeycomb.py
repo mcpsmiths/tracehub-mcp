@@ -166,6 +166,23 @@ _SEARCH_BREAKDOWNS = list(_STRUCTURAL_BREAKDOWNS) + list(_GEN_AI_BREAKDOWNS)
 _STRUCTURAL_ROW_FIELDS = frozenset(_STRUCTURAL_BREAKDOWNS)
 
 
+_MAX_PAYLOAD_EXCERPT_CHARS = 300
+
+
+def _payload_excerpt(payload: object) -> str:
+    """A bounded repr of an unexpected response payload for error text.
+
+    The body itself is already size-capped at the transport
+    (BACKEND_MAX_RESPONSE_BYTES), but a ValueError message that echoes the
+    whole repr would be a second copy of it in memory and in the tool-error
+    channel; a few hundred characters identify the shape just as well.
+    """
+    text = repr(payload)
+    if len(text) <= _MAX_PAYLOAD_EXCERPT_CHARS:
+        return text
+    return f"{text[:_MAX_PAYLOAD_EXCERPT_CHARS]}... ({len(text)} chars)"
+
+
 class HoneycombEnterpriseRequiredError(ValueError):
     """Raised when Honeycomb's Query Data API rejects a request with what
     this backend interprets as tier-gating (see module docstring point 1)."""
@@ -755,7 +772,7 @@ class HoneycombBackend(BaseBackend):
         if not isinstance(query_id, str):
             raise ValueError(
                 f"Unexpected Honeycomb create-query response shape "
-                f"(expected an 'id' string, got {type(payload).__name__}): {payload!r}"
+                f"(expected an 'id' string, got {type(payload).__name__}): {_payload_excerpt(payload)}"
             )
         return query_id
 
@@ -785,7 +802,7 @@ class HoneycombBackend(BaseBackend):
         if not isinstance(result_id, str):
             raise ValueError(
                 f"Unexpected Honeycomb create-query-result response shape "
-                f"(expected an 'id' string, got {type(payload).__name__}): {payload!r}"
+                f"(expected an 'id' string, got {type(payload).__name__}): {_payload_excerpt(payload)}"
             )
         return result_id
 
@@ -812,7 +829,7 @@ class HoneycombBackend(BaseBackend):
             if not isinstance(payload, dict):
                 raise ValueError(
                     f"Unexpected Honeycomb query-result response shape "
-                    f"(expected an object, got {type(payload).__name__}): {payload!r}"
+                    f"(expected an object, got {type(payload).__name__}): {_payload_excerpt(payload)}"
                 )
 
             if payload.get("complete"):
@@ -821,7 +838,7 @@ class HoneycombBackend(BaseBackend):
                 if not isinstance(results, list):
                     raise ValueError(
                         "Unexpected Honeycomb query-result response shape "
-                        f"(expected data.results to be a list): {payload!r}"
+                        f"(expected data.results to be a list): {_payload_excerpt(payload)}"
                     )
                 return [r for r in results if isinstance(r, dict)]
 

@@ -4,7 +4,7 @@ import functools
 import logging
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -76,6 +76,62 @@ class RedirectTargetBlockedError(httpx.TransportError):
     """
 
 
+# Ceiling on the DECODED (post-Content-Encoding) size of any single backend
+# response, in bytes. httpx advertises Accept-Encoding: gzip, deflate and
+# inflates transparently on the read path, so without a bound a ~1 KB wire
+# body chosen by the backend (or a redirect target) becomes ~1 MB of heap,
+# then ~3x that again when json() parses it - in the one process every MCP
+# session and GET /ready share. 64 MiB is far above a MAX_TRACES_PER_QUERY=500
+# Jaeger response in normal use; BACKEND_MAX_RESPONSE_BYTES raises or lowers
+# it per deployment (config.py).
+DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+
+class ResponseTooLargeError(httpx.TransportError):
+    """Raised when a backend (or redirect-target) response declares, or
+    decodes to, more than the configured max_response_bytes. Deliberately
+    not one of the retryable exceptions below - the same backend would send
+    the same body again.
+    """
+
+
+class _BoundedResponse(httpx.Response):
+    """The response _RetryingTransport hands back to httpx: the wrapped
+    transport's status, headers, body stream and extensions, with an
+    aiter_bytes() that counts DECODED bytes and raises ResponseTooLargeError
+    once the running total passes the cap.
+
+    httpx (~=0.28) reads every non-stream response - and every redirect hop
+    it follows - through Response.aread(), which is implemented over
+    aiter_bytes(), so this one override bounds all 25 response.json() sites
+    across the backends with no call-site changes. Overshoot is bounded by
+    the expansion of a single raw chunk, never by the whole body.
+    """
+
+    def __init__(self, inner: httpx.Response, max_response_bytes: int) -> None:
+        super().__init__(
+            inner.status_code,
+            headers=inner.headers,
+            stream=inner.stream,
+            extensions=inner.extensions,
+        )
+        self._max_response_bytes = max_response_bytes
+
+    async def aiter_bytes(self, chunk_size: int | None = None) -> AsyncIterator[bytes]:
+        decoded_total = 0
+        async for chunk in super().aiter_bytes(chunk_size):
+            decoded_total += len(chunk)
+            if decoded_total > self._max_response_bytes:
+                # Release the pooled connection now rather than leaving the
+                # half-read body to the client's own exception handling.
+                await self.aclose()
+                raise ResponseTooLargeError(
+                    f"Backend response exceeded {self._max_response_bytes} decoded bytes "
+                    "(BACKEND_MAX_RESPONSE_BYTES); refusing to buffer it"
+                )
+            yield chunk
+
+
 # Only genuine transport-level failures - a connection that never completed
 # or a request that timed out - are worth retrying on their own. An HTTP
 # response with a 4xx/5xx status code is a *successful* transport exchange
@@ -143,6 +199,7 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         wrapped: httpx.AsyncBaseTransport | None = None,
         slow_request_threshold_ms: float | None = None,
         allowed_host: str | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         """Wrap an underlying transport (defaults to a fresh AsyncHTTPTransport).
 
@@ -157,10 +214,16 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
                 host, so a 3xx Location chosen by the backend can never steer
                 the shared client elsewhere. Host-only on purpose: a same-host
                 scheme/port change (an http->https upgrade) stays allowed.
+            max_response_bytes: Ceiling on the DECODED size of any single
+                response (initial or redirect hop). A larger declared
+                Content-Length is refused before the body is read; a body
+                that decodes past the cap raises ResponseTooLargeError
+                mid-read (see _BoundedResponse).
         """
         self._wrapped = wrapped if wrapped is not None else httpx.AsyncHTTPTransport()
         self._slow_request_threshold_ms = slow_request_threshold_ms
         self._allowed_host = allowed_host.lower() if allowed_host is not None else None
+        self._max_response_bytes = max_response_bytes
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         """Delegate to the wrapped transport, retrying up to 3 total attempts
@@ -226,6 +289,23 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
             if exc.last_attempt.failed:
                 raise
             response = exc.last_attempt.result()
+        # Content-Length is the WIRE size (pre-decoding), so this only ever
+        # rejects a body that is oversized before inflation - but then it
+        # does so without reading a byte of it. The decisive control is the
+        # decoded-byte count in _BoundedResponse.aiter_bytes().
+        declared_length = response.headers.get("Content-Length")
+        if (
+            declared_length is not None
+            and declared_length.isascii()
+            and declared_length.isdigit()
+            and int(declared_length) > self._max_response_bytes
+        ):
+            await response.aclose()
+            raise ResponseTooLargeError(
+                f"Backend response declared Content-Length {declared_length}, above the "
+                f"{self._max_response_bytes}-byte BACKEND_MAX_RESPONSE_BYTES cap"
+            )
+        response = _BoundedResponse(response, self._max_response_bytes)
         if self._slow_request_threshold_ms is not None:
             duration_ms = (time.perf_counter() - start) * 1000
             if duration_ms > self._slow_request_threshold_ms:
@@ -279,6 +359,10 @@ class BaseBackend(ABC):
         # timeout) positionally, so a caller (server.py's _create_backend)
         # sets this as a plain attribute after construction instead.
         self.slow_request_threshold_ms: float | None = None
+        # Same post-construction pattern: server.py applies the operator's
+        # BACKEND_MAX_RESPONSE_BYTES here, and `client` hands it to the
+        # transport, which enforces it on every response.
+        self.max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
         self._query_cache: TTLCoalescingCache | None = None
 
     def configure_query_cache(self, ttl_seconds: float | None) -> None:
@@ -315,11 +399,13 @@ class BaseBackend(ABC):
         """The one _RetryingTransport construction every backend shares -
         the Datadog/New Relic/Honeycomb `client` overrides (which differ
         from the base one only in follow_redirects) call this too, so a
-        transport-level control added here (host pin, slow-request logging)
-        can never be missed by one backend's own client."""
+        transport-level control added here (host pin, response size cap,
+        slow-request logging) can never be missed by one backend's own
+        client."""
         return _RetryingTransport(
             slow_request_threshold_ms=self.slow_request_threshold_ms,
             allowed_host=httpx.URL(self.url).host,
+            max_response_bytes=self.max_response_bytes,
         )
 
     @abstractmethod

@@ -7,6 +7,7 @@ from typing import Literal
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, field_validator
 
+from opentelemetry_mcp.backends.base import DEFAULT_MAX_RESPONSE_BYTES
 from opentelemetry_mcp.security import is_cloud_metadata_host, is_loopback_host
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,13 @@ class BackendConfig(BaseModel):
         "dataset-scoped (Honeycomb backend only)",
     )
     timeout: float = Field(default=30.0, gt=0, le=300)
+    max_response_bytes: int = Field(
+        default=DEFAULT_MAX_RESPONSE_BYTES,
+        ge=1,
+        le=1024**3,
+        description="Ceiling on the decoded size of any single backend response, in bytes; "
+        "an oversized body is refused at the transport before it is buffered or parsed",
+    )
     environments: list[str] = Field(default_factory=lambda: ["prd"])
 
     @field_validator("url")
@@ -155,6 +163,19 @@ class BackendConfig(BaseModel):
             logger.warning(f"Invalid {prefix}TIMEOUT value '{timeout_str}': {e}. Using default: 30")
             timeout = 30.0
 
+        # Parse max_response_bytes with validation (optional; range-checked by
+        # the Field so an out-of-range value fails fast like a bad timeout)
+        max_response_bytes = DEFAULT_MAX_RESPONSE_BYTES
+        max_response_bytes_str = os.getenv(f"{prefix}MAX_RESPONSE_BYTES")
+        if max_response_bytes_str:
+            try:
+                max_response_bytes = int(max_response_bytes_str)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Invalid {prefix}MAX_RESPONSE_BYTES value '{max_response_bytes_str}': {e}. "
+                    f"Using default: {DEFAULT_MAX_RESPONSE_BYTES}"
+                )
+
         return cls(
             type=backend_type,  # type: ignore
             url=backend_url,  # type: ignore
@@ -167,6 +188,7 @@ class BackendConfig(BaseModel):
             newrelic_account_id=os.getenv(f"{prefix}NEWRELIC_ACCOUNT_ID"),
             honeycomb_dataset=os.getenv(f"{prefix}HONEYCOMB_DATASET"),
             timeout=timeout,
+            max_response_bytes=max_response_bytes,
             environments=environments,
         )
 

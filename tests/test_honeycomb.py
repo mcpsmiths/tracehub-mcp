@@ -484,6 +484,28 @@ class TestCreateQueryResultEnterpriseGating:
         with pytest.raises(ValueError, match="unexpected"):
             await backend._create_query_result("query-1")
 
+    async def test_malformed_payload_echo_is_truncated(self) -> None:
+        """The response body is already size-capped at the transport, but a
+        ValueError that echoes the whole repr is a second copy of it in
+        memory and in the tool-error channel - keep the excerpt short."""
+        backend = _backend()
+        huge = {"unexpected": "x" * 100_000}
+
+        async def _fake_post(*args: Any, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                200, json=huge, request=httpx.Request("POST", "https://api.honeycomb.io/x")
+            )
+
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.post = _fake_post
+
+        with pytest.raises(ValueError, match="unexpected") as exc_info:
+            await backend._create_query_result("query-1")
+
+        assert len(str(exc_info.value)) < 1000
+        assert "chars" in str(exc_info.value)  # the excerpt says how long the real repr was
+
     async def test_query_spec_creation_also_checks_enterprise_gating(self) -> None:
         """The docstring's own disclosure is that the exact gating boundary
         (query creation vs. query-result creation) was never confirmed live

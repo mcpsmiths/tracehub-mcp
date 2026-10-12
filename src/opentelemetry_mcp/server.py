@@ -227,6 +227,7 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
     # several backend subclasses override __init__ with their own named
     # params, so this is applied uniformly here instead.
     backend.slow_request_threshold_ms = config.slow_request_threshold_ms
+    backend.max_response_bytes = config.backend.max_response_bytes
     backend.configure_query_cache(config.query_cache_ttl_seconds)
     return backend
 
@@ -296,6 +297,7 @@ async def _get_secondary_backend() -> BaseBackend:
         logger.info("Creating secondary backend in current event loop")
         _secondary_backend = _build_backend_from_config(_config.secondary_backend)
         _secondary_backend.slow_request_threshold_ms = _config.slow_request_threshold_ms
+        _secondary_backend.max_response_bytes = _config.secondary_backend.max_response_bytes
         _secondary_backend.configure_query_cache(_config.query_cache_ttl_seconds)
 
         try:
@@ -1782,6 +1784,7 @@ def _print_config_backend_dict(backend_config: BackendConfig) -> dict[str, Any]:
         "url": str(backend_config.url),
         "environments": backend_config.environments,
         "timeout": backend_config.timeout,
+        "max_response_bytes": backend_config.max_response_bytes,
         "sentry_org": backend_config.sentry_org,
         "sentry_project": backend_config.sentry_project,
         "tempo_instance_id": backend_config.tempo_instance_id,

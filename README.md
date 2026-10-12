@@ -151,6 +151,8 @@ docker run --rm -p 8000:8000 \
   ghcr.io/mcpsmiths/tracehub-mcp:latest
 ```
 
+Backend responses are capped at `BACKEND_MAX_RESPONSE_BYTES` (64 MiB decoded by default) before they are buffered, but a container that serves many sessions still benefits from Docker's own guard rails: add `--memory 1g --restart unless-stopped` (or the Compose equivalents) so a process that does exhaust memory is contained and comes back without an operator.
+
 Runs HTTP transport by default (the image's `CMD`) and refuses to start without `MCP_HTTP_BEARER_TOKEN` - or the explicit `-e MCP_ALLOW_UNAUTHENTICATED_HTTP=true` opt-out, which hands every peer that can reach the published port your backend's full read scope. Clients connect to `http://localhost:8000/mcp` with `Authorization: Bearer <token>`; `/health` and `/ready` (the image's `HEALTHCHECK`) never need the token. Because the `CMD` binds `0.0.0.0`, the container does not validate the `Host` header unless you also pass `-e MCP_ALLOWED_HOSTS=<the public hostnames clients use>`. This is also the form to use for MCP clients whose config takes a `command`/`args` pair pointing at `docker` directly (Cursor, Windsurf) instead of a local binary - pass the same `-e MCP_HTTP_BEARER_TOKEN=...` in `args`.
 
 **Prerequisites:** Python 3.11+, plus [uv](https://github.com/astral-sh/uv) for Options 1 and 3; Docker for Option 4.
@@ -188,6 +190,7 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 | `BACKEND_HONEYCOMB_DATASET` | string | -     | Honeycomb dataset slug (required for Honeycomb - the Query Data API is dataset-scoped) |
 | `BACKEND_ENVIRONMENTS`   | string  | `prd`    | Comma-separated environments (Traceloop only)                        |
 | `BACKEND_TIMEOUT`        | float   | `30`     | Request timeout in seconds                                           |
+| `BACKEND_MAX_RESPONSE_BYTES` | integer | `67108864` (64 MiB) | Ceiling on the *decoded* size of any single backend response (1 to 1 GiB). httpx inflates `gzip`/`deflate` bodies transparently, so without a bound a ~1 KB wire body chosen by the backend (or a redirect target) could become ~1 MB of heap, then ~3x that when parsed, in the one process every MCP session and `/ready` share. A larger declared `Content-Length` is refused before the body is read; a body that decodes past the cap fails with `ResponseTooLargeError` (not retried). Raise it if legitimate trace queries are rejected; `SECONDARY_BACKEND_MAX_RESPONSE_BYTES` for the secondary backend |
 | `SECONDARY_BACKEND_TYPE` / `SECONDARY_BACKEND_URL` / ... | string/URL | unset (opt-in) | A second, independently-configured backend for `correlate_trace` (cross-backend correlation) - every `BACKEND_*` variable above has a `SECONDARY_BACKEND_*` equivalent. Env-var only, no CLI flags. Unset means `correlate_trace` raises a clear error if called |
 | `LOG_LEVEL`              | string  | `INFO`   | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` (`--log-level`)    |
 | `MAX_TRACES_PER_QUERY`   | integer | `500`    | Server-wide ceiling (1-1000, `--max-traces-per-query`) - caps every tool's `limit` argument before it reaches a backend query, regardless of what the calling agent requests |

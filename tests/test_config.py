@@ -5,6 +5,7 @@ import logging
 import pytest
 from pydantic import HttpUrl, ValidationError
 
+from opentelemetry_mcp.backends.base import DEFAULT_MAX_RESPONSE_BYTES
 from opentelemetry_mcp.config import BackendConfig
 
 
@@ -104,3 +105,57 @@ def test_https_url_never_warns(caplog: pytest.LogCaptureFixture) -> None:
         BackendConfig(type="jaeger", url=HttpUrl("https://localhost:16686"))
 
     assert caplog.records == []
+
+
+class TestMaxResponseBytes:
+    """BACKEND_MAX_RESPONSE_BYTES / SECONDARY_BACKEND_MAX_RESPONSE_BYTES bound
+    the DECODED size of any single backend response (enforced in
+    backends.base._RetryingTransport); parsed like BACKEND_TIMEOUT."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", "http://localhost:16686")
+        monkeypatch.delenv("BACKEND_MAX_RESPONSE_BYTES", raising=False)
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("SECONDARY_BACKEND_URL", "http://localhost:16687")
+        monkeypatch.delenv("SECONDARY_BACKEND_MAX_RESPONSE_BYTES", raising=False)
+
+    def test_default_is_the_transport_default(self) -> None:
+        assert BackendConfig.from_env().max_response_bytes == DEFAULT_MAX_RESPONSE_BYTES
+        assert DEFAULT_MAX_RESPONSE_BYTES == 64 * 1024 * 1024
+
+    def test_env_override_is_applied(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_MAX_RESPONSE_BYTES", "1048576")
+
+        assert BackendConfig.from_env().max_response_bytes == 1048576
+
+    def test_secondary_backend_reads_its_own_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_MAX_RESPONSE_BYTES", "1048576")
+        monkeypatch.setenv("SECONDARY_BACKEND_MAX_RESPONSE_BYTES", "2097152")
+
+        secondary = BackendConfig.from_env_optional()
+
+        assert secondary is not None
+        assert secondary.max_response_bytes == 2097152
+
+    def test_unparsable_value_warns_and_falls_back_to_default(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("BACKEND_MAX_RESPONSE_BYTES", "lots")
+
+        with caplog.at_level(logging.WARNING):
+            config = BackendConfig.from_env()
+
+        assert config.max_response_bytes == DEFAULT_MAX_RESPONSE_BYTES
+        assert any(
+            "BACKEND_MAX_RESPONSE_BYTES" in r.message and "lots" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize("value", [0, -1, 1024**3 + 1])
+    def test_out_of_range_value_is_rejected(self, value: int) -> None:
+        with pytest.raises(ValidationError, match="max_response_bytes"):
+            BackendConfig(
+                type="jaeger", url=HttpUrl("http://localhost:16686"), max_response_bytes=value
+            )

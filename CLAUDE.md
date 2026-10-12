@@ -156,6 +156,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `BACKEND_NEWRELIC_ACCOUNT_ID` - Required for New Relic backend only: numeric account ID (NerdGraph queries are user-scoped, not account-scoped)
 - `BACKEND_HONEYCOMB_DATASET` - Required for Honeycomb backend only: dataset slug (the Query Data API is dataset-scoped)
 - `BACKEND_TIMEOUT` - Optional: Request timeout (default: 30s)
+- `BACKEND_MAX_RESPONSE_BYTES` - Optional: ceiling on the *decoded* size of any single backend response (default: 64 MiB, range 1 to 1 GiB; `SECONDARY_BACKEND_MAX_RESPONSE_BYTES` for the secondary backend). Enforced in `backends/base.py`'s `_RetryingTransport` (`_BoundedResponse` counts post-`Content-Encoding` bytes on httpx's `aread()` path, so every `response.json()` site and every redirect hop is covered without call-site changes); an oversized body raises `ResponseTooLargeError`, which is not retried
 - `BACKEND_TEMPO_INSTANCE_ID` - Optional for Tempo backend: Grafana Cloud stack/instance ID (Basic Auth with `BACKEND_API_KEY` instead of Bearer auth)
 - `SECONDARY_BACKEND_TYPE` / `SECONDARY_BACKEND_URL` / ... - Optional, opt-in: a second, independently-configured backend for `correlate_trace` (cross-backend correlation) - every `BACKEND_*` variable above has a `SECONDARY_BACKEND_*` equivalent. Env-var only (no CLI override), see `config.py`'s `BackendConfig.from_env_optional`
 - `LOG_LEVEL` - Optional: Logging level (default: INFO)

@@ -25,7 +25,7 @@ from pydantic import HttpUrl
 
 from opentelemetry_mcp import server
 from opentelemetry_mcp.attributes import HealthCheckResponse
-from opentelemetry_mcp.backends.base import BaseBackend
+from opentelemetry_mcp.backends.base import BaseBackend, _RetryingTransport
 from opentelemetry_mcp.backends.datadog import DatadogBackend
 from opentelemetry_mcp.backends.honeycomb import HoneycombBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
@@ -202,6 +202,18 @@ class TestCreateBackend:
         assert backend.dataset == FAKE_HONEYCOMB_DATASET
         assert backend.timeout == 16.0
 
+    def test_applies_max_response_bytes_from_config(self) -> None:
+        """Like slow_request_threshold_ms, not a constructor parameter -
+        applied uniformly after construction so every backend's transport
+        gets the operator's BACKEND_MAX_RESPONSE_BYTES."""
+        config = _config(type="jaeger", max_response_bytes=123456)
+        backend = server._create_backend(config)
+
+        assert backend.max_response_bytes == 123456
+        transport = backend.client._transport
+        assert isinstance(transport, _RetryingTransport)
+        assert transport._max_response_bytes == 123456
+
     def test_unsupported_backend_type_raises(self) -> None:
         config = _config(type="jaeger")
         # BackendConfig.type is a Literal, so bypass validation to simulate
@@ -347,6 +359,26 @@ class TestGetSecondaryBackend:
         assert second is fake_backend
         mock_build.assert_called_once_with(server._config.secondary_backend)
         fake_backend.health_check.assert_awaited_once()
+
+    async def test_applies_secondary_max_response_bytes(self) -> None:
+        server._config = _config()
+        server._config.secondary_backend = BackendConfig(
+            type="sentry",
+            url=HttpUrl("https://sentry.io"),
+            sentry_org=FAKE_SENTRY_ORG,
+            max_response_bytes=654321,
+        )
+        fake_backend = AsyncMock(spec=BaseBackend)
+        fake_backend.health_check = AsyncMock(
+            return_value=HealthCheckResponse(
+                status="healthy", backend="sentry", url="https://sentry.io"
+            )
+        )
+
+        with patch.object(server, "_build_backend_from_config", return_value=fake_backend):
+            await server._get_secondary_backend()
+
+        assert fake_backend.max_response_bytes == 654321
 
     async def test_health_check_exception_is_swallowed(self) -> None:
         server._config = _config()

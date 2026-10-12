@@ -105,6 +105,14 @@
           "default": "30"
         },
         {
+          "name": "BACKEND_MAX_RESPONSE_BYTES",
+          "description": "Ceiling on the decoded size of any single backend response, in bytes (1 to 1073741824). An oversized body is refused before it is buffered or parsed.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "number",
+          "default": "67108864"
+        },
+        {
           "name": "LOG_LEVEL",
           "description": "Logging level.",
           "isRequired": false,

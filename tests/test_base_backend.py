@@ -9,16 +9,21 @@ the shared `client` property in base.py.
 """
 
 import asyncio
+import gzip
+import json
 import logging
 import time
+from collections.abc import AsyncIterator
 
 import httpx
 import pytest
 
 from opentelemetry_mcp.backends.base import (
+    DEFAULT_MAX_RESPONSE_BYTES,
     BaseBackend,
     MetadataEndpointBlockedError,
     RedirectTargetBlockedError,
+    ResponseTooLargeError,
     _RetryingTransport,
 )
 from opentelemetry_mcp.backends.datadog import DatadogBackend
@@ -539,6 +544,209 @@ def test_backend_clients_pin_the_configured_host(backend: BaseBackend) -> None:
 
     assert isinstance(client._transport, _RetryingTransport)
     assert client._transport._allowed_host == "backend.example"
+
+
+_ONE_MIB = 1024 * 1024
+
+
+def _gzip_json_body(pad_bytes: int) -> bytes:
+    return gzip.compress(json.dumps({"data": ["svc-a"], "pad": "a" * pad_bytes}).encode())
+
+
+def _gzip_response(gz: bytes) -> httpx.Response:
+    """stream= (not content=) so decoding happens on the client's read path,
+    exactly as in production - httpx pre-reads content= at construction."""
+    return httpx.Response(
+        200,
+        headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
+        stream=httpx.ByteStream(gz),
+    )
+
+
+class _RecordingStream(httpx.AsyncByteStream):
+    """A body stream that records whether anyone ever iterated or closed it."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.reads = 0
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.reads += 1
+        yield self._data
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class TestBoundedResponse:
+    """A backend (or redirect target) must never be able to materialize an
+    unbounded decoded body in the shared server process: a ~1 KB gzip
+    member inflates ~1000x on the client's read path, before any backend
+    code sees the response. The bound lives in the transport, the one point
+    every httpx backend shares, and counts DECODED bytes."""
+
+    async def test_gzip_body_over_cap_is_rejected_before_parse(self) -> None:
+        gz = _gzip_json_body(2 * _ONE_MIB)
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return _gzip_response(gz)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            with pytest.raises(ResponseTooLargeError, match="BACKEND_MAX_RESPONSE_BYTES"):
+                await client.get("/api/services")
+
+        # Not retryable: the same backend would send the same body again.
+        assert call_count == 1
+        assert len(gz) < 16 * 1024  # the wire size really was tiny
+
+    async def test_gzip_body_under_cap_still_parses(self) -> None:
+        gz = _gzip_json_body(64 * 1024)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return _gzip_response(gz)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/api/services")
+
+        assert response.status_code == 200
+        assert response.json()["data"] == ["svc-a"]
+        assert len(response.json()["pad"]) == 64 * 1024
+
+    async def test_declared_content_length_over_cap_is_rejected_early(self) -> None:
+        """Content-Length is the WIRE size, so it can only ever reject a body
+        that is oversized before decoding - but when it does, the body
+        stream must never be read at all, and the connection released."""
+        stream = _RecordingStream(b"x" * 16)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"Content-Length": str(_ONE_MIB + 1)}, stream=stream)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            with pytest.raises(ResponseTooLargeError, match="Content-Length"):
+                await client.get("/api/services")
+
+        assert stream.reads == 0
+        assert stream.closed is True
+
+    async def test_non_numeric_content_length_is_ignored_and_body_counted(self) -> None:
+        gz = _gzip_json_body(2 * _ONE_MIB)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            response = _gzip_response(gz)
+            response.headers["Content-Length"] = "not-a-number"
+            return response
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            with pytest.raises(ResponseTooLargeError):
+                await client.get("/api/services")
+
+    async def test_redirect_target_body_is_bounded(self) -> None:
+        gz = _gzip_json_body(2 * _ONE_MIB)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/services":
+                return httpx.Response(302, headers={"Location": "http://backend.test/bomb"})
+            return _gzip_response(gz)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler),
+            max_response_bytes=_ONE_MIB,
+            allowed_host="backend.test",
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            with pytest.raises(ResponseTooLargeError):
+                await client.get("/api/services")
+
+    async def test_identity_body_exactly_at_cap_is_allowed(self) -> None:
+        body = b"a" * _ONE_MIB
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, stream=httpx.ByteStream(body))
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/blob")
+
+        assert len(response.content) == _ONE_MIB
+
+    async def test_jaeger_list_services_respects_max_response_bytes(self) -> None:
+        """End to end through a real backend method: the production
+        transport construction (BaseBackend._create_transport) with only the
+        innermost transport swapped for a mock."""
+        gz_big = _gzip_json_body(2 * _ONE_MIB)
+        gz_small = _gzip_json_body(1024)
+        serve_big = True
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return _gzip_response(gz_big if serve_big else gz_small)
+
+        backend = JaegerBackend(url="http://backend.test")
+        backend.max_response_bytes = _ONE_MIB
+        transport = backend._create_transport()
+        transport._wrapped = httpx.MockTransport(handler)
+        backend._client = httpx.AsyncClient(base_url=backend.url, transport=transport)
+        try:
+            with pytest.raises(ResponseTooLargeError):
+                await backend.list_services()
+            serve_big = False
+            assert await backend.list_services() == ["svc-a"]
+        finally:
+            await backend.close()
+
+    def test_transport_default_cap_is_the_module_default(self) -> None:
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(lambda r: httpx.Response(200)))
+
+        assert transport._max_response_bytes == DEFAULT_MAX_RESPONSE_BYTES
+        assert DEFAULT_MAX_RESPONSE_BYTES == 64 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        JaegerBackend(url="https://backend.example:16686"),
+        DatadogBackend(url="https://backend.example", api_key="k", app_key="a"),
+        NewRelicBackend(url="https://backend.example/graphql", api_key="k", account_id="1"),
+        HoneycombBackend(url="https://backend.example", api_key="k", dataset="d"),
+    ],
+    ids=["base", "datadog", "newrelic", "honeycomb"],
+)
+def test_backend_clients_forward_max_response_bytes_to_transport(backend: BaseBackend) -> None:
+    """max_response_bytes follows slow_request_threshold_ms's own
+    post-construction-attribute pattern and must reach the transport through
+    every backend's client, vendor overrides included."""
+    assert backend.max_response_bytes == DEFAULT_MAX_RESPONSE_BYTES
+    backend.max_response_bytes = 4096
+
+    client = backend.client
+
+    assert isinstance(client._transport, _RetryingTransport)
+    assert client._transport._max_response_bytes == 4096
 
 
 class TestRetryOn429:
