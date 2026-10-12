@@ -53,28 +53,50 @@ jobs:
         # --no-deps forbids any resolution outside the file.
         run: pip install --require-hashes --no-deps -r .github/requirements-release.txt
 
+      - name: Configure git identity for the bump commit
+        # commitizen-action used to do this unconditionally from its inputs;
+        # the runner-side `cz bump` below commits with whatever git has.
+        run: |
+          git config user.name "sairam0424"
+          git config user.email "uggesairam0000@gmail.com"
+
       - name: Bump version
         id: cz
-        uses: commitizen-tools/commitizen-action@338bbd841b75aaee6bf5340e1fa12f6ab58ff9ff  # master (no tagged releases; pinned snapshot, re-pin periodically)
-        with:
-          # Same reason as the checkout step above: this action does the
-          # actual `git push` of the bump commit, which needs a token the
-          # main-protection ruleset's bypass covers.
-          github_token: ${{ secrets.RELEASE_PAT }}
-          increment: ${{ github.event.inputs.increment }}
-          # Deliberately NOT using changelog_increment_filename: that makes the
-          # action run `cz bump --changelog-to-stdout > body.md`, and everything
-          # else cz prints to stdout lands in the file too - the `git commit`
-          # summary ("[main <sha>] bump: ..." / "N files changed") was the last
-          # two lines of every GitHub Release body from v0.2.0 to v0.12.3, and
-          # the pre_bump_hooks banner ("Running hook ...") would join it now.
-          # The notes are rendered by the step below instead.
-          # The action's own entrypoint runs `git config --local user.name/email`
-          # unconditionally using these inputs (default: github-actions[bot]) --
-          # a standalone `git config` step earlier in this job has no effect,
-          # since this overwrites it right before the bump commit is made.
-          git_name: "sairam0424"
-          git_email: "uggesairam0000@gmail.com"
+        # Runner-side replacement for commitizen-tools/commitizen-action: that
+        # action is `FROM python:3.10-alpine` (mutable tag) and ran
+        # `pip install commitizen` at step start, i.e. two run-time-resolved
+        # code sources inside the job that holds RELEASE_PAT. The `cz` used
+        # here is the hash-pinned one installed above; the pre_bump_hook from
+        # .cz.toml runs on this runner under setup-python 3.13.
+        #
+        # `--no-raise 21`: exit 21 (NO_INCREMENT) means a run with no
+        # bump-worthy commits (e.g. docs-only) - treat it as success and leave
+        # steps.cz.outputs.version pointing at the CURRENT (unchanged) version,
+        # exactly like the action's `no_raise: 21`, so the already-released
+        # check below turns the rest of the workflow into a no-op.
+        env:
+          INCREMENT: ${{ github.event.inputs.increment }}
+        run: |
+          args=(bump --yes)
+          if [[ -n "$INCREMENT" ]]; then
+            args+=(--increment "$INCREMENT")
+          fi
+          cz --no-raise 21 "${args[@]}"
+          echo "version=$(cz version --project)" >> "$GITHUB_OUTPUT"
+
+      - name: Push bump commit and tag
+        # The checkout did not persist RELEASE_PAT, so authenticate this one
+        # push with a per-step extraheader: the PAT is never written to
+        # .git/config or into a remote URL. Pushes HEAD and exactly the tag cz
+        # just created (never --tags). When nothing was bumped, HEAD and the
+        # tag already exist upstream and this is a no-op.
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+          NEW_VERSION: ${{ steps.cz.outputs.version }}
+        run: |
+          auth="$(printf 'x-access-token:%s' "$RELEASE_PAT" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push origin HEAD:main "refs/tags/v${NEW_VERSION}"
 
       - name: Print version info
         run: |
@@ -86,7 +108,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # commitizen-action's no_raise: 21 means a run with no bump-worthy
+          # `cz --no-raise 21` above means a run with no bump-worthy
           # commits (e.g. docs-only) exits 0 rather than failing, but leaves
           # steps.cz.outputs.version pointing at the CURRENT (unchanged)
           # version, not a new one. Without this check, the next two steps

@@ -9,10 +9,12 @@ to follow (it did for 0.12.2 and 0.12.3). This hook rewrites just that one
 block so the bump commit (`git commit -a`) carries the lockfile too and the
 release tag points at a fully consistent tree.
 
-Runs INSIDE commitizen-action's container (python:3.10-alpine, no uv), with
-the new version in CZ_PRE_NEW_VERSION - so: stdlib only, no tomllib (3.11+),
-no `uv lock`. Exits non-zero on anything unexpected: a failed hook aborts the
-bump before the commit, which is the loud failure we want.
+Runs on the release workflow's ubuntu runner (setup-python 3.13, the
+hash-pinned `cz` from .github/requirements-release.txt), with the new version
+in CZ_PRE_NEW_VERSION. Kept stdlib only - no tomllib (so it also runs on
+3.10), no `uv lock` - so it has no dependency of its own to pin. Exits
+non-zero on anything unexpected: a failed hook aborts the bump before the
+commit, which is the loud failure we want.
 
 Usage (from .cz.toml):  pre_bump_hooks = ["python3 scripts/sync_uv_lock_version.py"]
 Manual check:           CZ_PRE_NEW_VERSION=1.2.3 python3 scripts/sync_uv_lock_version.py

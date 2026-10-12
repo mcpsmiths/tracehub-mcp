@@ -23,6 +23,8 @@ RELEASE_YML = WORKFLOWS_DIR / "release.yml"
 DEPENDABOT_YML = REPO_ROOT / ".github" / "dependabot.yml"
 REQUIREMENTS_RELEASE = REPO_ROOT / ".github" / "requirements-release.txt"
 SECURITY_MD = REPO_ROOT / "SECURITY.md"
+CZ_TOML = REPO_ROOT / ".cz.toml"
+SYNC_HOOK = REPO_ROOT / "scripts" / "sync_uv_lock_version.py"
 
 Step = dict[str, Any]
 Job = dict[str, Any]
@@ -176,3 +178,74 @@ def test_no_secret_is_interpolated_into_a_run_body() -> None:
         if pattern.search(_run(step))
     ]
     assert offenders == [], offenders
+
+
+# --- bump-version: no Docker action resolving code at run time --------------------
+
+
+def _bump_version_steps() -> list[Step]:
+    return _steps(_jobs(_load_yaml(RELEASE_YML))["bump-version"])
+
+
+def test_release_no_longer_uses_commitizen_action() -> None:
+    """commitizen-action is `FROM python:3.10-alpine` (mutable tag) and runs
+    `pip install commitizen` at step start - two run-time-resolved code
+    sources inside the job that holds RELEASE_PAT."""
+    offenders = [
+        _uses(step)
+        for job in _jobs(_load_yaml(RELEASE_YML)).values()
+        for step in _steps(job)
+        if _uses(step).startswith("commitizen-tools/commitizen-action")
+    ]
+    assert offenders == [], offenders
+
+
+def test_cz_bump_runs_on_the_runner_from_the_hashed_install() -> None:
+    steps = _bump_version_steps()
+    install_idx = _step_index(steps, lambda s: "requirements-release.txt" in _run(s))
+    identity_idx = _step_index(steps, lambda s: "git config user.name" in _run(s))
+    cz_idx = _step_index(steps, lambda s: s.get("id") == "cz")
+    cz_run = _run(steps[cz_idx])
+    assert "cz --no-raise 21" in cz_run, cz_run
+    assert "version=" in cz_run and "GITHUB_OUTPUT" in cz_run, cz_run
+    assert "uses" not in steps[cz_idx], "the bump must be a run: step, not an action"
+    assert install_idx < cz_idx, "cz must be installed (hash-pinned) before it runs"
+    assert identity_idx < cz_idx, "git identity must be configured before the bump commit"
+
+
+def test_bump_commit_and_tag_are_pushed_with_a_per_step_header() -> None:
+    steps = _bump_version_steps()
+    cz_idx = _step_index(steps, lambda s: s.get("id") == "cz")
+    push_idx = _step_index(steps, lambda s: "push origin HEAD:main" in _run(s))
+    push_run = _run(steps[push_idx])
+    assert push_idx > cz_idx
+    assert "http.https://github.com/.extraheader" in push_run, push_run
+    assert "refs/tags/v" in push_run, "exactly one tag is pushed, never --tags"
+    assert "--tags" not in push_run, push_run
+    assert steps[push_idx].get("env", {}).get("RELEASE_PAT") == "${{ secrets.RELEASE_PAT }}"
+
+
+def test_release_pat_reaches_only_the_checkout_token_and_the_push_step_env() -> None:
+    """The PAT may be handed to actions/checkout (clone only, not persisted)
+    and to the push step as a step-level env var; nowhere else, and never
+    inline in a run body."""
+    locations: list[tuple[str, str]] = []
+    for job_name, job in _jobs(_load_yaml(RELEASE_YML)).items():
+        for step in _steps(job):
+            assert "secrets.RELEASE_PAT" not in _run(step), (job_name, step.get("name"))
+            for key, value in _with(step).items():
+                if "secrets.RELEASE_PAT" in str(value):
+                    locations.append(("with", key))
+            env = step.get("env", {})
+            for key, value in env.items() if isinstance(env, dict) else []:
+                if "secrets.RELEASE_PAT" in str(value):
+                    locations.append(("env", key))
+    assert sorted(locations) == [("env", "RELEASE_PAT"), ("with", "token")], locations
+
+
+def test_pre_bump_hook_docs_no_longer_describe_the_action_container() -> None:
+    """The hook now runs on the ubuntu runner under setup-python 3.13."""
+    cz_text = CZ_TOML.read_text(encoding="utf-8")
+    hook_text = SYNC_HOOK.read_text(encoding="utf-8")
+    assert "container" not in cz_text and "python:3.10-alpine" not in cz_text
+    assert "python:3.10-alpine" not in hook_text and "INSIDE commitizen-action" not in hook_text
