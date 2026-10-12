@@ -2,8 +2,16 @@ name: Publish to MCP Registry
 
 # Publishes server.json to the official MCP Registry
 # (registry.modelcontextprotocol.io) via GitHub OIDC - no stored token
-# required. The io.github.mcpsmiths/* namespace is authorized because this
-# workflow runs in the mcpsmiths org/repo server.json itself declares.
+# required. The registry's github-oidc grant for io.github.mcpsmiths/* is
+# REPO-scoped, not ref-scoped: any ref of this repository can mint a token
+# that may publish under the namespace. The job therefore (1) runs under the
+# `release` environment (deployment-branch policy: main; evaluated against
+# the caller's ref on the workflow_call path), (2) checks out exactly
+# refs/tags/v<version> and verifies HEAD is that tag's commit, and
+# (3) asserts server.json's identity (name, single pypi package named
+# tracehub-mcp, both version fields) with scripts/check_server_json.py
+# before anything is published - so the entry for version X is always tag
+# vX's server.json for this project's own distribution.
 # Adopts the pattern verified live in github.com/docling-project/docling-mcp's
 # own publish-mcp.yml: poll PyPI for the release to actually be live (closes
 # the exact race that caused a stale-registry incident before this workflow
@@ -24,14 +32,13 @@ on:
         required: true
         type: string
   workflow_dispatch:
+    # No `ref` input: a manual re-publish is bound to refs/tags/v<version>,
+    # matching the workflow_call contract above (release.yml passes the tag
+    # it just created). Publishing server.json from a non-tag ref was never a
+    # documented procedure.
     inputs:
-      ref:
-        description: Git ref whose server.json should be published
-        required: true
-        default: main
-        type: string
       version:
-        description: The version to sync server.json to before publishing
+        description: The released version (e.g. 0.5.0) whose tag's server.json should be published
         required: true
         type: string
 
@@ -54,7 +61,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
-          ref: ${{ inputs.ref }}
+          # workflow_call: the tag release.yml just made; workflow_dispatch:
+          # the tag derived from the version input. Never a caller-chosen ref.
+          ref: ${{ inputs.ref || format('refs/tags/v{0}', inputs.version) }}
+          fetch-depth: 0  # tags are needed for the guard below
+          persist-credentials: false
 
       - name: Validate version input format
         env:
@@ -62,6 +73,15 @@ jobs:
         run: |
           if ! [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::version input '${NEW_VERSION}' is not a valid semver (expected X.Y.Z or X.Y.Z-prerelease)"
+            exit 1
+          fi
+
+      - name: Verify checkout is the release tag
+        env:
+          NEW_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse "refs/tags/v${NEW_VERSION}^{commit}")" ]; then
+            echo "::error::HEAD is not tag v${NEW_VERSION}"
             exit 1
           fi
 
@@ -75,12 +95,24 @@ jobs:
           mv server.json.tmp server.json
           cat server.json | jq '{name, version, package_version: .packages[0].version}'
 
+      - name: Assert server.json identity
+        # Fails closed unless .name, exactly one pypi package whose identifier
+        # is tracehub-mcp, and both version fields are what this project
+        # publishes - the semver check above and the jq sync never looked at
+        # the identity fields.
+        env:
+          NEW_VERSION: ${{ inputs.version }}
+        run: python3 scripts/check_server_json.py --expect-version "$NEW_VERSION" server.json
+
       - name: Wait for PyPI to serve the release with the ownership marker
         run: |
           name="$(jq -r '.name' server.json)"
-          echo "Waiting for PyPI tracehub-mcp ${NEW_VERSION} with marker 'mcp-name: ${name}'"
+          # Derived from the identifier the step above just asserted, so the
+          # poll and the published entry can never name different distributions.
+          identifier="$(jq -r '.packages[0].identifier' server.json)"
+          echo "Waiting for PyPI ${identifier} ${NEW_VERSION} with marker 'mcp-name: ${name}'"
           for i in $(seq 1 40); do
-            desc="$(curl -sf "https://pypi.org/pypi/tracehub-mcp/${NEW_VERSION}/json" \
+            desc="$(curl -sf "https://pypi.org/pypi/${identifier}/${NEW_VERSION}/json" \
               | jq -r '.info.description' 2>/dev/null || true)"
             if printf '%s' "$desc" | grep -qF "mcp-name: ${name}"; then
               echo "Ownership marker present on PyPI ${NEW_VERSION}"

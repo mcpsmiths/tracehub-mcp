@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 RELEASE_YML = WORKFLOWS_DIR / "release.yml"
 DOCKER_PUBLISH_YML = WORKFLOWS_DIR / "docker-publish.yml"
+MCP_REGISTRY_YML = WORKFLOWS_DIR / "mcp-registry-publish.yml"
 DEPENDABOT_YML = REPO_ROOT / ".github" / "dependabot.yml"
 REQUIREMENTS_RELEASE = REPO_ROOT / ".github" / "requirements-release.txt"
 SECURITY_MD = REPO_ROOT / "SECURITY.md"
@@ -572,3 +573,52 @@ def test_every_publishing_job_checks_out_an_explicit_release_ref() -> None:
         for checkout in checkouts:
             ref = str(_with(checkout).get("ref", ""))
             assert _RELEASE_REF_RE.match(ref), f"{name}: checkout ref {ref!r} is not a release ref"
+
+
+# --- mcp-registry-publish: the entry for version X is tag vX's server.json ---------
+
+
+def _publish_mcp_steps() -> list[Step]:
+    return _steps(_jobs(_load_yaml(MCP_REGISTRY_YML))["publish-mcp"])
+
+
+def test_mcp_registry_dispatch_exposes_only_the_version_input() -> None:
+    """The dispatch path is bound to refs/tags/v<version>; `ref` stays a
+    workflow_call input because release.yml passes the tag it just made."""
+    triggers = _triggers(_load_yaml(MCP_REGISTRY_YML))
+    assert set(triggers["workflow_dispatch"]["inputs"]) == {"version"}, triggers[
+        "workflow_dispatch"
+    ]
+    assert set(triggers["workflow_call"]["inputs"]) == {"ref", "version"}, triggers["workflow_call"]
+
+
+def test_mcp_registry_checks_out_the_release_tag() -> None:
+    steps = _publish_mcp_steps()
+    checkout = _with(steps[_step_index(steps, lambda s: _uses(s).startswith("actions/checkout"))])
+    ref = str(checkout.get("ref", ""))
+    assert "format('refs/tags/v{0}', inputs.version)" in ref and "inputs.ref ||" in ref, ref
+    assert checkout.get("persist-credentials") is False and checkout.get("fetch-depth") == 0
+
+
+def test_mcp_registry_asserts_identity_and_tag_before_publishing() -> None:
+    steps = _publish_mcp_steps()
+    sync_idx = _step_index(steps, lambda s: ".packages[0].version = $v" in _run(s))
+    guard_idx = _step_index(steps, lambda s: "refs/tags/v${NEW_VERSION}^{commit}" in _run(s))
+    assert_idx = _step_index(steps, lambda s: "scripts/check_server_json.py" in _run(s))
+    poll_idx = _step_index(steps, lambda s: "pypi.org/pypi/" in _run(s))
+    publish_idx = _step_index(steps, lambda s: "mcp-publisher publish" in _run(s))
+    assert guard_idx < publish_idx
+    assert sync_idx < assert_idx < poll_idx < publish_idx
+    assert_run = _run(steps[assert_idx])
+    assert '--expect-version "$NEW_VERSION"' in assert_run and "server.json" in assert_run, (
+        assert_run
+    )
+    assert steps[assert_idx].get("env", {}).get("NEW_VERSION") == "${{ inputs.version }}"
+
+
+def test_mcp_registry_pypi_poll_targets_the_asserted_identifier() -> None:
+    steps = _publish_mcp_steps()
+    poll_run = _run(steps[_step_index(steps, lambda s: "pypi.org/pypi/" in _run(s))])
+    assert "pypi.org/pypi/tracehub-mcp/" not in poll_run, "poll URL must not be hardcoded"
+    assert "jq -r '.packages[0].identifier' server.json" in poll_run, poll_run
+    assert "pypi.org/pypi/${identifier}/${NEW_VERSION}/json" in poll_run, poll_run
