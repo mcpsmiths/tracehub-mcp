@@ -9,7 +9,7 @@ import math
 import re
 import sys
 import time
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, Literal, NoReturn
 
@@ -119,6 +119,22 @@ _READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
 )
 
 
+def _exception_chain(error: BaseException) -> Iterator[BaseException]:
+    """`error` followed by its __cause__ / implicit __context__ links, in
+    the order a traceback prints them. Cycle-safe."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__suppress_context__:
+            current = None
+        else:
+            current = current.__context__
+
+
 def _handle_tool_error(tool_name: str, error: Exception) -> NoReturn:
     """Centralized error handler for tool functions.
 
@@ -128,22 +144,28 @@ def _handle_tool_error(tool_name: str, error: Exception) -> NoReturn:
     CallToolResult(isError=True), per SEP-2140 - a plain successful return
     would leave isError=False even though the tool call failed.
 
-    The one exception to the identity re-raise: when the error text embeds a
+    The one exception to the identity re-raise: when the error text - or that
+    of any exception chained beneath it (__cause__/__context__) - embeds a
     URL userinfo (httpx's HTTPStatusError message carries the request URL
     verbatim, so a credential a bypassed config left in BACKEND_URL would
     otherwise reach the MCP client as tool-error content), a ToolError with
-    the redacted text is raised from it instead - still isError=True, and
-    fastmcp logs a ToolError without exc_info, so no traceback re-prints it.
+    the redacted text is raised from it instead - still isError=True. The
+    chain matters because the identity path ends in fastmcp's generic
+    `except Exception`, whose logger.exception() prints every chained cause
+    through the 'fastmcp' logger's own RichHandler - that logger does not
+    propagate to the root handler, so UserinfoRedactingFilter never sees it.
+    fastmcp logs a ToolError with exc_info=False, so nothing re-prints the
+    chain.
 
     Args:
         tool_name: Name of the tool that encountered the error
         error: The exception that was raised
     """
-    message = str(error)
-    redacted = redact_userinfo_in_text(message)
-    if redacted == message:
+    messages = [str(link) for link in _exception_chain(error)]
+    if all(redact_userinfo_in_text(text) == text for text in messages):
         logger.error(f"Error executing {tool_name}: {error}", exc_info=True)
         raise error
+    redacted = redact_userinfo_in_text(messages[0])
     # The traceback's final line would repeat the raw message: log without it.
     logger.error(f"Error executing {tool_name}: {redacted}")
     raise ToolError(redacted) from error

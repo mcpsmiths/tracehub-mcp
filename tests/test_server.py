@@ -33,7 +33,7 @@ from opentelemetry_mcp import server
 from opentelemetry_mcp.attributes import HealthCheckResponse
 from opentelemetry_mcp.backends.base import BaseBackend, _RetryingTransport
 from opentelemetry_mcp.backends.datadog import DatadogBackend
-from opentelemetry_mcp.backends.honeycomb import HoneycombBackend
+from opentelemetry_mcp.backends.honeycomb import HoneycombBackend, HoneycombEnterpriseRequiredError
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
 from opentelemetry_mcp.backends.newrelic import NewRelicBackend
 from opentelemetry_mcp.backends.sentry import SentryBackend
@@ -368,6 +368,41 @@ class TestHandleToolError:
         assert "h.test/api/services" in str(exc_info.value)
         assert marker not in caplog.text  # message AND any formatted traceback
         assert "list_services" in caplog.text
+
+    def test_credential_bearing_cause_also_becomes_a_redacted_tool_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The whole chain is judged, not just the top message: honeycomb
+        raises HoneycombEnterpriseRequiredError `from` the HTTPStatusError
+        whose text embeds the request URL. An identity re-raise would land
+        in fastmcp's generic `except Exception`, whose logger.exception()
+        prints the chained cause through the 'fastmcp' logger's own
+        RichHandler - that logger does not propagate to the root handler,
+        so UserinfoRedactingFilter never sees it. ToolError is logged by
+        fastmcp with exc_info=False, so the chain is never printed."""
+        marker = "VFY-PW-cause"
+        request = httpx.Request("POST", f"https://u:{marker}@h.test/1/queries/ds")
+        cause = httpx.HTTPStatusError(
+            f"Client error '403 Forbidden' for url 'https://u:{marker}@h.test/1/queries/ds'",
+            request=request,
+            response=httpx.Response(403, request=request),
+        )
+        try:
+            raise HoneycombEnterpriseRequiredError(
+                "Honeycomb backend requires an Enterprise-tier account (HTTP 403)"
+            ) from cause
+        except HoneycombEnterpriseRequiredError as chained:
+            error = chained
+
+        with caplog.at_level("ERROR"), pytest.raises(ToolError) as exc_info:
+            server._handle_tool_error("search_traces", error)
+
+        assert exc_info.value.__cause__ is error
+        assert str(exc_info.value) == str(error)
+        (record,) = caplog.records
+        assert record.exc_info is None
+        assert marker not in caplog.text
+        assert "search_traces" in caplog.text
 
 
 class TestGetBackend:
@@ -2025,6 +2060,27 @@ class TestConfigErrorsNeverEchoUserinfo:
         (record,) = [r for r in caplog.records if "Configuration error" in r.message]
         assert record.exc_info is None
         assert "[REDACTED]@h.test" in record.message
+
+    def test_password_containing_at_in_backend_url_env_var_is_fully_redacted(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """pydantic accepts a literal '@' inside the password (WHATWG: host
+        h.test, password p%40<marker>) and echoes the raw string in
+        input_value; a first-'@' redaction would leave the password's tail
+        in the one message guaranteed to be emitted for a rejected URL."""
+        monkeypatch.setenv("BACKEND_URL", f"https://u:p@{self.MARKER}@h.test")
+        runner = CliRunner()
+        with caplog.at_level(logging.ERROR), patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(server.main, ["--print-config"])
+
+        assert result.exit_code == 1
+        assert self.MARKER not in result.output
+        assert self.MARKER not in caplog.text
+        (record,) = [r for r in caplog.records if "Configuration error" in r.message]
+        assert record.exc_info is None
+        assert "[REDACTED]@h.test" in record.message
+        assert "p@" not in record.message
 
     def test_doctor_prints_a_redacted_configuration_failure(self) -> None:
         runner = CliRunner()
