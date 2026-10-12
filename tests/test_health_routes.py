@@ -12,10 +12,13 @@ pattern for mocking _get_backend.
 
 from unittest.mock import AsyncMock, patch
 
+from starlette.middleware import Middleware
 from starlette.testclient import TestClient
 
 from opentelemetry_mcp import server
 from opentelemetry_mcp.attributes import HealthCheckResponse
+from opentelemetry_mcp.server import OriginValidationMiddleware
+from tests.streamable_http_client import post_initialize
 
 
 def _healthy_backend() -> AsyncMock:
@@ -100,6 +103,45 @@ def test_ready_returns_503_when_get_backend_itself_raises() -> None:
 
     assert response.status_code == 503
     assert response.json()["error"] == "Server configuration not set"
+
+
+class TestReadyBehindHostValidation:
+    """/ready drives real backend calls, so a DNS-rebound browser's
+    Origin-less GET must be refused by the Host check before the route runs
+    when the listener is loopback-bound (the shape main() now defaults to)."""
+
+    def _build_client(self) -> TestClient:
+        app = server.mcp.http_app(
+            transport="streamable-http",
+            middleware=[Middleware(OriginValidationMiddleware, bind_host="127.0.0.1")],
+        )
+        return TestClient(app)
+
+    def test_foreign_host_without_origin_is_421_and_touches_no_backend(self) -> None:
+        fake_backend = _healthy_backend()
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with self._build_client() as client:
+                response = client.get("/ready", headers={"host": "attacker.example:8000"})
+
+        assert response.status_code == 421
+        fake_backend.health_check.assert_not_awaited()
+        fake_backend.list_services.assert_not_awaited()
+
+    def test_loopback_host_still_reaches_ready(self) -> None:
+        fake_backend = _healthy_backend()
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with self._build_client() as client:
+                response = client.get("/ready", headers={"host": "localhost:8000"})
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "ready"
+
+    def test_loopback_host_still_opens_an_mcp_session(self) -> None:
+        with self._build_client() as client:
+            response = post_initialize(client, headers={"host": "127.0.0.1:8000"})
+
+        assert response.status_code == 200
+        assert response.headers.get("mcp-session-id")
 
 
 def test_ready_never_closes_the_cached_backend() -> None:

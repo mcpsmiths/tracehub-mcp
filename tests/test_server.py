@@ -1126,6 +1126,9 @@ class TestMainCli:
         middleware = http_app_kwargs["middleware"]
         assert len(middleware) == 2
         assert middleware[0].cls is server.OriginValidationMiddleware
+        # The bound address drives automatic Host validation for loopback
+        # binds; --allowed-hosts is None unless the operator names hosts.
+        assert middleware[0].kwargs == {"bind_host": "127.0.0.1", "allowed_hosts": None}
         assert middleware[1].cls is server.RateLimitMiddleware
 
         mock_server_cls.assert_called_once()
@@ -1134,6 +1137,25 @@ class TestMainCli:
         assert config_arg.host == "127.0.0.1"
         assert config_arg.port == 9001
         mock_server_cls.return_value.serve.assert_awaited_once()
+
+    def test_allowed_hosts_flag_is_parsed_into_the_origin_middleware(self) -> None:
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(
+                server.main,
+                ["--transport", "http", "--allowed-hosts", "tracehub.example, 10.0.0.5"],
+            )
+
+        assert result.exit_code == 0, result.output
+        middleware = mock_mcp.http_app.call_args.kwargs["middleware"]
+        assert middleware[0].kwargs == {
+            "bind_host": "127.0.0.1",
+            "allowed_hosts": ["tracehub.example", "10.0.0.5"],
+        }
 
     def test_session_idle_timeout_flag_is_forwarded(self) -> None:
         runner = CliRunner()
@@ -1378,6 +1400,7 @@ class TestPrintConfigFlag:
         assert resolved["allow_unauthenticated_http"] is False
         assert resolved["session_idle_timeout_seconds"] == 1800.0
         assert resolved["stateless_http"] is False
+        assert resolved["allowed_hosts"] is None
 
 
 class TestDoctorCli:

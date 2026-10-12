@@ -2,12 +2,13 @@
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import re
 import sys
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, Literal, NoReturn
 
@@ -1308,8 +1309,70 @@ def _validate_http_listener_auth(
 _LOCAL_ORIGIN_PATTERN = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$", re.IGNORECASE)
 
 
+def _parse_csv_option(value: str | None) -> list[str] | None:
+    """Comma-separated CLI/env value -> trimmed, non-empty items; None stays None
+    so callers can tell "not configured" from "configured empty"."""
+    if value is None:
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _hostname_from_host_header(value: str) -> str:
+    """Lower-cased host part of a Host header value: ``[v6]:port`` -> ``v6``,
+    ``name:port`` -> ``name``, a missing/blank header -> ``""``."""
+    value = value.strip().lower()
+    if not value:
+        return ""
+    if value.startswith("["):
+        end = value.find("]")
+        return value[1:end] if end != -1 else value[1:]
+    if value.count(":") > 1:
+        # Bare IPv6 literal (not valid in a Host header, but never a port).
+        return value
+    host, _, port = value.rpartition(":")
+    if host and port.isdigit():
+        return host
+    return value
+
+
+def _is_unspecified_address(hostname: str) -> bool:
+    """True for the wildcard binds 0.0.0.0 / :: - a listener bound there has
+    no single legitimate name to add to a Host allowlist."""
+    try:
+        return ipaddress.ip_address(hostname).is_unspecified
+    except ValueError:
+        return False
+
+
 class OriginValidationMiddleware(BaseHTTPMiddleware):
-    """Validate the Origin header on requests to the streamable-http transport.
+    """Validate the Host and Origin headers on requests to the streamable-http
+    transport.
+
+    Host rule (DNS-rebinding defence proper). A page served from
+    ``attacker.example`` whose name is then re-pointed at 127.0.0.1 issues a
+    same-origin GET that carries ``Host: attacker.example:8000`` and - per
+    the Fetch standard for same-origin GET/HEAD - no Origin header at all,
+    so an Origin-only check lets it reach /ready and /mcp. When the
+    legitimate names are known the Host header is therefore checked *first*:
+    automatically for a loopback bind (``--host 127.0.0.1`` / ``localhost`` /
+    ``::1``, main()'s default), and for any deployment that sets
+    ``--allowed-hosts``. Accepted names are every loopback spelling, the
+    bound address itself when it is a specific (non-wildcard) address, and
+    the ``--allowed-hosts`` entries, compared case-insensitively with the
+    port stripped; anything else answers ``421 Misdirected Request`` before
+    any route runs. A wildcard bind (``0.0.0.0`` / ``::``, the Dockerfile
+    CMD) has no single legitimate name, so it performs no Host validation
+    unless ``--allowed-hosts`` names the public hostnames; ``--allowed-hosts
+    '*'`` is the explicit opt-out. Constructed with no kwargs (bind_host and
+    allowed_hosts both None) the middleware keeps its pre-existing
+    Origin-only contract.
+
+    Origin rule. fastmcp 3.2.0 built its StreamableHTTPSessionManager without
+    passing security_settings through at all, leaving the upstream mcp SDK's
+    own DNS-rebinding/Origin protection (mcp.server.transport_security)
+    disabled by omission. Re-verified against the real installed fastmcp
+    4.0.5 (fastmcp/server/http.py:668-682, not assumed unchanged from
+    3.2.0): the gap is now an explicit, unconditional
 
     fastmcp 3.2.0 built its StreamableHTTPSessionManager without passing
     security_settings through at all, leaving the upstream mcp SDK's own
@@ -1327,10 +1390,14 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     `mcp.http_app(transport=..., middleware=[...])` call never sets it - so
     fastmcp's own native alternative is never actually inserted for this
     deployment, and the underlying SDK protection stays disabled either way.
-    This middleware remains fully necessary, unchanged, satisfying the MCP
-    spec's (2025-06-18 basic/transports) MUST-requirement for Streamable HTTP
+    This middleware remains fully necessary, satisfying the MCP spec's
+    (2025-06-18 basic/transports) MUST-requirement for Streamable HTTP
     servers to validate the Origin header regardless of which fastmcp
-    version is running.
+    version is running. fastmcp's guard was deliberately not adopted for the
+    Host rule either: once given an explicit allowlist it also enforces its
+    own Origin policy, which rejects the local-dev Origin allowance below
+    whenever the Host is a non-loopback name - the in-repo check keeps one
+    allowlist and the Origin semantics byte-for-byte.
 
     A request with no Origin header is allowed through unmodified: Origin can
     be absent for same-origin requests, and most MCP HTTP clients are not
@@ -1355,7 +1422,34 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     close.
     """
 
+    def __init__(
+        self,
+        app: Any,
+        bind_host: str | None = None,
+        allowed_hosts: Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(app)
+        self._validate_host = allowed_hosts is not None or is_loopback_host(bind_host)
+        self._host_wildcard = allowed_hosts is not None and "*" in allowed_hosts
+        allowlist: set[str] = set()
+        if bind_host:
+            bound = _hostname_from_host_header(bind_host)
+            if bound and not _is_unspecified_address(bound):
+                allowlist.add(bound)
+        for name in allowed_hosts or ():
+            normalized = _hostname_from_host_header(name)
+            if normalized and normalized != "*":
+                allowlist.add(normalized)
+        self._host_allowlist = frozenset(allowlist)
+
+    def _host_is_allowed(self, request: Request) -> bool:
+        hostname = _hostname_from_host_header(request.headers.get("host", ""))
+        return is_loopback_host(hostname) or hostname in self._host_allowlist
+
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        if self._validate_host and not self._host_wildcard and not self._host_is_allowed(request):
+            logger.warning(f"Unexpected Host header: {request.headers.get('host', '')!r}")
+            return Response("Misdirected Request", status_code=421)
         origin = request.headers.get("origin")
         if origin and not _LOCAL_ORIGIN_PATTERN.match(origin):
             logger.warning(f"Invalid Origin header: {origin}")
@@ -1756,6 +1850,18 @@ def _backend_config_options(f: Any) -> Any:
     "MCP_ALLOW_UNAUTHENTICATED_HTTP env var)",
 )
 @click.option(
+    "--allowed-hosts",
+    type=str,
+    default=None,
+    envvar="MCP_ALLOWED_HOSTS",
+    help="Comma-separated hostnames/IP literals accepted in the Host header "
+    "besides loopback names and the bound address; any other Host answers 421 "
+    "(DNS-rebinding defence). A loopback --host validates Host automatically; "
+    "a network bind only validates when this is set; the single value '*' "
+    "disables Host validation (only for --transport http, overrides "
+    "MCP_ALLOWED_HOSTS env var)",
+)
+@click.option(
     "--include-args-in-spans",
     is_flag=True,
     default=False,
@@ -1900,6 +2006,7 @@ def main(
     port: int,
     http_bearer_token: str | None,
     allow_unauthenticated_http: bool,
+    allowed_hosts: str | None,
     include_args_in_spans: bool,
     log_level: str | None,
     max_traces_per_query: int | None,
@@ -2028,6 +2135,7 @@ def main(
                 "port": port,
                 "http_bearer_token_set": http_bearer_token is not None,
                 "allow_unauthenticated_http": allow_unauthenticated_http,
+                "allowed_hosts": allowed_hosts,
                 "include_args_in_spans": include_args_in_spans,
                 "disable_tools": disable_tools,
                 "enabled_tools": enabled_tools,
@@ -2079,7 +2187,13 @@ def main(
                     host,
                     port,
                 )
-            middleware = [Middleware(OriginValidationMiddleware)]
+            middleware = [
+                Middleware(
+                    OriginValidationMiddleware,
+                    bind_host=host,
+                    allowed_hosts=_parse_csv_option(allowed_hosts),
+                )
+            ]
             if rate_limit_max_requests > 0:
                 middleware.append(
                     Middleware(
