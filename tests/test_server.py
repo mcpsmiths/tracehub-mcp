@@ -1288,6 +1288,30 @@ class TestMainCli:
         assert "not in the range" in result.output
         mock_mcp.http_app.assert_not_called()
 
+    @pytest.mark.parametrize("value", ["inf", "nan", "Infinity"])
+    def test_non_finite_session_idle_timeout_is_a_usage_error(self, value: str) -> None:
+        """click.FloatRange(min=0, min_open=True) still admits inf (inf > 0
+        holds) and nan (every comparison against it is False), and the SDK's
+        StreamableHTTPSessionManager rejects both only at lifespan start -
+        the same late, cryptic 'Server error' / exit 1 the range check exists
+        to prevent. The option callback turns them into exit-code-2 usage
+        errors before the app is ever built."""
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp") as mock_mcp,
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(
+                server.main,
+                ["--transport", "http", "--session-idle-timeout-seconds", value],
+            )
+
+        assert result.exit_code == 2, result.output
+        assert "--session-idle-timeout-seconds" in result.output
+        assert "finite" in result.output
+        mock_mcp.http_app.assert_not_called()
+
     def test_rate_limit_disabled_when_max_requests_is_zero(self) -> None:
         runner = CliRunner()
         with (

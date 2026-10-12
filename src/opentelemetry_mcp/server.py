@@ -5,6 +5,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import re
 import sys
 import time
@@ -1594,6 +1595,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 _DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS = 1800.0
 
 
+def _require_finite_seconds(ctx: click.Context, param: click.Parameter, value: float) -> float:
+    """Option callback for --session-idle-timeout-seconds. click.FloatRange(
+    min=0, min_open=True) still admits ``inf`` (``inf > 0`` holds) and ``nan``
+    (every comparison against it is False), and the mcp SDK's
+    StreamableHTTPSessionManager raises ValueError for both only at lifespan
+    start - the same late, cryptic 'Server error' / exit 1 the range check
+    exists to prevent. Rejecting them here keeps every bad value a usage error
+    with exit code 2 before the app is built."""
+    if not math.isfinite(value):
+        raise click.BadParameter("must be a finite number of seconds")
+    return value
+
+
 def _build_http_app(
     middleware: list[Middleware], *, session_idle_timeout_seconds: float, stateless_http: bool
 ) -> StarletteWithLifespan:
@@ -2013,11 +2027,12 @@ def _backend_config_options(f: Any) -> Any:
     # min_open exists on click 8.x's FloatRange (verified at runtime); the
     # pinned types-click 7.1.8 stubs predate it, hence the targeted ignore.
     type=click.FloatRange(min=0, min_open=True),  # type: ignore[call-arg]
+    callback=_require_finite_seconds,
     default=_DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS,
     envvar="SESSION_IDLE_TIMEOUT_SECONDS",
     help="Close a streamable-HTTP session that has had no request for this "
     "many seconds; its id then answers 404 and the client re-initializes "
-    "(only for --transport http, must be > 0, default: "
+    "(only for --transport http, must be a finite number > 0, default: "
     f"{_DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS:g} - the mcp SDK's own default, "
     "overrides SESSION_IDLE_TIMEOUT_SECONDS env var)",
 )
