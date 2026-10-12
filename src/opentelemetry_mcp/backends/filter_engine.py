@@ -11,6 +11,11 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", TraceData, SpanData)
 
+# Dedup key for the per-span type-conversion WARNING: (field, value_type,
+# actual Python type name). One apply_filters call over a 1000-span window
+# with one mistyped filter emits one record, not one per span.
+_ConversionWarningKey = tuple[str, str, str]
+
 
 @dataclass(frozen=True, slots=True)
 class _CompiledFilter:
@@ -67,17 +72,19 @@ class FilterEngine:
         # Convert every filter's expected operand(s) exactly once per call;
         # the per-item loop below only ever converts the item's own value.
         compiled_filters = [FilterEngine._compile(f) for f in filters]
+        # Call-local accumulator so a mistyped filter warns once per call.
+        warned: set[_ConversionWarningKey] = set()
 
         filtered_items: list[TraceData] | list[SpanData]
         if isinstance(items[0] if items else None, TraceData):
             filtered_items = []
             for item in items:
-                if FilterEngine._matches_all_filters(item, compiled_filters):
+                if FilterEngine._matches_all_filters(item, compiled_filters, warned):
                     filtered_items.append(item)  # type: ignore[arg-type]
         else:
             filtered_items = []
             for item in items:
-                if FilterEngine._matches_all_filters(item, compiled_filters):
+                if FilterEngine._matches_all_filters(item, compiled_filters, warned):
                     filtered_items.append(item)  # type: ignore[arg-type]
 
         logger.debug(
@@ -87,29 +94,37 @@ class FilterEngine:
 
     @staticmethod
     def _matches_all_filters(
-        item: TraceData | SpanData, filters: list[_CompiledFilter] | list[Filter]
+        item: TraceData | SpanData,
+        filters: list[_CompiledFilter] | list[Filter],
+        warned: set[_ConversionWarningKey] | None = None,
     ) -> bool:
         """Check if an item (trace or span) matches all filters (AND logic).
 
         Args:
             item: Trace or span to check
             filters: List of (compiled) filters to apply
+            warned: Per-call dedup set for type-conversion warnings
 
         Returns:
             True if item matches all filters
         """
         for filter_obj in filters:
-            if not FilterEngine._matches_filter(item, filter_obj):
+            if not FilterEngine._matches_filter(item, filter_obj, warned):
                 return False
         return True
 
     @staticmethod
-    def _matches_filter(item: TraceData | SpanData, filter_obj: Filter | _CompiledFilter) -> bool:
+    def _matches_filter(
+        item: TraceData | SpanData,
+        filter_obj: Filter | _CompiledFilter,
+        warned: set[_ConversionWarningKey] | None = None,
+    ) -> bool:
         """Check if an item (trace or span) matches a single filter.
 
         Args:
             item: Trace or span to check
             filter_obj: Filter to apply (a raw Filter is compiled on the spot)
+            warned: Per-call dedup set for type-conversion warnings
 
         Returns:
             True if item matches the filter
@@ -144,9 +159,9 @@ class FilterEngine:
         }
 
         if operator in negative_ops:
-            return all(FilterEngine._compare_compiled(value, compiled) for value in values)
+            return all(FilterEngine._compare_compiled(value, compiled, warned) for value in values)
 
-        return any(FilterEngine._compare_compiled(value, compiled) for value in values)
+        return any(FilterEngine._compare_compiled(value, compiled, warned) for value in values)
 
     @staticmethod
     def _get_field_values(item: TraceData | SpanData, field: str) -> list[Any]:
@@ -307,11 +322,20 @@ class FilterEngine:
         return FilterEngine._compare_compiled(actual, FilterEngine._compile(filter_obj))
 
     @staticmethod
-    def _compare_compiled(actual: Any, compiled: _CompiledFilter) -> bool:
+    def _compare_compiled(
+        actual: Any,
+        compiled: _CompiledFilter,
+        warned: set[_ConversionWarningKey] | None = None,
+    ) -> bool:
         """Compare an actual value against a compiled filter condition.
 
         Only ``actual`` is converted here; the expected side was converted by
-        _compile. Any conversion failure returns False rather than raising.
+        _compile. Any conversion failure returns False rather than raising,
+        after a WARNING that names the filter and the offending value's
+        Python type - never the value itself, which is span data (a prompt,
+        a message list) that PRIVACY.md promises stays out of the server's
+        own logs. ``warned`` deduplicates that WARNING per apply_filters
+        call; when None (direct callers), every failure warns.
         """
         if compiled.invalid:
             return False
@@ -382,7 +406,23 @@ class FilterEngine:
                     return actual_str not in (compiled.str_members or frozenset())
 
         except (ValueError, TypeError):
-            logger.warning(f"Type conversion failed for value: {actual}")
+            actual_type = type(actual).__name__
+            key: _ConversionWarningKey = (
+                filter_obj.field,
+                filter_obj.value_type.value,
+                actual_type,
+            )
+            if warned is None or key not in warned:
+                if warned is not None:
+                    warned.add(key)
+                logger.warning(
+                    "Type conversion failed for field %r (operator=%s, value_type=%s, "
+                    "actual_type=%s); the value does not match this filter",
+                    filter_obj.field,
+                    operator.value,
+                    filter_obj.value_type.value,
+                    actual_type,
+                )
             return False
 
         logger.warning(f"Unknown operator: {operator}")
