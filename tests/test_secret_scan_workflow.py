@@ -31,6 +31,7 @@ GITLEAKS_CONFIG = REPO_ROOT / ".gitleaks.toml"
 
 TRACELOOP_KEY_PATTERN = "tl_[a-z0-9]{32}"
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_RELEASE_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 
 def _secret_scan() -> dict[Any, Any]:
@@ -53,6 +54,14 @@ def _trufflehog_step(job: dict[str, Any]) -> dict[str, Any]:
 
 def _checkout_step(job: dict[str, Any]) -> dict[str, Any]:
     return _only_step_using(job, "actions/checkout@")
+
+
+def _uses_line_annotation(uses: str) -> str:
+    """Release named by the `# vX.Y.Z` comment on every line pinning `uses`."""
+    lines = [ln for ln in SECRET_SCAN_YML.read_text(encoding="utf-8").splitlines() if uses in ln]
+    annotations = {m.group(1) for ln in lines if (m := re.search(r"#\s*v(\d+\.\d+\.\d+)\s*$", ln))}
+    assert len(lines) == 2 and len(annotations) == 1, lines
+    return annotations.pop()
 
 
 def _jobs_by_role() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -85,6 +94,14 @@ def test_whole_history_job_scans_every_commit_with_the_custom_detector() -> None
     assert "--results=verified,unknown,unverified" in extra, extra
     assert "--config .trufflehog.yaml" in extra, extra
     assert step["uses"] == _trufflehog_step(diff_job)["uses"], "both jobs pin the same version"
+    # The SHA on `uses` pins only the composite action; its `version` input
+    # defaults to `latest` and selects the ghcr.io/trufflesecurity/trufflehog
+    # image that actually scans, so the scanner must be pinned too - to the
+    # release the `# vX.Y.Z` annotation names, identically in both jobs.
+    version = str(step["with"]["version"])
+    assert _RELEASE_RE.match(version), version
+    assert version == str(_trufflehog_step(diff_job)["with"]["version"]), "same scanner"
+    assert version == _uses_line_annotation(str(step["uses"])), (version, step["uses"])
 
 
 def test_diff_job_keeps_verified_unknown_and_loads_the_custom_detector() -> None:
