@@ -169,6 +169,8 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `MCP_INCLUDE_ARGS_IN_SPANS` - Optional: Env-var equivalent of `--include-args-in-spans` (default: `false`). Known credential shapes are redacted before export (`observability._redact_secrets`) - a pattern match, not a guarantee.
 - `OTEL_EXPORTER_OTLP_ENDPOINT` - Optional: Enables opt-in OTel self-instrumentation of tool calls when set (unset by default - no TracerProvider is configured and no middleware is registered, so there is zero overhead if you don't opt in)
 - `OTEL_SERVICE_NAME` - Optional: Service name reported in self-instrumentation spans (default: `tracehub-mcp`)
+- `OTEL_TRACES_SAMPLER` - Optional: standard OTel SDK sampler override. Unset, `configure_tracing` installs `observability._OPERATOR_OWNED_SAMPLER` (ParentBased, root and remote-parent-not-sampled both ALWAYS_ON) so a caller's `traceparent` trace-flags can never drop this server's own span; set, the SDK's own resolution wins untouched
+- `MCP_TRUST_CLIENT_TRACE_CONTEXT` - Optional: Env-var equivalent of `--trust-client-trace-context` (default: `true` for stdio, `false` for `--transport http`). `true` -> fastmcp `telemetry_mode="propagation_only"` (a caller's `params._meta` trace context parents this server's spans); `false` -> `"off"` (neither extracted nor attached). Both suppress FastMCP's own duplicate spans (`tests/test_double_tracing_regression.py`)
 - `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` - Optional: Env-var equivalents of `--rate-limit-max-requests`/`--rate-limit-window-seconds` (HTTP transport only, defaults: `100`/`60.0`)
 - `SESSION_IDLE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--session-idle-timeout-seconds` (HTTP transport only, must be > 0, default: `1800.0` = the mcp SDK default). fastmcp's own default is `None`/never, so `server._build_http_app` always passes a finite bound; an idle session's id answers `404` and clients re-initialize. `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT` is a no-code stopgap for already-deployed containers
 - `MCP_STATELESS_HTTP` - Optional: Env-var equivalent of `--stateless-http` (HTTP transport only, default: `false`). Stateless mode keeps no per-peer session state at all but drops the GET SSE stream for server-initiated notifications
@@ -184,6 +186,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `--enabled-tools <name1,name2,...>` - Allowlist: every tool not named here is removed from this server instance
 - `--slow-request-threshold-ms <float>` - Overrides `SLOW_REQUEST_THRESHOLD_MS`
 - `--include-args-in-spans` - Overrides `MCP_INCLUDE_ARGS_IN_SPANS`
+- `--trust-client-trace-context` / `--no-trust-client-trace-context` - Overrides `MCP_TRUST_CLIENT_TRACE_CONTEXT` (see above)
 - `--http-bearer-token <token>` / `--allow-unauthenticated-http` - HTTP transport only. Override `MCP_HTTP_BEARER_TOKEN` / `MCP_ALLOW_UNAUTHENTICATED_HTTP`; prefer the env var for the token since argv is visible via `ps`
 - `--allowed-hosts <name1,name2,...>` - HTTP transport only. Overrides `MCP_ALLOWED_HOSTS` (see above); `--allowed-hosts '*'` opts out of Host validation
 - `--forwarded-allow-ips <ip1,cidr2,...>` - HTTP transport only. Overrides `FORWARDED_ALLOW_IPS` (see above)

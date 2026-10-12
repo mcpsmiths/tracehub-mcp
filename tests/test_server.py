@@ -1175,6 +1175,48 @@ class TestMainCli:
         assert config_arg.proxy_headers is True
         assert config_arg.forwarded_allow_ips == "127.0.0.1"
 
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            ([], True),
+            (["--no-trust-client-trace-context"], False),
+            (["--transport", "http"], False),
+            (["--transport", "http", "--trust-client-trace-context"], True),
+        ],
+        ids=["stdio-default", "stdio-opt-out", "http-default", "http-opt-in"],
+    )
+    def test_trust_client_trace_context_defaults_per_transport(
+        self, args: list[str], expected: bool
+    ) -> None:
+        """stdio's only caller is the trusted parent process, so its _meta
+        trace context is adopted by default; an HTTP peer's is not."""
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp"),
+            patch.object(server, "configure_tracing", return_value=False) as mock_tracing,
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(server.main, args)
+
+        assert result.exit_code == 0, result.output
+        mock_tracing.assert_called_once_with(trust_client_trace_context=expected)
+
+    def test_trust_client_trace_context_env_var(self) -> None:
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp"),
+            patch.object(server, "configure_tracing", return_value=False) as mock_tracing,
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(
+                server.main, ["--transport", "http"], env={"MCP_TRUST_CLIENT_TRACE_CONTEXT": "true"}
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_tracing.assert_called_once_with(trust_client_trace_context=True)
+
     def test_allowed_hosts_flag_is_parsed_into_the_origin_middleware(self) -> None:
         runner = CliRunner()
         with (
@@ -1439,6 +1481,7 @@ class TestPrintConfigFlag:
         assert resolved["stateless_http"] is False
         assert resolved["allowed_hosts"] is None
         assert resolved["forwarded_allow_ips"] is None
+        assert resolved["trust_client_trace_context"] is False
 
 
 class TestDoctorCli:

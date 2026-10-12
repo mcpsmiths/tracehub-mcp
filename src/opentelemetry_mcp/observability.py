@@ -30,6 +30,7 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased, Sampler
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,15 @@ _UNKNOWN_TOOL_LABEL = "unknown"
 # Hard cap on a label before the registry is even consulted - no real tool
 # name approaches this, and it bounds the lookup cost for a hostile peer.
 _MAX_TOOL_NAME_LABEL_CHARS = 128
+
+# The operator, not the caller, decides whether this server's own spans are
+# recorded. The SDK's default (parentbased_always_on) delegates a remote
+# parent whose trace-flags are 00 to ALWAYS_OFF, so a caller-supplied
+# traceparent could silently drop the server's span; this keeps root and
+# remote-parent-not-sampled on ALWAYS_ON while still following a sampled
+# parent's decision. Only used when OTEL_TRACES_SAMPLER is unset - an
+# operator's own SDK-level choice always wins (see configure_tracing).
+_OPERATOR_OWNED_SAMPLER: Sampler = ParentBased(root=ALWAYS_ON, remote_parent_not_sampled=ALWAYS_ON)
 
 # Field-name fragments that signal the value next to them is a credential,
 # not application data. Built up from parts rather than one literal list
@@ -91,37 +101,56 @@ def _redact_secrets(text: str) -> str:
     return text
 
 
-def configure_tracing(service_name: str | None = None) -> bool:
+def configure_tracing(
+    service_name: str | None = None, *, trust_client_trace_context: bool = False
+) -> bool:
     """Configure a real OTLP-exporting TracerProvider, but only if
     OTEL_EXPORTER_OTLP_ENDPOINT is actually set in the environment.
 
-    Also sets FastMCP's own ``telemetry_mode`` to ``"propagation_only"``
-    (fastmcp>=4.0's public, documented API - ``fastmcp.telemetry``) so
-    FastMCP stops creating its own native spans for the lifetime of this
-    process. Confirmed via a real end-to-end reproduction with an
-    in-memory exporter (not just source reading) that without this,
-    FastMCP's own middleware seam span PLUS its own internal
-    ``server_span()`` both survive alongside this codebase's own
-    McpServerTracingMiddleware span for the *same* logical tools/call
-    operation - three SERVER-kind spans exported for one tool call.
-    ``propagation_only`` mode still correctly parents this codebase's own
-    spans under any incoming distributed trace context carried in a
-    request's ``_meta`` (that's the whole point of the mode, per
-    fastmcp.telemetry's own docstring), it just stops FastMCP from
-    creating its own competing spans. A narrower, context-manager-scoped
-    fix (``suppress_fastmcp_telemetry()`` around just this codebase's own
-    ``call_next()``) was tried first and confirmed insufficient: FastMCP's
-    middleware seam span opens *before* any user middleware runs, so
-    nothing scoped inside this codebase's own middleware can reach back
-    far enough to suppress it - this has to be set process-wide, at the
-    point self-instrumentation is enabled.
+    Sampling is the operator's decision, not the caller's: unless the
+    operator set OTEL_TRACES_SAMPLER themselves (in which case the SDK's
+    own resolution of it wins untouched), the provider gets
+    ``_OPERATOR_OWNED_SAMPLER`` - ParentBased with both root and
+    remote-parent-not-sampled on ALWAYS_ON - so a remote parent carrying
+    trace-flags=00 can never turn this server's own tools/call span into a
+    non-recording one (the SDK default would, via its ALWAYS_OFF delegate).
+
+    Also sets FastMCP's own ``telemetry_mode`` (fastmcp>=4.0's public,
+    documented API - ``fastmcp.telemetry``) so FastMCP stops creating its
+    own native spans for the lifetime of this process. Confirmed via a real
+    end-to-end reproduction with an in-memory exporter (not just source
+    reading) that without this, FastMCP's own middleware seam span PLUS its
+    own internal ``server_span()`` both survive alongside this codebase's
+    own McpServerTracingMiddleware span for the *same* logical tools/call
+    operation - three SERVER-kind spans exported for one tool call. Both
+    non-native modes suppress those spans; they differ in what they do with
+    the W3C trace context a caller can place under a request's
+    ``params._meta``:
+
+    - ``trust_client_trace_context=False`` (the default, and main()'s
+      choice for ``--transport http``): ``"off"`` - FastMCP neither
+      extracts nor attaches the caller's ``_meta`` context, so an
+      unauthenticated network peer cannot choose the trace identity
+      (trace_id, parent span, tracestate) this server's span and its
+      correlated log lines are filed under.
+    - ``trust_client_trace_context=True`` (main()'s default for stdio,
+      whose only caller is the trusted parent process):
+      ``"propagation_only"`` - the caller's ``_meta`` context is attached
+      as the parent, continuing the caller's distributed trace exactly as
+      before.
+
+    A narrower, context-manager-scoped fix (``suppress_fastmcp_telemetry()``
+    around just this codebase's own ``call_next()``) was tried first and
+    confirmed insufficient: FastMCP's middleware seam span opens *before*
+    any user middleware runs, so nothing scoped inside this codebase's own
+    middleware can reach back far enough to suppress it - this has to be
+    set process-wide, at the point self-instrumentation is enabled.
 
     One accepted, deliberate tradeoff: FastMCP's own server_span() is the
     only place ``enduser.id``/``enduser.scope`` (auth) attributes would
-    have been set - suppressing it means those never appear on any span.
-    Not a live regression for this deployment today (this codebase never
-    configures ``FastMCP(auth=...)``, so those attributes are already
-    always empty regardless), but worth revisiting if that ever changes.
+    have been set - suppressing it means those never appear on any span,
+    including for the bearer-token principal server.OperatorTokenVerifier
+    establishes on the HTTP transport.
 
     Returns:
         True if tracing was configured, False if it was skipped (no
@@ -135,15 +164,22 @@ def configure_tracing(service_name: str | None = None) -> bool:
     resource = Resource.create(
         {SERVICE_NAME: service_name or os.getenv("OTEL_SERVICE_NAME") or "tracehub-mcp"}
     )
-    provider = TracerProvider(resource=resource)
+    if os.getenv("OTEL_TRACES_SAMPLER"):
+        # Leave sampler unset so the SDK resolves the operator's override.
+        provider = TracerProvider(resource=resource)
+    else:
+        provider = TracerProvider(resource=resource, sampler=_OPERATOR_OWNED_SAMPLER)
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
     trace.set_tracer_provider(provider)
 
     import fastmcp
 
-    fastmcp.settings.telemetry_mode = "propagation_only"
+    fastmcp.settings.telemetry_mode = "propagation_only" if trust_client_trace_context else "off"
 
-    logger.info(f"OTel self-instrumentation enabled, exporting spans to {endpoint}")
+    logger.info(
+        f"OTel self-instrumentation enabled, exporting spans to {endpoint} "
+        f"(client trace context {'trusted' if trust_client_trace_context else 'ignored'})"
+    )
     return True
 
 

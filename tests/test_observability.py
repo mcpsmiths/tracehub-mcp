@@ -43,6 +43,7 @@ from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import Sampler
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import HttpUrl
 from starlette.middleware import Middleware
@@ -62,9 +63,9 @@ from opentelemetry_mcp.server import OriginValidationMiddleware, RateLimitMiddle
 from tests.streamable_http_client import call_tool, open_session, sse_json
 
 
-def _tracer_with_exporter() -> tuple[Any, InMemorySpanExporter]:
+def _tracer_with_exporter(sampler: Sampler | None = None) -> tuple[Any, InMemorySpanExporter]:
     exporter = InMemorySpanExporter()
-    provider = TracerProvider()
+    provider = TracerProvider(sampler=sampler)
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     return provider.get_tracer("test"), exporter
 
@@ -174,7 +175,7 @@ class TestConfigureTracing:
         provider = mocked.call_args.args[0]
         assert provider.resource.attributes["service.name"] == "tracehub-mcp"
 
-    def test_sets_fastmcp_telemetry_mode_to_propagation_only_when_enabled(
+    def test_untrusted_callers_set_fastmcp_telemetry_mode_off(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """FastMCP's own native spans (its middleware seam span plus its
@@ -182,10 +183,35 @@ class TestConfigureTracing:
         McpServerTracingMiddleware span for the same tools/call operation -
         confirmed via a real end-to-end reproduction (see
         test_double_tracing_regression.py) that this produces THREE
-        SERVER-kind spans for one tool call without this setting.
-        propagation_only still correctly parents this codebase's own spans
-        under any incoming distributed trace context - it only stops
-        FastMCP from creating its own competing spans."""
+        SERVER-kind spans for one tool call at the default "native" mode.
+        Both "off" and "propagation_only" suppress them; "off" additionally
+        stops FastMCP from adopting a caller's params._meta.traceparent as
+        the parent of this server's own span, which is the default for
+        callers the operator has not marked trusted."""
+        import fastmcp
+
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+        monkeypatch.setattr(fastmcp.settings, "telemetry_mode", "native")
+
+        with patch.object(observability.trace, "set_tracer_provider"):
+            configure_tracing(trust_client_trace_context=False)
+
+        assert fastmcp.settings.telemetry_mode == "off"
+
+    def test_trusted_callers_set_fastmcp_telemetry_mode_propagation_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import fastmcp
+
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+        monkeypatch.setattr(fastmcp.settings, "telemetry_mode", "native")
+
+        with patch.object(observability.trace, "set_tracer_provider"):
+            configure_tracing(trust_client_trace_context=True)
+
+        assert fastmcp.settings.telemetry_mode == "propagation_only"
+
+    def test_default_is_untrusted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import fastmcp
 
         monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
@@ -194,7 +220,35 @@ class TestConfigureTracing:
         with patch.object(observability.trace, "set_tracer_provider"):
             configure_tracing()
 
-        assert fastmcp.settings.telemetry_mode == "propagation_only"
+        assert fastmcp.settings.telemetry_mode == "off"
+
+    def test_sampler_never_lets_a_remote_unsampled_parent_drop_the_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The SDK default (parentbased_always_on) delegates a remote parent
+        with trace-flags=00 to ALWAYS_OFF - i.e. the caller decides whether
+        the operator's own span is recorded. Pin the explicit sampler so a
+        dependency bump that changes the SDK default is caught too."""
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+        monkeypatch.delenv("OTEL_TRACES_SAMPLER", raising=False)
+
+        with patch.object(observability.trace, "set_tracer_provider") as mocked:
+            configure_tracing()
+
+        description = mocked.call_args.args[0].sampler.get_description()
+        assert "root:AlwaysOnSampler" in description
+        assert "remoteParentNotSampled:AlwaysOnSampler" in description
+
+    def test_operator_otel_traces_sampler_override_still_wins(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+        monkeypatch.setenv("OTEL_TRACES_SAMPLER", "always_off")
+
+        with patch.object(observability.trace, "set_tracer_provider") as mocked:
+            configure_tracing()
+
+        assert mocked.call_args.args[0].sampler.get_description() == "AlwaysOffSampler"
 
     def test_does_not_touch_fastmcp_telemetry_mode_when_disabled(
         self, monkeypatch: pytest.MonkeyPatch
@@ -679,6 +733,136 @@ class TestMcpServerTracingMiddlewareCardinality:
         count_points = _metric_data_points(reader, "mcp.server.tool.call.count")
         assert [p.attributes["gen_ai.tool.name"] for p in count_points] == ["unknown"]
         assert count_points[0].value == 5
+
+
+PEER_TRACE_ID = 0x0AF7651916CD43DD8448EB211C80319C
+PEER_SPAN_ID = 0x00F067AA0BA902B7
+PEER_TRACEPARENT_UNSAMPLED = "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-00"
+PEER_TRACEPARENT_SAMPLED = "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01"
+
+
+class TestClientTraceContextTrustOverHttp:
+    """An unauthenticated HTTP peer could decide, via params._meta.traceparent,
+    whether this server's own tools/call span was recorded (trace-flags=00 +
+    the SDK default sampler) and under which trace identity (fastmcp's
+    propagation_only mode adopts the peer context as parent before any user
+    middleware runs). The operator owns both decisions now: the explicit
+    sampler records the span regardless of the remote flags, and a peer's
+    _meta is only adopted as parent when trust_client_trace_context is on."""
+
+    @pytest.fixture(autouse=True)
+    def _real_server_state(self) -> Generator[None]:
+        original_middleware = list(server.mcp.middleware)
+        server._config = ServerConfig(
+            backend=BackendConfig(type="jaeger", url=HttpUrl("http://localhost:16686"))
+        )
+        server._backend = AsyncMock()
+        server.mcp.auth = None
+        yield
+        server.mcp.middleware = original_middleware
+        server._config = None
+        server._backend = None
+
+    @staticmethod
+    def _run_two_tool_calls_with_peer_trace_context(
+        exporter: InMemorySpanExporter,
+    ) -> list[Any]:
+        """initialize + initialized, then tools/call search_traces twice: once
+        with an unsampled peer traceparent, once sampled plus a tracestate.
+        Returns the recorded SERVER spans, in call order."""
+        sentinel = SearchTracesResult(count=0, traces=[])
+        tool_logger = logging.getLogger("opentelemetry_mcp.tools.search")
+
+        async def logging_search(*args: Any, **kwargs: Any) -> SearchTracesResult:
+            tool_logger.info("handling search_traces for the trace-context test")
+            return sentinel
+
+        app = server.mcp.http_app(
+            transport="streamable-http",
+            middleware=[
+                Middleware(OriginValidationMiddleware),
+                Middleware(RateLimitMiddleware, max_requests=100, window_seconds=60.0),
+            ],
+        )
+        with patch.object(server.search, "search_traces", AsyncMock(side_effect=logging_search)):
+            with TestClient(app) as client:
+                session_id = open_session(client)
+                for request_id, meta in (
+                    (10, {"traceparent": PEER_TRACEPARENT_UNSAMPLED}),
+                    (11, {"traceparent": PEER_TRACEPARENT_SAMPLED, "tracestate": "peer=chosen"}),
+                ):
+                    response = call_tool(
+                        client,
+                        session_id,
+                        "search_traces",
+                        {"limit": 5},
+                        meta=meta,
+                        request_id=request_id,
+                    )
+                    assert response.status_code == 200
+                    assert sse_json(response)["result"]["isError"] is False
+        return [
+            s
+            for s in exporter.get_finished_spans()
+            if "tools/call" in s.name and s.kind == SpanKind.SERVER
+        ]
+
+    def test_untrusted_peer_meta_is_neither_parent_nor_sampling_decision(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import fastmcp
+
+        monkeypatch.setattr(fastmcp.settings, "telemetry_mode", "off")
+        tracer, exporter = _tracer_with_exporter(sampler=observability._OPERATOR_OWNED_SAMPLER)
+        server.mcp.add_middleware(McpServerTracingMiddleware(tracer=tracer))
+        install_trace_context_log_filter([caplog.handler])
+
+        with caplog.at_level(logging.INFO, logger="opentelemetry_mcp.tools.search"):
+            spans = self._run_two_tool_calls_with_peer_trace_context(exporter)
+
+        assert len(spans) == 2
+        for span in spans:
+            assert span.context.trace_id != PEER_TRACE_ID
+            assert span.parent is None
+            assert len(span.context.trace_state) == 0
+        tool_records = [r for r in caplog.records if "handling search_traces" in r.getMessage()]
+        assert [r.trace_id for r in tool_records] == [f"{s.context.trace_id:032x}" for s in spans]
+        assert all(r.trace_id != "0" * 32 for r in tool_records)
+
+    def test_trusted_peer_meta_is_adopted_but_cannot_drop_the_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import fastmcp
+
+        monkeypatch.setattr(fastmcp.settings, "telemetry_mode", "propagation_only")
+        tracer, exporter = _tracer_with_exporter(sampler=observability._OPERATOR_OWNED_SAMPLER)
+        server.mcp.add_middleware(McpServerTracingMiddleware(tracer=tracer))
+
+        spans = self._run_two_tool_calls_with_peer_trace_context(exporter)
+
+        assert len(spans) == 2
+        for span in spans:
+            assert span.context.trace_id == PEER_TRACE_ID
+            assert span.parent is not None
+            assert span.parent.span_id == PEER_SPAN_ID
+        assert spans[1].context.trace_state.get("peer") == "chosen"
+
+    def test_sdk_default_sampler_would_let_the_unsampled_peer_drop_the_span(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Baseline proving the sampler half of the fix is load-bearing: with
+        the SDK default sampler and the peer context adopted, trace-flags=00
+        yields a non-recording span the exporter never sees."""
+        import fastmcp
+
+        monkeypatch.setattr(fastmcp.settings, "telemetry_mode", "propagation_only")
+        tracer, exporter = _tracer_with_exporter()
+        server.mcp.add_middleware(McpServerTracingMiddleware(tracer=tracer))
+
+        spans = self._run_two_tool_calls_with_peer_trace_context(exporter)
+
+        assert len(spans) == 1
+        assert spans[0].context.trace_id == PEER_TRACE_ID
 
     async def test_session_id_omitted_when_accessing_it_raises(self) -> None:
         """Context.session_id raises RuntimeError if no session is

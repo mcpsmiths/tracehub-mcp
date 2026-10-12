@@ -1928,6 +1928,18 @@ def _backend_config_options(f: Any) -> Any:
     "contain sensitive data - overrides MCP_INCLUDE_ARGS_IN_SPANS env var)",
 )
 @click.option(
+    "--trust-client-trace-context/--no-trust-client-trace-context",
+    default=None,
+    envvar="MCP_TRUST_CLIENT_TRACE_CONTEXT",
+    help="When OTel self-instrumentation is enabled, adopt the W3C trace "
+    "context a caller places under a request's params._meta as the parent "
+    "of this server's own spans (default: on for stdio, whose only caller is "
+    "the trusted parent process; off for --transport http, where any peer "
+    "could otherwise choose the trace identity the server's spans and "
+    "correlated log lines are filed under - overrides "
+    "MCP_TRUST_CLIENT_TRACE_CONTEXT env var)",
+)
+@click.option(
     "--log-level",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
     default=None,
@@ -2066,6 +2078,7 @@ def main(
     allowed_hosts: str | None,
     forwarded_allow_ips: str | None,
     include_args_in_spans: bool,
+    trust_client_trace_context: bool | None,
     log_level: str | None,
     max_traces_per_query: int | None,
     disable_tools: str | None,
@@ -2125,6 +2138,9 @@ def main(
             "MCP_HTTP_BEARER_TOKEN is set but --transport is stdio: the token only "
             "guards the HTTP listener and is ignored for stdio"
         )
+    if trust_client_trace_context is None:
+        # stdio's only caller is the trusted parent process; an HTTP peer is not.
+        trust_client_trace_context = transport == "stdio"
 
     try:
         # Load configuration from environment
@@ -2196,6 +2212,7 @@ def main(
                 "allowed_hosts": allowed_hosts,
                 "forwarded_allow_ips": forwarded_allow_ips,
                 "include_args_in_spans": include_args_in_spans,
+                "trust_client_trace_context": trust_client_trace_context,
                 "disable_tools": disable_tools,
                 "enabled_tools": enabled_tools,
                 "rate_limit_max_requests": rate_limit_max_requests,
@@ -2221,7 +2238,7 @@ def main(
         # runs before the middleware is constructed so metrics.get_meter()
         # resolves against the real provider immediately, mirroring the
         # existing tracer-resolution ordering.
-        tracing_enabled = configure_tracing()
+        tracing_enabled = configure_tracing(trust_client_trace_context=trust_client_trace_context)
         configure_metrics()
         if tracing_enabled:
             mcp.add_middleware(McpServerTracingMiddleware(include_args=include_args_in_spans))
