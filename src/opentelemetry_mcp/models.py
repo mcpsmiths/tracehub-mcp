@@ -60,35 +60,56 @@ MAX_TAGS_PER_QUERY = 50
 MAX_FILTER_FIELD_CHARS = 256
 
 
-def _parse_number_operand(text: str) -> int | float:
-    """Parse a string-encoded NUMBER operand ("5000", "1.5", "1e3") into a
-    genuine, finite int/float; anything else is rejected."""
+def _check_number_operand(number: int | float) -> int | float:
+    """Return ``number`` if it is finite and representable as a float, else
+    raise ValueError.
+
+    Every consumer of a NUMBER operand goes through float() - TraceQL
+    rendering via math.isfinite, FilterEngine via float(value) - and for an
+    int >= 2**1024 that raises OverflowError (not ValueError), so such an
+    operand is rejected here, at the model boundary, instead of crashing a
+    backend later. int("9" * 400) and a JSON integer literal of that size
+    are both genuine ints that reach this check.
+    """
     try:
-        return int(text)
-    except ValueError:
-        pass
-    try:
-        number = float(text)
-    except ValueError:
+        as_float = float(number)
+    except OverflowError:
         raise ValueError(
-            "value_type 'number' requires a numeric operand, got a non-numeric string"
+            "value_type 'number' requires a numeric operand within float range"
         ) from None
-    if not math.isfinite(number):
+    if not math.isfinite(as_float):
         raise ValueError("value_type 'number' requires a finite numeric operand")
     return number
+
+
+def _parse_number_operand(text: str) -> int | float:
+    """Parse a string-encoded NUMBER operand ("5000", "1.5", "1e3") into a
+    genuine int/float that passes _check_number_operand; anything else is
+    rejected."""
+    number: int | float
+    try:
+        number = int(text)
+    except ValueError:
+        try:
+            number = float(text)
+        except ValueError:
+            raise ValueError(
+                "value_type 'number' requires a numeric operand, got a non-numeric string"
+            ) from None
+    return _check_number_operand(number)
 
 
 def _normalize_filter_operand(value: Any, value_type: FilterType) -> Any:
     """Coerce one Filter operand to the Python type its declared value_type
     promises, or raise ValueError when it cannot be.
 
-    NUMBER keeps a genuine int/float, parses a numeric string, and rejects a
-    bool (an int subclass, but not a number a caller meant). BOOLEAN keeps a
-    genuine bool and accepts only the strings "true"/"false"
-    (case-insensitive). STRING str()-coerces int/float/bool scalars, which is
-    exactly what every backend builder and FilterEngine already did with
-    them. Values of any other Python type are returned unchanged so the
-    field's own type validation reports them.
+    NUMBER keeps a genuine finite, float-representable int/float, parses a
+    numeric string to one, and rejects a bool (an int subclass, but not a
+    number a caller meant). BOOLEAN keeps a genuine bool and accepts only the
+    strings "true"/"false" (case-insensitive). STRING str()-coerces
+    int/float/bool scalars, which is exactly what every backend builder and
+    FilterEngine already did with them. Values of any other Python type are
+    returned unchanged so the field's own type validation reports them.
     """
     if value is None:
         return None
@@ -96,7 +117,7 @@ def _normalize_filter_operand(value: Any, value_type: FilterType) -> Any:
         if isinstance(value, bool):
             raise ValueError("value_type 'number' does not accept a boolean operand")
         if isinstance(value, int | float):
-            return value
+            return _check_number_operand(value)
         if isinstance(value, str):
             return _parse_number_operand(value)
         return value
@@ -126,10 +147,11 @@ class Filter(BaseModel):
     last trusted decision point before its operands are rendered into a
     backend query. Unknown keys are rejected (``extra="forbid"``) and
     ``value``/``values`` are normalised to the declared ``value_type`` before
-    field validation - a NUMBER operand is a genuine int/float and a BOOLEAN
-    operand a genuine bool by the time any backend sees the Filter, so a
-    string that merely *claims* to be a number can never reach a raw
-    numeric-literal splice (see tempo.py's ``_render_traceql_scalar``).
+    field validation - a NUMBER operand is a genuine, finite,
+    float-representable int/float and a BOOLEAN operand a genuine bool by the
+    time any backend sees the Filter, so a string that merely *claims* to be
+    a number can never reach a raw numeric-literal splice (see tempo.py's
+    ``_render_traceql_scalar``).
     """
 
     model_config = ConfigDict(extra="forbid")

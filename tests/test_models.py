@@ -282,6 +282,48 @@ class TestFilterOperandNormalization:
                 field="x", operator=FilterOperator.EQUALS, value=True, value_type=FilterType.NUMBER
             )
 
+    @pytest.mark.parametrize(
+        "value",
+        ["9" * 400, 10**400, -(10**400), 2**1024],
+        ids=["digit-string-x400", "10**400", "-(10**400)", "2**1024"],
+    )
+    def test_number_beyond_float_range_is_rejected(self, value: str | int) -> None:
+        """int("9" * 400) - and a JSON integer literal of that size - is a
+        genuine int that float() cannot hold (OverflowError, not ValueError).
+        Every consumer converts through float() (TraceQL rendering,
+        FilterEngine), so the model rejects it up front instead of letting a
+        backend crash on it later."""
+        with pytest.raises(ValidationError, match="float range"):
+            Filter(
+                field="x", operator=FilterOperator.EQUALS, value=value, value_type=FilterType.NUMBER
+            )
+
+    def test_largest_float_representable_int_is_still_accepted(self) -> None:
+        # Boundary control for the test above: 2**1023 still converts to a float.
+        f = Filter(
+            field="x", operator=FilterOperator.EQUALS, value=2**1023, value_type=FilterType.NUMBER
+        )
+        assert f.value == 2**1023
+        assert isinstance(f.value, int)
+
+    def test_number_beyond_float_range_is_rejected_inside_values(self) -> None:
+        with pytest.raises(ValidationError, match="float range"):
+            Filter(
+                field="x",
+                operator=FilterOperator.IN,
+                values=[1, 10**400],
+                value_type=FilterType.NUMBER,
+            )
+
+    @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+    def test_non_finite_float_is_rejected_for_number(self, value: float) -> None:
+        """The string forms "inf"/"nan" were already rejected; a genuine
+        non-finite float declared as a number is the same unusable operand."""
+        with pytest.raises(ValidationError, match="finite"):
+            Filter(
+                field="x", operator=FilterOperator.EQUALS, value=value, value_type=FilterType.NUMBER
+            )
+
     @pytest.mark.parametrize(("value", "expected"), [("true", True), ("FALSE", False)])
     def test_boolean_strings_are_coerced_case_insensitively(
         self, value: str, expected: bool

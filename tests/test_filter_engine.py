@@ -132,3 +132,42 @@ class TestTypeConversionWarningIsPayloadFree:
         # Deduplicated per apply_filters call on (field, value_type, actual
         # type): a 1000-span window must not produce 1000 WARNING lines.
         assert len(_engine_warnings(caplog)) == 1
+
+    def test_expected_int_beyond_float_range_fails_closed_without_logging_digits(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """float() raises OverflowError - not ValueError - for an int >=
+        2**1024. The Filter model rejects such an operand, so bypass it: the
+        compile-time handler must treat it like any other unconvertible
+        operand (the filter matches nothing, one WARNING naming the field)
+        rather than let the OverflowError escape apply_filters."""
+        bad_expected = Filter.model_construct(
+            field="gen_ai.usage.input_tokens",
+            operator=FilterOperator.GT,
+            value=int("7" * 400),
+            values=None,
+            value_type=FilterType.NUMBER,
+        )
+        spans = [_span(0, {"gen_ai.usage.input_tokens": 5})]
+
+        assert FilterEngine.apply_filters(spans, [bad_expected]) == []
+
+        assert _records_containing(caplog, "7" * 40) == []
+        warnings = _engine_warnings(caplog)
+        assert len(warnings) == 1
+        assert "gen_ai.usage.input_tokens" in warnings[0].getMessage()
+
+    def test_actual_int_beyond_float_range_does_not_match_and_logs_only_its_type(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A backend can return an attribute that json parses to an int
+        float() cannot hold; the per-value handler fails closed the same way
+        and the record names the type, never the digits."""
+        spans = [_span(0, {"custom.n": int("7" * 400)})]
+
+        assert FilterEngine.apply_filters(spans, [_number_filter("custom.n")]) == []
+
+        assert _records_containing(caplog, "7" * 40) == []
+        warnings = _engine_warnings(caplog)
+        assert len(warnings) == 1
+        assert "int" in warnings[0].getMessage()

@@ -46,19 +46,25 @@ _TRACEQL_RANGE_OPERATORS = {
 def _render_traceql_scalar(value: object, value_type: FilterType) -> str | None:
     """Render a NUMBER/BOOLEAN Filter operand as an unquoted TraceQL literal.
 
-    Only a genuine, finite int/float (not a bool) renders as a numeric
-    literal and only a genuine bool renders as ``true``/``false``. Anything
-    else - notably a str that merely *claims* value_type number/boolean -
-    returns None, so the caller reclassifies the filter as client-side
-    (where FilterEngine fails closed on an unparsable operand) instead of
-    f-string-splicing the raw value into the query. This is the non-string
-    counterpart of ``_escape_traceql_value``: a model-chosen filter value may
-    select a literal to compare against but must never add query structure.
+    Only a genuine, finite, float-representable int/float (not a bool)
+    renders as a numeric literal and only a genuine bool renders as
+    ``true``/``false``. Anything else - notably a str that merely *claims*
+    value_type number/boolean - returns None, so the caller reclassifies the
+    filter as client-side (where FilterEngine fails closed on an unparsable
+    operand) instead of f-string-splicing the raw value into the query. This
+    is the non-string counterpart of ``_escape_traceql_value``: a model-chosen
+    filter value may select a literal to compare against but must never add
+    query structure.
     """
     if value_type == FilterType.NUMBER:
         if isinstance(value, bool) or not isinstance(value, int | float):
             return None
-        if not math.isfinite(value):
+        try:
+            if not math.isfinite(value):
+                return None
+        except OverflowError:
+            # An int >= 2**1024 has no float value: math.isfinite raises
+            # instead of answering, and no consumer downstream could take it.
             return None
         return repr(value)
     if value_type == FilterType.BOOLEAN:

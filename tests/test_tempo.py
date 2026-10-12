@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from opentelemetry_mcp.attributes import SpanAttributes
-from opentelemetry_mcp.backends.tempo import TempoBackend
+from opentelemetry_mcp.backends.tempo import TempoBackend, _render_traceql_scalar
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, SpanQuery, TraceQuery
 
 FAKE_API_KEY = "dd-api1"
@@ -835,7 +835,11 @@ class TestFilterToTraceqlNonStringOperands:
         f = _raw_filter("x", FilterOperator.EQUALS, value_type, value=value)
         assert self._backend()._filter_to_traceql(f) == expected
 
-    @pytest.mark.parametrize("value", [float("inf"), float("nan"), True, "1"])
+    @pytest.mark.parametrize(
+        "value",
+        [float("inf"), float("nan"), 10**400, True, "1"],
+        ids=["inf", "nan", "10**400", "bool", "numeric-string"],
+    )
     def test_equals_number_with_non_renderable_operand_returns_none(self, value: object) -> None:
         f = _raw_filter("x", FilterOperator.EQUALS, FilterType.NUMBER, value=value)
         assert self._backend()._filter_to_traceql(f) is None
@@ -844,6 +848,15 @@ class TestFilterToTraceqlNonStringOperands:
     def test_equals_boolean_with_non_bool_operand_returns_none(self, value: object) -> None:
         f = _raw_filter("x", FilterOperator.EQUALS, FilterType.BOOLEAN, value=value)
         assert self._backend()._filter_to_traceql(f) is None
+
+    def test_render_traceql_scalar_returns_none_for_int_beyond_float_range(self) -> None:
+        """math.isfinite() raises OverflowError for an int >= 2**1024 rather
+        than answering; the helper's contract is "anything else returns None",
+        so the filter is reclassified as client-side instead of the
+        OverflowError escaping search_traces as a tool error."""
+        assert _render_traceql_scalar(10**400, FilterType.NUMBER) is None
+        # Boundary control: the largest power of two float() still holds.
+        assert _render_traceql_scalar(2**1023, FilterType.NUMBER) == repr(2**1023)
 
 
 async def test_tools_call_with_payload_filter_never_reaches_tempo_unquoted(

@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any
 from unittest.mock import patch
 
-from hypothesis import assume, given, settings
+from hypothesis import assume, example, given, settings
 from hypothesis import strategies as st
 
 from opentelemetry_mcp.attributes import SpanAttributes
@@ -88,6 +88,10 @@ def _make_trace(spans_attrs: list[dict[str, object]]) -> TraceData:
     actual=ARBITRARY_VALUE,
     expected=NON_NONE_VALUE,
 )
+# st.integers() all but never reaches 2**1024, where float() raises
+# OverflowError rather than ValueError; pin that case on both sides.
+@example(value_type=FilterType.NUMBER, operator=FilterOperator.GT, actual=10**400, expected=1)
+@example(value_type=FilterType.NUMBER, operator=FilterOperator.GT, actual=1, expected=10**400)
 def test_compare_value_never_raises_for_single_value_operators(
     value_type: FilterType,
     operator: FilterOperator,
@@ -153,10 +157,13 @@ def test_gt_lte_both_reject_nan_actual() -> None:
 
 
 def test_gt_lte_both_reject_nan_expected() -> None:
-    gt_filter = Filter(
+    """The Filter model now rejects a non-finite NUMBER operand itself, so
+    build these via model_construct to keep the engine's own compile-time
+    NaN gate under test for callers that bypass the model."""
+    gt_filter = _raw_filter(
         field="x", operator=FilterOperator.GT, value=math.nan, value_type=FilterType.NUMBER
     )
-    lte_filter = Filter(
+    lte_filter = _raw_filter(
         field="x", operator=FilterOperator.LTE, value=math.nan, value_type=FilterType.NUMBER
     )
     assert FilterEngine._compare_value(5.0, gt_filter) is False

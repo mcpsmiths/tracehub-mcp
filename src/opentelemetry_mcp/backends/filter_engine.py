@@ -256,9 +256,10 @@ class FilterEngine:
         NUMBER: value -> float (NaN rejected), values -> frozenset[float] plus
         the BETWEEN bounds when exactly two were given; BOOLEAN: value -> bool
         (IN/NOT_IN stay on the unknown-operator path); STRING: value -> str,
-        values -> frozenset[str]. A conversion failure marks the filter
-        invalid (False for every item) with one WARNING that names the filter,
-        never the operand.
+        values -> frozenset[str]. A conversion failure (ValueError, TypeError,
+        or the OverflowError float() raises for an int >= 2**1024) marks the
+        filter invalid (False for every item) with one WARNING that names the
+        filter, never the operand.
         """
         value = filter_obj.value
         values = filter_obj.values
@@ -295,7 +296,7 @@ class FilterEngine:
                 expected_str=str(value) if value is not None else "",
                 str_members=frozenset(str(v) for v in values) if values is not None else None,
             )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             logger.warning(
                 "Type conversion failed for the expected value(s) of filter on field %r "
                 "(operator=%s, value_type=%s); the filter matches nothing",
@@ -330,8 +331,9 @@ class FilterEngine:
         """Compare an actual value against a compiled filter condition.
 
         Only ``actual`` is converted here; the expected side was converted by
-        _compile. Any conversion failure returns False rather than raising,
-        after a WARNING that names the filter and the offending value's
+        _compile. Any conversion failure (including the OverflowError float()
+        raises for an int beyond float range) returns False rather than
+        raising, after a WARNING that names the filter and the offending value's
         Python type - never the value itself, which is span data (a prompt,
         a message list) that PRIVACY.md promises stays out of the server's
         own logs. ``warned`` deduplicates that WARNING per apply_filters
@@ -405,7 +407,7 @@ class FilterEngine:
                 elif operator == FilterOperator.NOT_IN:
                     return actual_str not in (compiled.str_members or frozenset())
 
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             actual_type = type(actual).__name__
             key: _ConversionWarningKey = (
                 filter_obj.field,
