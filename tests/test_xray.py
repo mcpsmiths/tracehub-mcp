@@ -306,8 +306,10 @@ class TestFilterExpression:
         assert backend._filter_to_xray_expression(f) == "duration > 5.0"
 
     def test_duration_rejects_bool_operand(self) -> None:
+        # model_construct: the Filter model itself now rejects a bool for
+        # NUMBER, so bypass it to test the builder's own gate.
         backend = _backend()
-        f = Filter(
+        f = Filter.model_construct(
             field="duration", operator=FilterOperator.GT, value=True, value_type=FilterType.NUMBER
         )
         assert backend._filter_to_xray_expression(f) is None

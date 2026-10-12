@@ -257,11 +257,12 @@ class TestBuildSentryQuery:
         assert backend._filter_to_sentry_query(f) == 'gen_ai.system:"a\\" OR system:*"'
 
     def test_range_operator_rejects_non_numeric_value(self) -> None:
-        """Filter.value_type isn't enforced against the actual Python type,
-        so a range operator with a string value must be rejected rather than
-        interpolated unchecked into a numeric range expression."""
+        """The Filter model now normalises NUMBER operands (a non-numeric str
+        is a ValidationError), so model_construct bypasses it here to prove
+        the builder's own type gate still rejects a string operand rather
+        than interpolating it unchecked into a numeric range expression."""
         backend = _backend()
-        f = Filter(
+        f = Filter.model_construct(
             field="duration",
             operator=FilterOperator.GT,
             value="1000ms OR span.duration:>0",
@@ -270,9 +271,10 @@ class TestBuildSentryQuery:
         assert backend._filter_to_sentry_query(f) is None
 
     def test_range_operator_rejects_bool_value(self) -> None:
-        """bool is an int subclass in Python but not a sensible range operand."""
+        """bool is an int subclass in Python but not a sensible range operand
+        (model_construct: the Filter model itself rejects a bool for NUMBER)."""
         backend = _backend()
-        f = Filter(
+        f = Filter.model_construct(
             field="duration", operator=FilterOperator.GTE, value=True, value_type=FilterType.NUMBER
         )
         assert backend._filter_to_sentry_query(f) is None

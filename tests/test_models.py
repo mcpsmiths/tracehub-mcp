@@ -2,8 +2,14 @@
 
 from datetime import datetime
 
+import pytest
+from pydantic import ValidationError
+
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.models import (
+    Filter,
+    FilterOperator,
+    FilterType,
     LLMSpanAttributes,
     SpanData,
     TraceData,
@@ -225,3 +231,112 @@ def test_trace_query_to_backend_params() -> None:
     assert isinstance(tags, str)
     assert "openai" in tags
     assert "custom.tag" in tags
+
+
+# -- Filter operand normalisation ---------------------------------------------
+# Audit: src/opentelemetry_mcp/backends/tempo.py:TempoBackend._filter_to_traceql:unescaped-non-string-value-splice
+
+
+class TestFilterOperandNormalization:
+    """Filter binds value/values to the declared value_type at validation
+    time, so every backend builder downstream can rely on a NUMBER operand
+    being a genuine int/float and a BOOLEAN operand being a genuine bool."""
+
+    def test_numeric_string_is_coerced_to_int_for_number(self) -> None:
+        f = Filter(
+            field="x", operator=FilterOperator.EQUALS, value="5000", value_type=FilterType.NUMBER
+        )
+        assert f.value == 5000
+        assert isinstance(f.value, int)
+
+    def test_decimal_string_is_coerced_to_float_for_number(self) -> None:
+        f = Filter(field="x", operator=FilterOperator.GT, value="1.5", value_type=FilterType.NUMBER)
+        assert f.value == 1.5
+        assert isinstance(f.value, float)
+
+    def test_genuine_numbers_are_left_unchanged(self) -> None:
+        assert (
+            Filter(
+                field="x", operator=FilterOperator.GT, value=5, value_type=FilterType.NUMBER
+            ).value
+            == 5
+        )
+        assert (
+            Filter(
+                field="x", operator=FilterOperator.GT, value=5.5, value_type=FilterType.NUMBER
+            ).value
+            == 5.5
+        )
+
+    @pytest.mark.parametrize("value", ["abc", '1 || resource.service.name =~ ".*"', "nan", "inf"])
+    def test_non_numeric_or_non_finite_string_is_rejected_for_number(self, value: str) -> None:
+        with pytest.raises(ValidationError):
+            Filter(
+                field="x", operator=FilterOperator.EQUALS, value=value, value_type=FilterType.NUMBER
+            )
+
+    def test_bool_is_rejected_for_number(self) -> None:
+        with pytest.raises(ValidationError):
+            Filter(
+                field="x", operator=FilterOperator.EQUALS, value=True, value_type=FilterType.NUMBER
+            )
+
+    @pytest.mark.parametrize(("value", "expected"), [("true", True), ("FALSE", False)])
+    def test_boolean_strings_are_coerced_case_insensitively(
+        self, value: str, expected: bool
+    ) -> None:
+        f = Filter(
+            field="x", operator=FilterOperator.EQUALS, value=value, value_type=FilterType.BOOLEAN
+        )
+        assert f.value is expected
+
+    @pytest.mark.parametrize("value", ["yes", 1, 0, "1"])
+    def test_non_boolean_operand_is_rejected_for_boolean(self, value: str | int) -> None:
+        with pytest.raises(ValidationError):
+            Filter(
+                field="x",
+                operator=FilterOperator.EQUALS,
+                value=value,
+                value_type=FilterType.BOOLEAN,
+            )
+
+    @pytest.mark.parametrize(("value", "expected"), [(1, "1"), (500, "500"), (1.5, "1.5")])
+    def test_scalars_are_coerced_to_str_for_string(self, value: int | float, expected: str) -> None:
+        f = Filter(
+            field="x", operator=FilterOperator.EQUALS, value=value, value_type=FilterType.STRING
+        )
+        assert f.value == expected
+
+    def test_values_items_are_normalised_too(self) -> None:
+        numbers = Filter(
+            field="x", operator=FilterOperator.IN, values=["1", "2.5"], value_type=FilterType.NUMBER
+        )
+        assert list(numbers.values or []) == [1, 2.5]
+        strings = Filter(
+            field="x", operator=FilterOperator.IN, values=[1, 2], value_type=FilterType.STRING
+        )
+        assert list(strings.values or []) == ["1", "2"]
+        with pytest.raises(ValidationError):
+            Filter(
+                field="x", operator=FilterOperator.IN, values=[1, "x"], value_type=FilterType.NUMBER
+            )
+
+    def test_unknown_filter_key_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="extra_forbidden|Extra inputs"):
+            Filter(
+                field="x",
+                operator=FilterOperator.EQUALS,
+                value="a",
+                value_type=FilterType.STRING,
+                logical_operator="AND",  # type: ignore[call-arg]
+            )
+
+    def test_empty_field_name_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            Filter(
+                field="", operator=FilterOperator.EQUALS, value="a", value_type=FilterType.STRING
+            )
+
+    def test_exists_operator_still_accepts_no_operand(self) -> None:
+        f = Filter(field="x", operator=FilterOperator.EXISTS, value_type=FilterType.NUMBER)
+        assert f.value is None and f.values is None

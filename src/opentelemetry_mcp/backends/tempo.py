@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import math
 import re
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -33,6 +34,38 @@ logger = logging.getLogger(__name__)
 # instead (mirrors datadog.py's `_VALID_DD_FIELD_RE` / sentry.py's
 # `_VALID_SENTRY_FIELD_RE`).
 _VALID_TRACEQL_FIELD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+
+_TRACEQL_RANGE_OPERATORS = {
+    FilterOperator.GT: ">",
+    FilterOperator.LT: "<",
+    FilterOperator.GTE: ">=",
+    FilterOperator.LTE: "<=",
+}
+
+
+def _render_traceql_scalar(value: object, value_type: FilterType) -> str | None:
+    """Render a NUMBER/BOOLEAN Filter operand as an unquoted TraceQL literal.
+
+    Only a genuine, finite int/float (not a bool) renders as a numeric
+    literal and only a genuine bool renders as ``true``/``false``. Anything
+    else - notably a str that merely *claims* value_type number/boolean -
+    returns None, so the caller reclassifies the filter as client-side
+    (where FilterEngine fails closed on an unparsable operand) instead of
+    f-string-splicing the raw value into the query. This is the non-string
+    counterpart of ``_escape_traceql_value``: a model-chosen filter value may
+    select a literal to compare against but must never add query structure.
+    """
+    if value_type == FilterType.NUMBER:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        if not math.isfinite(value):
+            return None
+        return repr(value)
+    if value_type == FilterType.BOOLEAN:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return None
+    return None
 
 
 class TempoBackend(BaseBackend):
@@ -604,38 +637,38 @@ class TempoBackend(BaseBackend):
                 return None
             traceql_field = f"span.{field}"
 
-        # Build condition based on operator
+        # Build condition based on operator. Non-STRING operands go through
+        # _render_traceql_scalar: a None result means the operand is not a
+        # genuine number/bool, and returning None here lets
+        # _build_traceql_from_filters reclassify the filter as client-side
+        # rather than splicing the raw value into the query.
         if operator == FilterOperator.EQUALS:
             if filter_obj.value_type == FilterType.STRING:
                 return f'{traceql_field} = "{self._escape_traceql_value(str(value))}"'
-            else:
-                return f"{traceql_field} = {value}"
+            scalar = _render_traceql_scalar(value, filter_obj.value_type)
+            if scalar is None:
+                return None
+            return f"{traceql_field} = {scalar}"
 
         elif operator == FilterOperator.NOT_EQUALS:
             if filter_obj.value_type == FilterType.STRING:
                 return f'{traceql_field} != "{self._escape_traceql_value(str(value))}"'
-            else:
-                return f"{traceql_field} != {value}"
+            scalar = _render_traceql_scalar(value, filter_obj.value_type)
+            if scalar is None:
+                return None
+            return f"{traceql_field} != {scalar}"
 
-        elif operator == FilterOperator.GT:
-            if field == "duration":
-                return f"{traceql_field} > {value}ms"
-            return f"{traceql_field} > {value}"
-
-        elif operator == FilterOperator.LT:
-            if field == "duration":
-                return f"{traceql_field} < {value}ms"
-            return f"{traceql_field} < {value}"
-
-        elif operator == FilterOperator.GTE:
-            if field == "duration":
-                return f"{traceql_field} >= {value}ms"
-            return f"{traceql_field} >= {value}"
-
-        elif operator == FilterOperator.LTE:
-            if field == "duration":
-                return f"{traceql_field} <= {value}ms"
-            return f"{traceql_field} <= {value}"
+        elif operator in _TRACEQL_RANGE_OPERATORS:
+            # Range comparisons are only meaningful against a numeric
+            # literal; a STRING-typed operand (or one that fails to render)
+            # is applied client-side instead.
+            if filter_obj.value_type != FilterType.NUMBER:
+                return None
+            scalar = _render_traceql_scalar(value, FilterType.NUMBER)
+            if scalar is None:
+                return None
+            unit = "ms" if field == "duration" else ""
+            return f"{traceql_field} {_TRACEQL_RANGE_OPERATORS[operator]} {scalar}{unit}"
 
         elif operator == FilterOperator.CONTAINS:
             # Use regex for contains. Escape regex metacharacters in the
@@ -657,7 +690,14 @@ class TempoBackend(BaseBackend):
                     f'{traceql_field} = "{self._escape_traceql_value(str(v))}"' for v in values
                 ]
             else:
-                or_conditions = [f"{traceql_field} = {v}" for v in values]
+                or_conditions = []
+                for v in values:
+                    scalar = _render_traceql_scalar(v, filter_obj.value_type)
+                    if scalar is None:
+                        # One non-renderable item disqualifies the whole OR
+                        # group: apply the filter client-side instead.
+                        return None
+                    or_conditions.append(f"{traceql_field} = {scalar}")
             return "(" + " || ".join(or_conditions) + ")"
 
         elif operator == FilterOperator.EXISTS:

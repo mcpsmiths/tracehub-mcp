@@ -8,6 +8,7 @@ built from hand-picked examples are unlikely to stumble onto.
 
 import math
 from datetime import datetime
+from typing import Any
 
 from hypothesis import assume, given
 from hypothesis import strategies as st
@@ -43,6 +44,17 @@ SINGLE_VALUE_OPERATORS = [
     FilterOperator.STARTS_WITH,
     FilterOperator.ENDS_WITH,
 ]
+
+
+def _raw_filter(**fields: Any) -> Filter:
+    """Build a Filter with the model-level operand normalisation bypassed.
+
+    The Filter model now rejects/coerces operands that disagree with their
+    declared value_type, so a validated Filter can no longer carry e.g. a
+    str under NUMBER. The engine's never-raises contract must still hold for
+    such un-normalised filters (fail closed), so these property tests feed
+    them in via model_construct."""
+    return Filter.model_construct(**fields)
 
 
 def _make_span(index: int, attrs: dict[str, object] | None = None) -> SpanData:
@@ -86,7 +98,7 @@ def test_compare_value_never_raises_for_single_value_operators(
     input shape must come back as a plain bool, for every operator/type
     combination, including ones that are semantically mismatched
     (e.g. CONTAINS against value_type=NUMBER)."""
-    filt = Filter(field="x", operator=operator, value=expected, value_type=value_type)
+    filt = _raw_filter(field="x", operator=operator, value=expected, value_type=value_type)
     result = FilterEngine._compare_value(actual, filt)
     assert isinstance(result, bool)
 
@@ -101,7 +113,7 @@ def test_compare_value_never_raises_for_in_operators(
     actual: str | int | float | bool | None,
     values: list[str | int | float | bool],
 ) -> None:
-    filt = Filter(field="x", operator=FilterOperator.IN, values=values, value_type=value_type)
+    filt = _raw_filter(field="x", operator=FilterOperator.IN, values=values, value_type=value_type)
     result = FilterEngine._compare_value(actual, filt)
     assert isinstance(result, bool)
 
@@ -116,7 +128,9 @@ def test_compare_value_never_raises_for_between(
     actual: str | int | float | bool | None,
     values: list[str | int | float | bool],
 ) -> None:
-    filt = Filter(field="x", operator=FilterOperator.BETWEEN, values=values, value_type=value_type)
+    filt = _raw_filter(
+        field="x", operator=FilterOperator.BETWEEN, values=values, value_type=value_type
+    )
     result = FilterEngine._compare_value(actual, filt)
     assert isinstance(result, bool)
 
