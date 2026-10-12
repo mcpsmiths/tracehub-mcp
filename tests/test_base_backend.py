@@ -676,6 +676,31 @@ class TestBoundedResponse:
         assert stream.reads == 0
         assert stream.closed is True
 
+    async def test_absurdly_long_content_length_is_rejected_without_parsing(self) -> None:
+        """int() refuses a digit string longer than
+        sys.int_info.str_digits_check_threshold (4300) with a bare
+        ValueError, which would escape as an unrelated interpreter message
+        and skip the aclose(). A run of digits longer than any cap could
+        need is oversized without being parsed, and the message must not
+        copy those digits into the tool-error channel."""
+        stream = _RecordingStream(b"x" * 16)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"Content-Length": "9" * 5000}, stream=stream)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            with pytest.raises(ResponseTooLargeError, match="Content-Length") as exc_info:
+                await client.get("/api/services")
+
+        assert "5000 digits" in str(exc_info.value)
+        assert "9" * 50 not in str(exc_info.value)
+        assert stream.reads == 0
+        assert stream.closed is True
+
     async def test_non_numeric_content_length_is_ignored_and_body_counted(self) -> None:
         gz = _gzip_json_body(2 * _ONE_MIB)
 

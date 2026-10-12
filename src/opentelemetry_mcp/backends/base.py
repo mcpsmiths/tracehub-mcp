@@ -85,6 +85,12 @@ class RedirectTargetBlockedError(httpx.TransportError):
 # Jaeger response in normal use; BACKEND_MAX_RESPONSE_BYTES raises or lowers
 # it per deployment (config.py).
 DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+# int() refuses a digit string longer than sys.int_info.str_digits_check_threshold
+# (4300 digits) with a bare ValueError. A Content-Length with more digits than
+# this is oversized by construction (19 digits is already ~10^9 times the 1 GiB
+# config ceiling), so it is refused without being parsed - as
+# ResponseTooLargeError, not as an unrelated interpreter message.
+_MAX_CONTENT_LENGTH_DIGITS = 19
 
 
 class ResponseTooLargeError(httpx.TransportError):
@@ -328,11 +334,19 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
             declared_length is not None
             and declared_length.isascii()
             and declared_length.isdigit()
-            and int(declared_length) > self._max_response_bytes
+            and (
+                len(declared_length) > _MAX_CONTENT_LENGTH_DIGITS
+                or int(declared_length) > self._max_response_bytes
+            )
         ):
             await response.aclose()
+            shown = (
+                declared_length
+                if len(declared_length) <= _MAX_CONTENT_LENGTH_DIGITS
+                else f"<{len(declared_length)} digits>"
+            )
             raise ResponseTooLargeError(
-                f"Backend response declared Content-Length {declared_length}, above the "
+                f"Backend response declared Content-Length {shown}, above the "
                 f"{self._max_response_bytes}-byte BACKEND_MAX_RESPONSE_BYTES cap"
             )
         response = _BoundedResponse(response, self._max_response_bytes)
