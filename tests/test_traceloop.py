@@ -581,3 +581,24 @@ class TestGetTraceEscapesTraceId:
         requested_endpoint = backend._client.get.call_args[0][0]
         assert "../" not in requested_endpoint
         assert "%2F.." in requested_endpoint or "..%2F" in requested_endpoint
+
+
+class TestGetTraceRejectsDotSegmentTraceId:
+    """ "", "." and ".." survive percent-encoding as whole path segments and
+    httpx removes them when merging onto base_url, so they must be rejected
+    before any request is built.
+
+    Audit: src/opentelemetry_mcp/backends/sentry.py:SentryBackend.get_trace:dot-segment-trace-id
+    """
+
+    @pytest.mark.parametrize("trace_id", ["..", ".", ""])
+    async def test_dot_segment_trace_id_raises_before_any_request(self, trace_id: str) -> None:
+        backend = TraceloopBackend(url="https://api.traceloop.com/v2", api_key=_FAKE_API_KEY)
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock()
+
+        with pytest.raises(ValueError, match="Invalid trace_id"):
+            await backend.get_trace(trace_id)
+
+        backend._client.get.assert_not_awaited()

@@ -912,3 +912,67 @@ async def test_tools_call_with_payload_filter_never_reaches_tempo_unquoted(
     assert traces_rejected
     assert spans_rejected
     assert all("resource.service.name =~" not in q for q in captured_queries)
+
+
+# -- Regression tests: dot-segment trace ids collapse the request path --------
+# Audit: src/opentelemetry_mcp/backends/sentry.py:SentryBackend.get_trace:dot-segment-trace-id
+
+
+def _wire_tempo_backend(
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> tuple[TempoBackend, list[str]]:
+    """TempoBackend terminating in a MockTransport that records every
+    emitted request's raw path (the string handed to a mocked client.get
+    cannot show httpx collapsing "." / ".." during the base_url merge)."""
+    backend = TempoBackend(url="http://localhost:3200")
+    raw_paths: list[str] = []
+
+    async def recording_handler(request: httpx.Request) -> httpx.Response:
+        raw_paths.append(request.url.raw_path.decode())
+        return handler(request)
+
+    backend._client = httpx.AsyncClient(
+        base_url=backend.url, transport=httpx.MockTransport(recording_handler)
+    )
+    return backend, raw_paths
+
+
+class TestTempoPathSegmentSafety:
+    @pytest.mark.parametrize("trace_id", ["..", ".", ""])
+    async def test_get_trace_with_dot_segment_id_raises_and_emits_no_request(
+        self, trace_id: str
+    ) -> None:
+        backend, raw_paths = _wire_tempo_backend(
+            lambda request: httpx.Response(200, json=_minimal_otlp_trace("abc", status_code=1))
+        )
+
+        with pytest.raises(ValueError, match="Invalid trace_id"):
+            await backend.get_trace(trace_id)
+
+        assert raw_paths == []
+
+    @pytest.mark.parametrize("search", ["search_traces", "search_spans"])
+    async def test_hydration_skips_dot_segment_ids_without_leaving_api_traces(
+        self, search: str
+    ) -> None:
+        """Both hydration loops read trace ids from Tempo's own /api/search
+        rows; a ".." or "." row must never produce a GET outside
+        /api/traces/, and the remaining row still hydrates."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/search":
+                return httpx.Response(
+                    200, json={"traces": [{"traceID": ".."}, {"traceID": "."}, {"traceID": "abc"}]}
+                )
+            return httpx.Response(200, json=_minimal_otlp_trace("abc", status_code=1))
+
+        backend, raw_paths = _wire_tempo_backend(handler)
+
+        if search == "search_traces":
+            results: list[Any] = await backend.search_traces(TraceQuery(limit=10))
+        else:
+            results = await backend.search_spans(SpanQuery(limit=10))
+
+        assert len(results) >= 1
+        fetches = [p for p in raw_paths if not p.startswith("/api/search")]
+        assert fetches == ["/api/traces/abc"]

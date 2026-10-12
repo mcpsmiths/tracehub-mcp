@@ -7,11 +7,11 @@ import math
 import re
 from datetime import UTC, datetime
 from typing import Any, Literal
-from urllib.parse import quote
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes, SpanEvent
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
+from opentelemetry_mcp.backends.url_path import safe_path_segment
 from opentelemetry_mcp.models import (
     Filter,
     FilterOperator,
@@ -219,7 +219,7 @@ class TempoBackend(BaseBackend):
                 attempted_fetches += 1
                 try:
                     trace_response = await self.client.get(
-                        f"/api/traces/{quote(trace_id, safe='')}"
+                        f"/api/traces/{safe_path_segment(trace_id, 'trace_id')}"
                     )
                     trace_response.raise_for_status()
                     trace_data = trace_response.json()
@@ -369,7 +369,7 @@ class TempoBackend(BaseBackend):
                 attempted_fetches += 1
                 try:
                     trace_response = await self.client.get(
-                        f"/api/traces/{quote(trace_id, safe='')}"
+                        f"/api/traces/{safe_path_segment(trace_id, 'trace_id')}"
                     )
                     trace_response.raise_for_status()
                     trace_data = trace_response.json()
@@ -400,10 +400,10 @@ class TempoBackend(BaseBackend):
     async def get_trace(self, trace_id: str) -> TraceData:
         """Get a specific trace by ID from Tempo."""
         # trace_id is an unvalidated MCP tool argument and is a URL *path*
-        # segment here - path-escape it before interpolating (mirrors
-        # sentry.py's identical quote(trace_id, safe="") at its own
-        # /trace/{id}/ path-segment call site).
-        response = await self.client.get(f"/api/traces/{quote(trace_id, safe='')}")
+        # segment here - safe_path_segment path-escapes it and rejects the
+        # "" / "." / ".." values httpx would otherwise collapse into a
+        # different endpoint (see backends/url_path.py).
+        response = await self.client.get(f"/api/traces/{safe_path_segment(trace_id, 'trace_id')}")
         response.raise_for_status()
         data = response.json()
         # Pass trace_id_hex to ensure consistent trace ID format (hex instead of base64)

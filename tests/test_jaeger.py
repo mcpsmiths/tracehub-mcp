@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
 from opentelemetry_mcp.models import (
     Filter,
@@ -229,6 +231,43 @@ class TestUrlPathEscaping:
 
         called_path = backend._client.get.call_args[0][0]
         assert called_path == "/api/services/..%2Fsecret/operations"
+
+
+class TestPathSegmentDotReferences:
+    """ "", "." and ".." survive percent-encoding as whole path segments and
+    httpx removes them when merging onto base_url, so they must be rejected
+    before any request is built (see sentry.py's get_trace for the audit).
+
+    Audit: src/opentelemetry_mcp/backends/sentry.py:SentryBackend.get_trace:dot-segment-trace-id
+    """
+
+    @pytest.mark.parametrize("trace_id", ["..", ".", ""])
+    async def test_get_trace_rejects_dot_segment_ids_before_any_request(
+        self, trace_id: str
+    ) -> None:
+        backend = JaegerBackend(url="http://localhost:16686")
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock()
+
+        with pytest.raises(ValueError, match="Invalid trace_id"):
+            await backend.get_trace(trace_id)
+
+        backend._client.get.assert_not_awaited()
+
+    @pytest.mark.parametrize("service_name", ["..", ".", ""])
+    async def test_get_service_operations_rejects_dot_segment_names_before_any_request(
+        self, service_name: str
+    ) -> None:
+        backend = JaegerBackend(url="http://localhost:16686")
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock()
+
+        with pytest.raises(ValueError, match="Invalid service_name"):
+            await backend.get_service_operations(service_name)
+
+        backend._client.get.assert_not_awaited()
 
 
 class TestNativeFilterApplication:

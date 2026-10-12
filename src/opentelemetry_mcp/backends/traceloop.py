@@ -3,11 +3,11 @@
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
-from urllib.parse import quote
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes, SpanEvent
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
+from opentelemetry_mcp.backends.url_path import safe_path_segment
 from opentelemetry_mcp.constants import Fields, GenAI, LegacyLLM, Service
 from opentelemetry_mcp.models import (
     Filter,
@@ -325,11 +325,12 @@ class TraceloopBackend(BaseBackend):
         logger.debug(f"Getting trace: {trace_id}")
 
         # trace_id is an unvalidated MCP tool argument used as a URL path
-        # segment - encode it so a crafted value (e.g. containing "../")
-        # can't redirect this request to a different path, matching
-        # jaeger.py's/sentry.py's/tempo.py's identical fix for the same
-        # get_trace(trace_id) shape.
-        endpoint = f"/v2/projects/{self.project_id}/traces/{quote(trace_id, safe='')}/spans"
+        # segment - safe_path_segment encodes it and rejects the bare
+        # "" / "." / ".." values httpx would collapse, so a crafted value
+        # can't redirect this request to a different path (matching
+        # jaeger.py's/sentry.py's/tempo.py's get_trace; see url_path.py).
+        encoded_trace_id = safe_path_segment(trace_id, "trace_id")
+        endpoint = f"/v2/projects/{self.project_id}/traces/{encoded_trace_id}/spans"
         response = await self.client.get(endpoint)
         response.raise_for_status()
 

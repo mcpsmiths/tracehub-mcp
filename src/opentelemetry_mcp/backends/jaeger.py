@@ -3,11 +3,11 @@
 import logging
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import quote
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes, SpanEvent
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
+from opentelemetry_mcp.backends.url_path import safe_path_segment
 from opentelemetry_mcp.constants import Fields
 from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceData, TraceQuery
 
@@ -233,10 +233,10 @@ class JaegerBackend(BaseBackend):
         logger.debug(f"Fetching trace: {trace_id}")
 
         # trace_id can originate from an external MCP tool call. It's a URL
-        # *path* segment here, so a crafted value (e.g. containing "../")
-        # could redirect the outbound request to a different path if left
-        # unescaped - see sentry.py's get_trace for the identical pattern.
-        encoded_trace_id = quote(trace_id, safe="")
+        # *path* segment here, so a crafted value (e.g. containing "../", or
+        # the bare "." / ".." httpx would collapse) could redirect the
+        # outbound request to a different path - see backends/url_path.py.
+        encoded_trace_id = safe_path_segment(trace_id, "trace_id")
         response = await self.client.get(f"/api/traces/{encoded_trace_id}")
         response.raise_for_status()
 
@@ -288,9 +288,9 @@ class JaegerBackend(BaseBackend):
         logger.debug(f"Getting operations for service: {service_name}")
 
         # service_name can originate from an external MCP tool call and is a
-        # URL *path* segment here - encode it the same way get_trace encodes
+        # URL *path* segment here - guard it the same way get_trace guards
         # trace_id, to avoid a crafted value redirecting the request.
-        encoded_service_name = quote(service_name, safe="")
+        encoded_service_name = safe_path_segment(service_name, "service_name")
         response = await self.client.get(f"/api/services/{encoded_service_name}/operations")
         response.raise_for_status()
 
