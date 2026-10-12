@@ -13,7 +13,12 @@ from unittest.mock import AsyncMock
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery
-from opentelemetry_mcp.tools.correlate import correlate_trace
+from opentelemetry_mcp.tools.correlate import (
+    _LIMITATIONS,
+    _MAX_SEARCH_WINDOW,
+    _SEARCH_WINDOW_PAD,
+    correlate_trace,
+)
 
 _BASE_TIME = datetime(2024, 1, 1, tzinfo=UTC)
 
@@ -40,12 +45,12 @@ def _span(
     )
 
 
-def _trace(spans: list[SpanData], *, trace_id: str = "t1") -> TraceData:
+def _trace(spans: list[SpanData], *, trace_id: str = "t1", duration_ms: float = 100.0) -> TraceData:
     return TraceData(
         trace_id=trace_id,
         spans=spans,
         start_time=_BASE_TIME,
-        duration_ms=100.0,
+        duration_ms=duration_ms,
         service_name=spans[0].service_name if spans else "svc-a",
         root_operation="root-op",
         status="OK",
@@ -251,12 +256,14 @@ class TestHeuristicFallback:
         secondary.get_trace.side_effect = ValueError("not found")
         secondary.search_traces.return_value = []
 
-        await correlate_trace(primary, secondary, "t1")
+        result = await correlate_trace(primary, secondary, "t1")
 
         query: TraceQuery = secondary.search_traces.await_args.args[0]
         assert query.service_name == "svc-a"
         assert query.start_time == _BASE_TIME - timedelta(seconds=5)
         assert query.end_time == _BASE_TIME + timedelta(milliseconds=100.0) + timedelta(seconds=5)
+        # An ordinary extent adds no per-call truncation note.
+        assert result.limitations == _LIMITATIONS
 
     async def test_candidate_with_no_service_overlap_is_filtered_out(self) -> None:
         primary = _backend()
@@ -345,3 +352,78 @@ class TestHeuristicFallback:
             call.args[0].service_name for call in secondary.search_traces.await_args_list
         }
         assert queried_services == {"svc-a", "svc-b"}
+
+
+class TestSearchWindowCap:
+    """The heuristic window is derived from telemetry-controlled
+    TraceData.start_time/duration_ms, so a telemetry author who places two
+    spans years apart in one trace would otherwise choose the time range of
+    every secondary search issued under the operator's secondary credential."""
+
+    async def test_heuristic_window_is_capped_for_wide_primary_extents(self) -> None:
+        primary = _backend()
+        primary.get_trace.return_value = _trace(
+            [_span("p1", service_name="svc-a")],
+            duration_ms=timedelta(days=365) / timedelta(milliseconds=1),
+        )
+        secondary = _backend()
+        secondary.get_trace.side_effect = ValueError("not found")
+        secondary.search_traces.return_value = []
+
+        result = await correlate_trace(primary, secondary, "t1")
+
+        query: TraceQuery = secondary.search_traces.await_args.args[0]
+        assert query.start_time is not None and query.end_time is not None
+        assert query.start_time == _BASE_TIME - _SEARCH_WINDOW_PAD
+        assert query.end_time - query.start_time == _MAX_SEARCH_WINDOW + 2 * _SEARCH_WINDOW_PAD
+        assert result.limitations[: len(_LIMITATIONS)] == _LIMITATIONS
+        cap_notes = [note for note in result.limitations[len(_LIMITATIONS) :] if "capped" in note]
+        assert len(cap_notes) == 1
+        assert len(result.limitations) == len(_LIMITATIONS) + 1
+        # The module-level fixed list itself is never mutated by a call.
+        assert len(_LIMITATIONS) == 4
+        assert all("capped" not in note for note in _LIMITATIONS)
+
+    async def test_capped_window_is_identical_for_every_service_query(self) -> None:
+        primary = _backend()
+        primary.get_trace.return_value = _trace(
+            [
+                _span("p1", service_name="svc-a"),
+                _span("p2", service_name="svc-b"),
+                _span("p3", service_name="svc-c"),
+            ],
+            duration_ms=timedelta(days=24 * 365) / timedelta(milliseconds=1),
+        )
+        secondary = _backend()
+        secondary.get_trace.side_effect = ValueError("not found")
+        secondary.search_traces.return_value = []
+
+        await correlate_trace(primary, secondary, "t1")
+
+        assert secondary.search_traces.await_count == 3
+        windows = {
+            (call.args[0].start_time, call.args[0].end_time)
+            for call in secondary.search_traces.await_args_list
+        }
+        assert windows == {
+            (_BASE_TIME - _SEARCH_WINDOW_PAD, _BASE_TIME + _MAX_SEARCH_WINDOW + _SEARCH_WINDOW_PAD)
+        }
+
+    async def test_negative_duration_is_treated_as_zero(self) -> None:
+        # SpanData/TraceData.duration_ms has no ge=0 constraint - clock skew
+        # between services can yield a negative extent, which must not
+        # invert the window or raise.
+        primary = _backend()
+        primary.get_trace.return_value = _trace(
+            [_span("p1", service_name="svc-a")], duration_ms=-500.0
+        )
+        secondary = _backend()
+        secondary.get_trace.side_effect = ValueError("not found")
+        secondary.search_traces.return_value = []
+
+        result = await correlate_trace(primary, secondary, "t1")
+
+        query: TraceQuery = secondary.search_traces.await_args.args[0]
+        assert query.start_time is not None and query.end_time is not None
+        assert query.end_time - query.start_time == 2 * _SEARCH_WINDOW_PAD
+        assert result.limitations == _LIMITATIONS

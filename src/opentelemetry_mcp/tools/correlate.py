@@ -27,6 +27,7 @@ from opentelemetry_mcp.tools import span_tree
 logger = logging.getLogger(__name__)
 
 _SEARCH_WINDOW_PAD = timedelta(seconds=5)
+_MAX_SEARCH_WINDOW = timedelta(hours=24)
 _MAX_CANDIDATES_PER_SERVICE_QUERY = 20
 _MAX_REPORTED_MATCHES = 5
 
@@ -103,14 +104,20 @@ async def correlate_trace(
     Returns:
         CorrelationResult with every candidate match found (direct
         trace_id match, if any, else up to 5 time-window/service-overlap
-        heuristic candidates) and a fixed list of limitations that always
-        apply to this kind of best-effort cross-backend correlation.
+        heuristic candidates) and the fixed limitations that always apply
+        to this kind of best-effort cross-backend correlation, plus any
+        per-call truncation notes - the heuristic search window is capped
+        at _MAX_SEARCH_WINDOW (24 h) after the primary trace's start, however
+        wide an extent the primary trace's spans claim.
     """
     primary_trace = await primary_backend.get_trace(trace_id)
     primary_services = {span.service_name for span in primary_trace.spans}
     primary_has_error, primary_blamed_service = _error_signal(primary_trace)
 
     matches: list[CorrelationMatch] = []
+    # Per-call copy: truncation notes are appended below, never to the
+    # module-level list shared by every call.
+    limitations = list(_LIMITATIONS)
 
     try:
         secondary_trace: TraceData | None = await secondary_backend.get_trace(trace_id)
@@ -137,18 +144,29 @@ async def correlate_trace(
             )
         )
         return CorrelationResult(
-            primary_trace_id=trace_id, matches=matches, limitations=_LIMITATIONS
+            primary_trace_id=trace_id, matches=matches, limitations=limitations
         )
 
     # Heuristic fallback: query per primary service name (not one filter-
     # less call) so this works against backends like Jaeger that require
     # `service_name` on search_traces, not just the ones where it's optional.
+    #
+    # The window is derived from the primary trace's own start/duration,
+    # which every backend parser computes as min(span start)..max(span end)
+    # over telemetry-authored timestamps - two spans dated years apart would
+    # otherwise make every secondary search below scan years of the
+    # operator's secondary account. Cap the extent (a clock-skewed negative
+    # duration counts as zero) and keep the window anchored at the primary
+    # start, so correlation still works for the trace's beginning.
+    extent = timedelta(milliseconds=max(primary_trace.duration_ms, 0))
+    if extent > _MAX_SEARCH_WINDOW:
+        limitations.append(
+            f"Primary trace spans {extent}; the secondary search window was capped "
+            f"at {_MAX_SEARCH_WINDOW} after its start."
+        )
+        extent = _MAX_SEARCH_WINDOW
     start_time = primary_trace.start_time - _SEARCH_WINDOW_PAD
-    end_time = (
-        primary_trace.start_time
-        + timedelta(milliseconds=primary_trace.duration_ms)
-        + _SEARCH_WINDOW_PAD
-    )
+    end_time = primary_trace.start_time + extent + _SEARCH_WINDOW_PAD
     candidates_by_id: dict[str, TraceData] = {}
     # Sorted rather than iterated directly off the set: str hashing (and
     # therefore set iteration order) is randomized per-process by default
@@ -206,4 +224,4 @@ async def correlate_trace(
         if len(matches) >= _MAX_REPORTED_MATCHES:
             break
 
-    return CorrelationResult(primary_trace_id=trace_id, matches=matches, limitations=_LIMITATIONS)
+    return CorrelationResult(primary_trace_id=trace_id, matches=matches, limitations=limitations)
