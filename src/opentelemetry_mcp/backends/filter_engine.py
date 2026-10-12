@@ -2,6 +2,7 @@
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any, TypeVar, overload
 
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, SpanData, TraceData
@@ -9,6 +10,31 @@ from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, SpanDat
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", TraceData, SpanData)
+
+
+@dataclass(frozen=True, slots=True)
+class _CompiledFilter:
+    """A Filter whose expected operand(s) have been converted to the declared
+    value_type exactly once, so comparing it against N span values costs N
+    conversions of the span side only (and O(1) IN/NOT_IN membership) rather
+    than rebuilding and linearly scanning the converted values list per span.
+
+    ``invalid`` is set when the expected operand(s) could not be converted;
+    such a filter evaluates to False for every item, as the per-call engine
+    did, after a single payload-free WARNING at compile time.
+    """
+
+    filter: Filter
+    invalid: bool = False
+    # NUMBER
+    expected_number: float | None = None
+    number_members: frozenset[float] | None = None
+    between: tuple[float, float] | None = None
+    # BOOLEAN
+    expected_bool: bool | None = None
+    # STRING
+    expected_str: str = ""
+    str_members: frozenset[str] | None = None
 
 
 class FilterEngine:
@@ -38,16 +64,20 @@ class FilterEngine:
         if not filters:
             return items
 
+        # Convert every filter's expected operand(s) exactly once per call;
+        # the per-item loop below only ever converts the item's own value.
+        compiled_filters = [FilterEngine._compile(f) for f in filters]
+
         filtered_items: list[TraceData] | list[SpanData]
         if isinstance(items[0] if items else None, TraceData):
             filtered_items = []
             for item in items:
-                if FilterEngine._matches_all_filters(item, filters):
+                if FilterEngine._matches_all_filters(item, compiled_filters):
                     filtered_items.append(item)  # type: ignore[arg-type]
         else:
             filtered_items = []
             for item in items:
-                if FilterEngine._matches_all_filters(item, filters):
+                if FilterEngine._matches_all_filters(item, compiled_filters):
                     filtered_items.append(item)  # type: ignore[arg-type]
 
         logger.debug(
@@ -56,12 +86,14 @@ class FilterEngine:
         return filtered_items
 
     @staticmethod
-    def _matches_all_filters(item: TraceData | SpanData, filters: list[Filter]) -> bool:
+    def _matches_all_filters(
+        item: TraceData | SpanData, filters: list[_CompiledFilter] | list[Filter]
+    ) -> bool:
         """Check if an item (trace or span) matches all filters (AND logic).
 
         Args:
             item: Trace or span to check
-            filters: List of filters to apply
+            filters: List of (compiled) filters to apply
 
         Returns:
             True if item matches all filters
@@ -72,18 +104,23 @@ class FilterEngine:
         return True
 
     @staticmethod
-    def _matches_filter(item: TraceData | SpanData, filter_obj: Filter) -> bool:
+    def _matches_filter(item: TraceData | SpanData, filter_obj: Filter | _CompiledFilter) -> bool:
         """Check if an item (trace or span) matches a single filter.
 
         Args:
             item: Trace or span to check
-            filter_obj: Filter to apply
+            filter_obj: Filter to apply (a raw Filter is compiled on the spot)
 
         Returns:
             True if item matches the filter
         """
-        field = filter_obj.field
-        operator = filter_obj.operator
+        compiled = (
+            filter_obj
+            if isinstance(filter_obj, _CompiledFilter)
+            else FilterEngine._compile(filter_obj)
+        )
+        field = compiled.filter.field
+        operator = compiled.filter.operator
 
         # Get values from item (may check multiple spans for traces, single span for spans)
         values = FilterEngine._get_field_values(item, field)
@@ -107,9 +144,9 @@ class FilterEngine:
         }
 
         if operator in negative_ops:
-            return all(FilterEngine._compare_value(value, filter_obj) for value in values)
+            return all(FilterEngine._compare_compiled(value, compiled) for value in values)
 
-        return any(FilterEngine._compare_value(value, filter_obj) for value in values)
+        return any(FilterEngine._compare_compiled(value, compiled) for value in values)
 
     @staticmethod
     def _get_field_values(item: TraceData | SpanData, field: str) -> list[Any]:
@@ -198,8 +235,67 @@ class FilterEngine:
         return [v for v in values if v is not None]
 
     @staticmethod
+    def _compile(filter_obj: Filter) -> _CompiledFilter:
+        """Convert a Filter's expected operand(s) to its declared value_type once.
+
+        NUMBER: value -> float (NaN rejected), values -> frozenset[float] plus
+        the BETWEEN bounds when exactly two were given; BOOLEAN: value -> bool
+        (IN/NOT_IN stay on the unknown-operator path); STRING: value -> str,
+        values -> frozenset[str]. A conversion failure marks the filter
+        invalid (False for every item) with one WARNING that names the filter,
+        never the operand.
+        """
+        value = filter_obj.value
+        values = filter_obj.values
+        try:
+            if filter_obj.value_type == FilterType.NUMBER:
+                expected_number = float(value) if value is not None else None
+                # NaN compares False against everything, including itself, so
+                # GT/LTE (and LT/GTE) would silently agree on False instead of
+                # being complements - reject it once here like any other
+                # malformed numeric operand.
+                if expected_number is not None and math.isnan(expected_number):
+                    raise ValueError("NaN is not a comparable numeric value")
+                numbers = [float(v) for v in values] if values is not None else None
+                between: tuple[float, float] | None = None
+                if (
+                    filter_obj.operator == FilterOperator.BETWEEN
+                    and numbers is not None
+                    and len(numbers) == 2
+                ):
+                    between = (numbers[0], numbers[1])
+                return _CompiledFilter(
+                    filter=filter_obj,
+                    expected_number=expected_number,
+                    number_members=frozenset(numbers) if numbers is not None else None,
+                    between=between,
+                )
+            if filter_obj.value_type == FilterType.BOOLEAN:
+                return _CompiledFilter(
+                    filter=filter_obj,
+                    expected_bool=bool(value) if value is not None else None,
+                )
+            return _CompiledFilter(
+                filter=filter_obj,
+                expected_str=str(value) if value is not None else "",
+                str_members=frozenset(str(v) for v in values) if values is not None else None,
+            )
+        except (ValueError, TypeError):
+            logger.warning(
+                "Type conversion failed for the expected value(s) of filter on field %r "
+                "(operator=%s, value_type=%s); the filter matches nothing",
+                filter_obj.field,
+                filter_obj.operator.value,
+                filter_obj.value_type.value,
+            )
+            return _CompiledFilter(filter=filter_obj, invalid=True)
+
+    @staticmethod
     def _compare_value(actual: Any, filter_obj: Filter) -> bool:
         """Compare an actual value against a filter condition.
+
+        Thin adapter over _compile + _compare_compiled for callers holding a
+        raw Filter; apply_filters compiles each filter once up front instead.
 
         Args:
             actual: Actual value from trace/span
@@ -208,28 +304,28 @@ class FilterEngine:
         Returns:
             True if actual value matches the filter condition
         """
-        operator = filter_obj.operator
-        expected = filter_obj.value
-        expected_values = filter_obj.values
+        return FilterEngine._compare_compiled(actual, FilterEngine._compile(filter_obj))
 
-        # Convert to appropriate type
+    @staticmethod
+    def _compare_compiled(actual: Any, compiled: _CompiledFilter) -> bool:
+        """Compare an actual value against a compiled filter condition.
+
+        Only ``actual`` is converted here; the expected side was converted by
+        _compile. Any conversion failure returns False rather than raising.
+        """
+        if compiled.invalid:
+            return False
+
+        filter_obj = compiled.filter
+        operator = filter_obj.operator
+
         try:
             if filter_obj.value_type == FilterType.NUMBER:
                 actual_num = float(actual)
-                expected_num = float(expected) if expected is not None else None
-                expected_values_num = (
-                    [float(v) for v in expected_values] if expected_values is not None else None
-                )
-
-                # NaN compares False against everything, including itself, so GT/LTE
-                # (and LT/GTE) silently agree on False instead of being complements -
-                # a NaN-valued attribute would otherwise pass neither a "greater than"
-                # nor a "less than or equal to" filter, rather than being rejected
-                # once like any other malformed numeric value below.
-                if math.isnan(actual_num) or (
-                    expected_num is not None and math.isnan(expected_num)
-                ):
-                    raise ValueError(f"NaN is not a comparable numeric value: {actual!r}")
+                # See _compile for why NaN is rejected rather than compared.
+                if math.isnan(actual_num):
+                    raise ValueError("NaN is not a comparable numeric value")
+                expected_num = compiled.expected_number
 
                 # Apply numeric operators
                 if operator == FilterOperator.EQUALS:
@@ -245,17 +341,18 @@ class FilterEngine:
                 elif operator == FilterOperator.LTE:
                     return actual_num <= expected_num if expected_num is not None else False
                 elif operator == FilterOperator.IN:
-                    return actual_num in (expected_values_num or [])
+                    return actual_num in (compiled.number_members or frozenset())
                 elif operator == FilterOperator.NOT_IN:
-                    return actual_num not in (expected_values_num or [])
+                    return actual_num not in (compiled.number_members or frozenset())
                 elif operator == FilterOperator.BETWEEN:
-                    if expected_values_num and len(expected_values_num) == 2:
-                        return expected_values_num[0] <= actual_num <= expected_values_num[1]
+                    if compiled.between is not None:
+                        low, high = compiled.between
+                        return low <= actual_num <= high
                     return False
 
             elif filter_obj.value_type == FilterType.BOOLEAN:
                 actual_bool = bool(actual)
-                expected_bool = bool(expected) if expected is not None else None
+                expected_bool = compiled.expected_bool
 
                 if operator == FilterOperator.EQUALS:
                     return actual_bool == expected_bool
@@ -264,10 +361,7 @@ class FilterEngine:
 
             else:  # STRING
                 actual_str = str(actual)
-                expected_str = str(expected) if expected is not None else ""
-                expected_values_str = (
-                    [str(v) for v in expected_values] if expected_values is not None else None
-                )
+                expected_str = compiled.expected_str
 
                 # String operators
                 if operator == FilterOperator.EQUALS:
@@ -283,9 +377,9 @@ class FilterEngine:
                 elif operator == FilterOperator.ENDS_WITH:
                     return actual_str.endswith(expected_str)
                 elif operator == FilterOperator.IN:
-                    return actual_str in (expected_values_str or [])
+                    return actual_str in (compiled.str_members or frozenset())
                 elif operator == FilterOperator.NOT_IN:
-                    return actual_str not in (expected_values_str or [])
+                    return actual_str not in (compiled.str_members or frozenset())
 
         except (ValueError, TypeError):
             logger.warning(f"Type conversion failed for value: {actual}")
