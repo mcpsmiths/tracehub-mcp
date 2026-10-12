@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 _SEARCH_WINDOW_PAD = timedelta(seconds=5)
 _MAX_SEARCH_WINDOW = timedelta(hours=24)
+_MAX_SEARCH_WINDOW_MS = _MAX_SEARCH_WINDOW / timedelta(milliseconds=1)
+_MS_PER_HOUR = timedelta(hours=1) / timedelta(milliseconds=1)
 _MAX_CANDIDATES_PER_SERVICE_QUERY = 20
 _MAX_SERVICE_QUERIES = 10
 _MAX_REPORTED_MATCHES = 5
@@ -160,11 +162,20 @@ async def correlate_trace(
     # operator's secondary account. Cap the extent (a clock-skewed negative
     # duration counts as zero) and keep the window anchored at the primary
     # start, so correlation still works for the trace's beginning.
-    extent = timedelta(milliseconds=max(primary_trace.duration_ms, 0))
-    if extent > _MAX_SEARCH_WINDOW:
+    #
+    # Compared in the float-millisecond domain before any timedelta is
+    # built: duration_ms is an unconstrained float, and timedelta() raises
+    # OverflowError for 1e17 ms or inf (ValueError for nan) before a cap
+    # could apply - a capped window, not an error, is the right outcome for
+    # all of them. nan compares False against everything, so it lands in
+    # the capped branch rather than becoming a zero-width window.
+    extent_ms = primary_trace.duration_ms
+    if extent_ms <= _MAX_SEARCH_WINDOW_MS:
+        extent = timedelta(milliseconds=max(extent_ms, 0.0))
+    else:
         limitations.append(
-            f"Primary trace spans {extent}; the secondary search window was capped "
-            f"at {_MAX_SEARCH_WINDOW} after its start."
+            f"Primary trace spans {extent_ms / _MS_PER_HOUR:g} h; the secondary search "
+            f"window was capped at {_MAX_SEARCH_WINDOW} after its start."
         )
         extent = _MAX_SEARCH_WINDOW
     start_time = primary_trace.start_time - _SEARCH_WINDOW_PAD

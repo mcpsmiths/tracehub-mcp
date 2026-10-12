@@ -11,6 +11,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from unittest.mock import AsyncMock
 
+import pytest
+
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery
@@ -432,6 +434,31 @@ class TestSearchWindowCap:
         assert query.start_time is not None and query.end_time is not None
         assert query.end_time - query.start_time == 2 * _SEARCH_WINDOW_PAD
         assert result.limitations == _LIMITATIONS
+
+    @pytest.mark.parametrize("duration_ms", [1e17, float("inf"), float("nan")])
+    async def test_degenerate_durations_are_capped_not_raised(self, duration_ms: float) -> None:
+        # duration_ms is an unconstrained float. Converting 1e17 ms or inf
+        # to a timedelta raises OverflowError (nan a ValueError) before any
+        # cap could apply, so the clamp compares in the millisecond domain
+        # first; nan compares False against everything and is treated as
+        # over the cap rather than as a zero-width window.
+        primary = _backend()
+        primary.get_trace.return_value = _trace(
+            [_span("p1", service_name="svc-a")], duration_ms=duration_ms
+        )
+        secondary = _backend()
+        secondary.get_trace.side_effect = ValueError("not found")
+        secondary.search_traces.return_value = []
+
+        result = await correlate_trace(primary, secondary, "t1")
+
+        query: TraceQuery = secondary.search_traces.await_args.args[0]
+        assert query.start_time is not None and query.end_time is not None
+        assert query.start_time == _BASE_TIME - _SEARCH_WINDOW_PAD
+        assert query.end_time - query.start_time == _MAX_SEARCH_WINDOW + 2 * _SEARCH_WINDOW_PAD
+        assert result.limitations[: len(_LIMITATIONS)] == _LIMITATIONS
+        assert len(result.limitations) == len(_LIMITATIONS) + 1
+        assert "capped" in result.limitations[-1]
 
 
 class TestServiceFanoutCap:
