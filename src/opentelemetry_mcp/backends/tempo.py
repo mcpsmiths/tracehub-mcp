@@ -329,7 +329,11 @@ class TempoBackend(BaseBackend):
             min_duration_ms=query.min_duration_ms,
             max_duration_ms=query.max_duration_ms,
             tags=query.tags,
-            limit=query.limit * 2,  # Fetch more traces to ensure we get enough spans
+            # Fetch more traces to ensure we get enough spans, but cap at
+            # TraceQuery.limit's own le=1000 constraint (as jaeger.py does):
+            # a query.limit above 500 would otherwise raise a pydantic
+            # ValidationError here instead of issuing a request.
+            limit=min(query.limit * 2, 1000),
             has_error=query.has_error,
             gen_ai_system=query.gen_ai_system,
             gen_ai_request_model=query.gen_ai_request_model,

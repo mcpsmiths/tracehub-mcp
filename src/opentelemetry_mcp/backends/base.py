@@ -38,6 +38,13 @@ _CACHEABLE_METHODS = (
     "list_services",
     "get_service_operations",
 )
+# The two methods that take a TraceQuery/SpanQuery and therefore carry a
+# `limit` the operator's MAX_TRACES_PER_QUERY must bound. Clamped at this
+# boundary - not only in the tool handlers that call server._clamp_limit -
+# because handlers re-expand the clamped value (expensive/slow traces fetch
+# limit * 10), helpers pick their own limits (model_stats 1000, correlate 20)
+# and new callers appear; the boundary covers all of them, present and future.
+_QUERY_LIMITED_METHODS = ("search_traces", "search_spans")
 
 
 # Upper bound on the rendered size of one cache key. A key is built from the
@@ -74,6 +81,33 @@ def _cache_key_size(key: tuple[Any, ...]) -> int:
         if isinstance(value, str):
             size += len(value.encode("utf-8"))
     return size
+
+
+def _wrap_with_query_limit(
+    method_name: str, original: Callable[..., Awaitable[Any]]
+) -> Callable[..., Awaitable[Any]]:
+    """Clamp the query's `limit` to self.max_query_limit before `original`
+    (the cache wrapper, then the backend's own method) sees it. Applied
+    OUTSIDE _wrap_with_cache so the cache key is computed from the clamped
+    query: limit=500 and limit=1000 under a ceiling of 50 are the same
+    backend query and share one entry. The caller's query object is never
+    mutated - a copy with the clamped limit is handed down."""
+
+    @functools.wraps(original)
+    async def wrapper(self: "BaseBackend", *args: Any, **kwargs: Any) -> Any:
+        ceiling = self.max_query_limit
+        if ceiling is None:
+            return await original(self, *args, **kwargs)
+        query = args[0] if args else kwargs.get("query")
+        if isinstance(query, TraceQuery | SpanQuery) and query.limit > ceiling:
+            clamped = query.model_copy(update={"limit": ceiling})
+            if args:
+                args = (clamped, *args[1:])
+            else:
+                kwargs = {**kwargs, "query": clamped}
+        return await original(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _wrap_with_cache(
@@ -413,12 +447,21 @@ class BaseBackend(ABC):
         methods a subclass defines itself (cls.__dict__), never a method
         inherited unchanged from a parent, which would otherwise be
         wrapped twice across a subclass hierarchy.
+
+        search_traces/search_spans additionally get the query-limit clamp
+        as the OUTER wrapper (clamp -> cache -> original): the cache key
+        must be built from the clamped query. functools.wraps chains
+        __wrapped__ through both layers.
         """
         super().__init_subclass__(**kwargs)
         for method_name in _CACHEABLE_METHODS:
             original = cls.__dict__.get(method_name)
-            if original is not None:
-                setattr(cls, method_name, _wrap_with_cache(method_name, original))
+            if original is None:
+                continue
+            wrapped = _wrap_with_cache(method_name, original)
+            if method_name in _QUERY_LIMITED_METHODS:
+                wrapped = _wrap_with_query_limit(method_name, wrapped)
+            setattr(cls, method_name, wrapped)
 
     def __init__(self, url: str, api_key: str | None = None, timeout: float = 30.0):
         """Initialize backend with connection parameters.
@@ -441,6 +484,11 @@ class BaseBackend(ABC):
         # BACKEND_MAX_RESPONSE_BYTES here, and `client` hands it to the
         # transport, which enforces it on every response.
         self.max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
+        # Same post-construction pattern: server.py applies the operator's
+        # MAX_TRACES_PER_QUERY here and _wrap_with_query_limit enforces it on
+        # every search_traces/search_spans call, whichever tool or helper
+        # built the query. None (the library default) means no clamp.
+        self.max_query_limit: int | None = None
         self._query_cache: TTLCoalescingCache | None = None
 
     def configure_query_cache(

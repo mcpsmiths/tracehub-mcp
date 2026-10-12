@@ -184,14 +184,18 @@ mcp = FastMCP("tracehub-mcp", version=__version__)
 
 def _clamp_limit(limit: int) -> int:
     """Cap a tool's requested limit at the server-wide ceiling
-    (--max-traces-per-query / MAX_TRACES_PER_QUERY), so a single query can
-    never fetch more traces/spans than the operator has allowed, regardless
-    of what the calling agent requests. _config is only None before startup
-    has finished (in practice, _get_backend() already fails first in that
-    case), so there is nothing to clamp against yet.
+    (--max-traces-per-query / MAX_TRACES_PER_QUERY). This is the per-tool
+    contract (the advertised `limit` is honoured up to the ceiling); the
+    enforcement point is the backend boundary - BaseBackend.max_query_limit,
+    set from the same field in _create_backend/_get_secondary_backend -
+    which clamps every search_traces/search_spans query however a tool or
+    helper re-expanded or chose its limit. _config is only None before
+    startup has finished (every handler calls _get_backend() first, which
+    raises the same error), so fail closed rather than forward an unbounded
+    limit.
     """
     if _config is None:
-        return limit
+        raise RuntimeError("Server configuration not set")
     return min(limit, _config.max_traces_per_query)
 
 
@@ -293,6 +297,7 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
     # params, so this is applied uniformly here instead.
     backend.slow_request_threshold_ms = config.slow_request_threshold_ms
     backend.max_response_bytes = config.backend.max_response_bytes
+    backend.max_query_limit = config.max_traces_per_query
     backend.configure_query_cache(config.query_cache_ttl_seconds, config.query_cache_max_entries)
     return backend
 
@@ -371,6 +376,7 @@ async def _get_secondary_backend() -> BaseBackend:
         _secondary_backend = _build_backend_from_config(_config.secondary_backend)
         _secondary_backend.slow_request_threshold_ms = _config.slow_request_threshold_ms
         _secondary_backend.max_response_bytes = _config.secondary_backend.max_response_bytes
+        _secondary_backend.max_query_limit = _config.max_traces_per_query
         _secondary_backend.configure_query_cache(
             _config.query_cache_ttl_seconds, _config.query_cache_max_entries
         )
@@ -2068,8 +2074,9 @@ def _backend_config_options(f: Any) -> Any:
     "--max-traces-per-query",
     type=click.IntRange(1, 1000),
     default=None,
-    help="Maximum traces returned per query, 1-1000 (overrides "
-    "MAX_TRACES_PER_QUERY env var, default: 500)",
+    help="Maximum traces/spans a single backend query may fetch, 1-1000 - "
+    "caps every tool's limit, including tool-internal over-fetch, at the "
+    "backend boundary (overrides MAX_TRACES_PER_QUERY env var, default: 500)",
 )
 @click.option(
     "--disable-tools",

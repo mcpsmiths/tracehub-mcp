@@ -601,6 +601,10 @@ class TestToolWrappers:
     so we exercise the wrapper's own glue code rather than the mock."""
 
     async def _set_backend(self) -> AsyncMock:
+        # _clamp_limit fails closed without a config (it used to forward the
+        # raw limit), so the wrappers need the default ceiling (500) in place
+        # exactly as they would have at runtime after startup.
+        server._config = _config()
         fake_backend = AsyncMock()
         server._get_backend = AsyncMock(return_value=fake_backend)
         return fake_backend
@@ -1070,10 +1074,15 @@ class TestClampLimit:
 
         assert server._clamp_limit(100) == 100
 
-    def test_config_not_set_yet_returns_the_requested_limit_unclamped(self) -> None:
+    def test_config_not_set_yet_raises_instead_of_returning_the_raw_limit(self) -> None:
+        """Fail closed: with no ceiling to clamp against there is nothing
+        trustworthy to forward. Every handler calls _get_backend() first,
+        which already raises the same RuntimeError, so this is unreachable
+        in practice - but the fallback must not be "unbounded"."""
         server._config = None
 
-        assert server._clamp_limit(999999) == 999999
+        with pytest.raises(RuntimeError, match="Server configuration not set"):
+            server._clamp_limit(999999)
 
     async def test_search_traces_wrapper_clamps_before_calling_the_tool(self) -> None:
         """End-to-end through the actual @mcp.tool() wrapper, not just the
