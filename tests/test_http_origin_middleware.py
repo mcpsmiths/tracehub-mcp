@@ -6,8 +6,10 @@ This wraps only the middleware itself around a trivial downstream handler -
 spinning up the full MCP server here would be slow and out of scope.
 """
 
+import logging
 from collections.abc import Sequence
 
+import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -15,7 +17,11 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from opentelemetry_mcp.server import OriginValidationMiddleware, _hostname_from_host_header
+from opentelemetry_mcp.server import (
+    _MAX_LOGGED_HEADER_CHARS,
+    OriginValidationMiddleware,
+    _hostname_from_host_header,
+)
 
 ALL_INTERFACES = "0.0.0.0"  # noqa: S104 - the network bind shape under test
 
@@ -171,3 +177,50 @@ class TestHostnameFromHostHeader:
     def test_missing_header_is_empty(self) -> None:
         assert _hostname_from_host_header("") == ""
         assert _hostname_from_host_header("   ") == ""
+
+
+class TestRejectionLogging:
+    """Both rejection paths log at WARNING *before* RateLimitMiddleware can
+    throttle the peer (this class is first in main()'s middleware list and
+    Starlette applies the list outermost-first), so an unauthenticated peer
+    gets one log line per request. Each line must therefore be bounded no
+    matter how large the offending header is, and repr()-quoted so it can
+    never carry raw control characters."""
+
+    def test_unexpected_host_log_line_is_bounded_and_quoted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = _build_client(bind_host="127.0.0.1")
+        oversized = "evil.example" + "a" * (50 * _MAX_LOGGED_HEADER_CHARS)
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.server"):
+            response = client.get("/", headers={"host": oversized})
+
+        assert response.status_code == 421
+        [message] = [
+            r.getMessage() for r in caplog.records if "Unexpected Host header" in r.getMessage()
+        ]
+        assert "'evil.example" in message  # repr()-quoted, prefix preserved for diagnosis
+        assert len(message) <= len("Unexpected Host header: ''") + _MAX_LOGGED_HEADER_CHARS
+
+    def test_invalid_origin_log_line_is_bounded_and_quoted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = _build_client()
+        oversized = "https://evil.example/" + "a" * (50 * _MAX_LOGGED_HEADER_CHARS)
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.server"):
+            response = client.get("/", headers={"origin": oversized})
+
+        assert response.status_code == 403
+        [message] = [
+            r.getMessage() for r in caplog.records if "Invalid Origin header" in r.getMessage()
+        ]
+        assert "'https://evil.example/" in message
+        assert len(message) <= len("Invalid Origin header: ''") + _MAX_LOGGED_HEADER_CHARS
+
+    def test_short_values_are_logged_whole(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Positive control for the bound: a realistic header is not cut."""
+        client = _build_client(bind_host="127.0.0.1")
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.server"):
+            client.get("/", headers={"host": "attacker.example:8000"})
+
+        assert "Unexpected Host header: 'attacker.example:8000'" in caplog.text

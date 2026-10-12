@@ -1308,6 +1308,12 @@ def _validate_http_listener_auth(
 
 _LOCAL_ORIGIN_PATTERN = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$", re.IGNORECASE)
 
+# Upper bound on how much of a rejected Host/Origin header value reaches the
+# log. OriginValidationMiddleware logs before RateLimitMiddleware runs, so
+# without a bound one unauthenticated peer could write header-sized,
+# attacker-chosen text to the log on every request.
+_MAX_LOGGED_HEADER_CHARS = 128
+
 
 def _parse_csv_option(value: str | None) -> list[str] | None:
     """Comma-separated CLI/env value -> trimmed, non-empty items; None stays None
@@ -1420,6 +1426,15 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     _LOCAL_ORIGIN_PATTERN above - either would widen exactly the
     DNS-rebinding/cross-origin attack surface this middleware exists to
     close.
+
+    Both rejection paths log at WARNING so a misconfigured MCP_ALLOWED_HOSTS
+    or client Origin is diagnosable from the server log. This middleware runs
+    before RateLimitMiddleware (Starlette applies the middleware list
+    outermost-first and main() places this class first), so an
+    unauthenticated peer can trigger one such line per request. Accepted
+    limitation, bounded rather than reordered: the logged value is cut to
+    _MAX_LOGGED_HEADER_CHARS and repr()-escaped, so each line carries at most
+    that much attacker-chosen text and can never contain a raw newline.
     """
 
     def __init__(
@@ -1448,11 +1463,12 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         if self._validate_host and not self._host_wildcard and not self._host_is_allowed(request):
-            logger.warning(f"Unexpected Host header: {request.headers.get('host', '')!r}")
+            host = request.headers.get("host", "")[:_MAX_LOGGED_HEADER_CHARS]
+            logger.warning(f"Unexpected Host header: {host!r}")
             return Response("Misdirected Request", status_code=421)
         origin = request.headers.get("origin")
         if origin and not _LOCAL_ORIGIN_PATTERN.match(origin):
-            logger.warning(f"Invalid Origin header: {origin}")
+            logger.warning(f"Invalid Origin header: {origin[:_MAX_LOGGED_HEADER_CHARS]!r}")
             return Response("Invalid Origin header", status_code=403)
         return await call_next(request)
 
