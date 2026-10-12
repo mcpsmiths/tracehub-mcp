@@ -341,9 +341,10 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
             if duration_ms > self._slow_request_threshold_ms:
                 # Query strings can carry trace IDs, filter values, or (for
                 # backends that use query-param rather than header auth)
-                # credentials - logging the path only is enough to identify
-                # which endpoint was slow without exposing that.
-                url_without_query = request.url.copy_with(query=None)
+                # credentials, and a URL userinfo IS a credential - logging
+                # scheme, host and path only is enough to identify which
+                # endpoint was slow without exposing either.
+                url_without_query = request.url.copy_with(query=None, username=None, password=None)
                 logger.warning(
                     f"Slow backend request: {request.method} {url_without_query} took "
                     f"{duration_ms:.0f}ms (threshold: {self._slow_request_threshold_ms:.0f}ms)"

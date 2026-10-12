@@ -23,9 +23,12 @@ class BackendConfig(BaseModel):
         "jaeger", "tempo", "traceloop", "datadog", "sentry", "xray", "newrelic", "honeycomb"
     ]
     url: HttpUrl
-    api_key: str | None = Field(default=None, exclude=True)
+    api_key: str | None = Field(default=None, exclude=True, repr=False)
     app_key: str | None = Field(
-        default=None, exclude=True, description="Datadog Application key (Datadog backend only)"
+        default=None,
+        exclude=True,
+        repr=False,
+        description="Datadog Application key (Datadog backend only)",
     )
     sentry_org: str | None = Field(
         default=None, exclude=True, description="Sentry organization slug (Sentry backend only)"
@@ -82,16 +85,26 @@ class BackendConfig(BaseModel):
         """
         if v.scheme not in ["http", "https"]:
             raise ValueError("URL must use http or https scheme")
+        if v.username or v.password:
+            # Never keep a credential inside the URL: str(url) is logged at
+            # startup, printed by --print-config and doctor, and echoed by
+            # httpx's own error text into /ready bodies and tool errors.
+            # Checked first so neither message below can stringify it.
+            raise ValueError(
+                "BACKEND_URL must not embed credentials (user:password@host). Use "
+                "BACKEND_API_KEY (Bearer) or BACKEND_TEMPO_INSTANCE_ID + BACKEND_API_KEY "
+                "(Basic) so the secret is never stringified"
+            )
         if is_cloud_metadata_host(v.host):
             raise ValueError(
-                f"BACKEND_URL '{v}' points at a cloud instance-metadata endpoint. "
+                f"BACKEND_URL host '{v.host}' is a cloud instance-metadata endpoint. "
                 "This is never a legitimate trace-backend location and is blocked "
                 "to prevent SSRF-based credential theft."
             )
         if v.scheme == "http" and not is_loopback_host(v.host):
             logger.warning(
-                f"BACKEND_URL '{v}' uses plain HTTP to a non-local host. "
-                "This is vulnerable to network interception (see CVE-2025-6514). "
+                f"BACKEND_URL host '{v.host}' is reached over plain HTTP from a non-local "
+                "host. This is vulnerable to network interception (see CVE-2025-6514). "
                 "Use https:// unless this backend is only reachable over a "
                 "trusted private network (e.g. a VPC or Docker Compose network)."
             )

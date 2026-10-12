@@ -12,16 +12,22 @@ CLI entrypoint.
 # server.py import-style nuance that is out of scope for this test file.
 # mypy: disable-error-code="attr-defined"
 
+import io
 import json
+import logging
 from collections.abc import Generator
 from datetime import datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import click
+import httpx
 import pytest
 from click.testing import CliRunner
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from pydantic import HttpUrl
+from starlette.testclient import TestClient
 
 from opentelemetry_mcp import server
 from opentelemetry_mcp.attributes import HealthCheckResponse
@@ -42,6 +48,7 @@ from opentelemetry_mcp.models import (
     TriageResult,
     TriageVerdict,
 )
+from opentelemetry_mcp.security import UserinfoRedactingFilter
 
 FAKE_API_KEY = "dd-key1"
 FAKE_APP_KEY = "dd-app1"
@@ -224,6 +231,78 @@ class TestCreateBackend:
             server._create_backend(config)
 
 
+class TestBackendUrlNeverLoggedWithUserinfo:
+    """Defence in depth behind BackendConfig.validate_url's rejection: the
+    startup INFO lines print the backend URL, so they go through
+    redact_url_userinfo even though a validated config can no longer carry
+    userinfo. model_construct() bypasses the validator on purpose."""
+
+    MARKER = "VFY-PW-init"
+
+    def _unvalidated_config(self, backend_type: str, **fields: object) -> BackendConfig:
+        values: dict[str, Any] = {
+            "type": backend_type,
+            "url": HttpUrl(f"https://u:{self.MARKER}@h.test/"),
+            "api_key": None,
+            "app_key": None,
+            "sentry_org": None,
+            "sentry_project": None,
+            "tempo_instance_id": None,
+            "aws_region": None,
+            "newrelic_account_id": None,
+            "honeycomb_dataset": None,
+            "timeout": 30.0,
+            "max_response_bytes": 64 * 1024 * 1024,
+            "environments": ["prd"],
+        }
+        values.update(fields)
+        return BackendConfig.model_construct(None, **values)
+
+    @pytest.mark.parametrize(
+        ("backend_type", "fields"),
+        [
+            ("jaeger", {}),
+            ("tempo", {}),
+            ("traceloop", {"api_key": FAKE_API_KEY}),
+            ("datadog", {"api_key": FAKE_API_KEY, "app_key": FAKE_APP_KEY}),
+            ("sentry", {"api_key": FAKE_API_KEY, "sentry_org": FAKE_SENTRY_ORG}),
+        ],
+    )
+    def test_initializing_line_strips_userinfo(
+        self, backend_type: str, fields: dict[str, object], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO):
+            server._build_backend_from_config(self._unvalidated_config(backend_type, **fields))
+
+        (line,) = [r.message for r in caplog.records if r.message.startswith("Initializing")]
+        assert self.MARKER not in line
+        assert "https://h.test/" in line
+
+    async def test_secondary_health_log_is_redacted(self, caplog: pytest.LogCaptureFixture) -> None:
+        server._config = _config()
+        server._config.secondary_backend = BackendConfig(
+            type="sentry", url=HttpUrl("https://sentry.io"), sentry_org=FAKE_SENTRY_ORG
+        )
+        fake_backend = AsyncMock(spec=BaseBackend)
+        fake_backend.health_check = AsyncMock(
+            return_value=HealthCheckResponse(
+                status="unhealthy",
+                backend="sentry",
+                url=f"https://u:{self.MARKER}@sentry.io",
+                error=f"Client error '401 Unauthorized' for url 'https://u:{self.MARKER}@sentry.io/'",
+            )
+        )
+
+        with (
+            caplog.at_level(logging.INFO),
+            patch.object(server, "_build_backend_from_config", return_value=fake_backend),
+        ):
+            await server._get_secondary_backend()
+
+        assert self.MARKER not in caplog.text
+        assert "unhealthy" in caplog.text
+
+
 class TestHandleToolError:
     """_handle_tool_error logs then re-raises the original exception - it
     must never swallow it and return a value instead. Swallowing it would
@@ -252,6 +331,42 @@ class TestHandleToolError:
         with caplog.at_level("ERROR"), pytest.raises(Exception, match="oops"):
             server._handle_tool_error("list_services", Exception("oops"))
 
+        assert "list_services" in caplog.text
+
+    def test_credential_free_error_keeps_its_traceback_in_the_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level("ERROR"), pytest.raises(RuntimeError):
+            server._handle_tool_error("list_services", RuntimeError("plain failure"))
+
+        (record,) = caplog.records
+        assert record.exc_info is not None
+
+    def test_credential_bearing_error_becomes_a_redacted_tool_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The one case where the identity re-raise is replaced: httpx's
+        HTTPStatusError text embeds the request URL, so a credential a
+        bypassed config left in BACKEND_URL's userinfo would otherwise reach
+        the MCP client as tool-error content and the log as both message
+        and traceback. ToolError keeps isError=True and is logged by
+        fastmcp without exc_info."""
+        marker = "VFY-PW-tool"
+        request = httpx.Request("GET", f"https://u:{marker}@h.test/api/services")
+        error = httpx.HTTPStatusError(
+            f"Client error '401 Unauthorized' for url 'https://u:{marker}@h.test/api/services'",
+            request=request,
+            response=httpx.Response(401, request=request),
+        )
+
+        with caplog.at_level("ERROR"), pytest.raises(ToolError) as exc_info:
+            server._handle_tool_error("list_services", error)
+
+        assert exc_info.value.__cause__ is error
+        assert marker not in str(exc_info.value)
+        assert "401 Unauthorized" in str(exc_info.value)
+        assert "h.test/api/services" in str(exc_info.value)
+        assert marker not in caplog.text  # message AND any formatted traceback
         assert "list_services" in caplog.text
 
 
@@ -295,6 +410,53 @@ class TestGetBackend:
             result = await server._get_backend()
 
         assert result is fake_backend
+
+    async def test_health_log_reports_status_and_redacted_error_not_the_repr(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """HealthCheckResponse carries url= and error= verbatim; logging the
+        model repr would print both. The lazy-init INFO line logs the
+        status and the redacted error only."""
+        marker = "VFY-PW-lazy"
+        server._config = _config()
+        fake_backend = AsyncMock()
+        fake_backend.health_check = AsyncMock(
+            return_value=HealthCheckResponse(
+                status="unhealthy",
+                backend="jaeger",
+                url=f"https://u:{marker}@h.test",
+                error=f"Client error '401 Unauthorized' for url 'https://u:{marker}@h.test/api'",
+            )
+        )
+
+        with (
+            caplog.at_level(logging.INFO),
+            patch.object(server, "_create_backend", return_value=fake_backend),
+        ):
+            await server._get_backend()
+
+        assert marker not in caplog.text
+        health_lines = [r.message for r in caplog.records if "health check" in r.message.lower()]
+        assert any("unhealthy" in line and "h.test/api" in line for line in health_lines)
+
+    async def test_health_check_exception_log_is_redacted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        marker = "VFY-PW-lazy2"
+        server._config = _config()
+        fake_backend = AsyncMock()
+        fake_backend.health_check = AsyncMock(
+            side_effect=RuntimeError(f"cannot reach https://u:{marker}@h.test/")
+        )
+
+        with (
+            caplog.at_level(logging.INFO),
+            patch.object(server, "_create_backend", return_value=fake_backend),
+        ):
+            await server._get_backend()
+
+        assert marker not in caplog.text
+        assert "[REDACTED]@h.test" in caplog.text
 
     async def test_unhealthy_status_does_not_prevent_return(self) -> None:
         """A non-'healthy' status is only logged as a warning - the backend
@@ -1661,3 +1823,337 @@ class TestDoctorCli:
             runner.invoke(server.main, ["doctor"])
 
         fake_backend.close.assert_awaited_once()
+
+
+class TestUserinfoNeverLeavesTheProcess:
+    """End to end, bypassing config on purpose (BackendConfig.validate_url
+    now rejects userinfo; everything below is the defence in depth for a
+    URL that got past it): a real JaegerBackend over the real
+    _RetryingTransport with only the innermost transport mocked to answer
+    401, driven through the real streamable-http app (/ready) and the
+    in-memory fastmcp client (tools/call), with every log sink captured."""
+
+    MARKER = "VFY-PW-e2e"
+
+    @pytest.fixture(autouse=True)
+    def _log_levels(self) -> Generator[None]:
+        """Apply the production log-level path (which quiets httpx's INFO
+        request line, the one sink that cannot be redacted at creation
+        time) and restore both loggers afterwards."""
+        root_level = logging.getLogger().level
+        httpx_level = logging.getLogger("httpx").level
+        server._apply_log_level("INFO")
+        yield
+        logging.getLogger().setLevel(root_level)
+        logging.getLogger("httpx").setLevel(httpx_level)
+
+    def _install_backend(self) -> JaegerBackend:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, text="unauthorized")
+
+        backend = JaegerBackend(url=f"https://u:{self.MARKER}@h.test")
+        # slow_request_threshold_ms=0 so the slow-request WARNING (which
+        # prints the request URL) fires on every request too.
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler),
+            slow_request_threshold_ms=0.0,
+            allowed_host="h.test",
+        )
+        backend._client = httpx.AsyncClient(
+            base_url=backend.url, transport=transport, follow_redirects=True
+        )
+        server._config = _config()
+        server._backend = backend
+        return backend
+
+    def test_ready_body_and_logs_are_free_of_the_credential(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        self._install_backend()
+        app = server.mcp.http_app(transport="streamable-http")
+
+        with caplog.at_level(logging.INFO), TestClient(app) as client:
+            response = client.get("/ready")
+
+        assert response.status_code == 503
+        assert self.MARKER not in response.text
+        body = response.json()
+        assert "401" in body["health_check"]["error"]
+        assert "401" in body["list_services"]["error"]
+        assert self.MARKER not in caplog.text
+        # Not vacuous: the slow-request WARNING did fire and named the path.
+        assert any("Slow backend request" in r.message for r in caplog.records)
+        assert any("/api/services" in r.message for r in caplog.records)
+
+    async def test_tool_error_content_and_logs_are_free_of_the_credential(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        self._install_backend()
+
+        with caplog.at_level(logging.INFO):
+            async with Client(server.mcp) as client:
+                result = await client.call_tool("list_services", {}, raise_on_error=False)
+
+        assert result.is_error is True
+        text = " ".join(getattr(c, "text", "") for c in result.content)
+        assert "401" in text
+        assert self.MARKER not in text
+        assert self.MARKER not in caplog.text
+        assert any("Error executing list_services" in r.message for r in caplog.records)
+
+
+class TestApplyLogLevel:
+    @pytest.fixture(autouse=True)
+    def _restore(self) -> Generator[None]:
+        root_level = logging.getLogger().level
+        httpx_level = logging.getLogger("httpx").level
+        yield
+        logging.getLogger().setLevel(root_level)
+        logging.getLogger("httpx").setLevel(httpx_level)
+
+    @pytest.mark.parametrize("level", ["INFO", "WARNING", "ERROR"])
+    def test_above_debug_quiets_httpx_request_lines(self, level: str) -> None:
+        """httpx logs 'HTTP Request: GET <full url>' at INFO on every
+        request - the one URL sink that cannot be redacted at creation time."""
+        server._apply_log_level(level)
+
+        assert logging.getLogger().level == logging.getLevelName(level)
+        assert logging.getLogger("httpx").level == logging.WARNING
+        assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+
+    def test_debug_keeps_httpx_request_lines(self) -> None:
+        """Operators debugging connectivity rely on those lines; at DEBUG
+        they stay and pass through the redacting handler filter."""
+        server._apply_log_level("DEBUG")
+
+        assert logging.getLogger().level == logging.DEBUG
+        assert logging.getLogger("httpx").level == logging.NOTSET
+        assert logging.getLogger("httpx").isEnabledFor(logging.INFO)
+
+
+class TestRootLogHandlerRedaction:
+    """server.py builds the root stderr handler itself so the userinfo
+    filter sits on the HANDLER (a filter on the root logger never sees
+    records propagated from httpx/fastmcp/opentelemetry_mcp.* loggers).
+    Under pytest basicConfig is a no-op (the root already has pytest's
+    handlers), so drive the handler object directly."""
+
+    def test_handler_carries_the_filter(self) -> None:
+        assert any(isinstance(f, UserinfoRedactingFilter) for f in server._ROOT_LOG_HANDLER.filters)
+
+    def test_handler_emits_redacted_text_for_a_foreign_logger(self) -> None:
+        marker = "VFY-PW-root"
+        stream = io.StringIO()
+        previous = server._ROOT_LOG_HANDLER.setStream(stream)
+        try:
+            record = logging.LogRecord(
+                name="httpx",
+                level=logging.INFO,
+                pathname=__file__,
+                lineno=1,
+                msg="HTTP Request: %s %s",
+                args=("GET", f"https://u:{marker}@h.test/api/services"),
+                exc_info=None,
+            )
+            server._ROOT_LOG_HANDLER.handle(record)
+        finally:
+            server._ROOT_LOG_HANDLER.setStream(previous)  # type: ignore[arg-type]
+
+        out = stream.getvalue()
+        assert marker not in out
+        assert "https://[REDACTED]@h.test/api/services" in out
+        assert "httpx" in out and "INFO" in out
+
+
+class TestConfigErrorsNeverEchoUserinfo:
+    """pydantic's ValidationError str() echoes input_value='<the URL>', and
+    exc_info=True would print it again in a traceback - so the config phase
+    of main() and doctor report the redacted text only, without a
+    traceback. CliRunner never sees log lines (the root handler is bound to
+    the real stderr at import), so exit codes and stdout are asserted here
+    and the log content via caplog."""
+
+    MARKER = "VFY-PW-cli"
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", "http://localhost:16686")
+        monkeypatch.delenv("BACKEND_API_KEY", raising=False)
+        monkeypatch.delenv("SECONDARY_BACKEND_TYPE", raising=False)
+        monkeypatch.delenv("SECONDARY_BACKEND_URL", raising=False)
+
+    def test_print_config_with_a_userinfo_url_flag_exits_non_zero_and_redacts(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        runner = CliRunner()
+        with caplog.at_level(logging.ERROR), patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(
+                server.main,
+                [
+                    "--print-config",
+                    "--backend",
+                    "jaeger",
+                    "--url",
+                    f"https://u:{self.MARKER}@h.test",
+                ],
+            )
+
+        assert result.exit_code == 1
+        assert self.MARKER not in result.output
+        assert self.MARKER not in caplog.text
+        (record,) = [r for r in caplog.records if "Configuration error" in r.message]
+        assert record.exc_info is None
+        assert "must not embed credentials" in record.message
+        mock_mcp.run.assert_not_called()
+
+    def test_userinfo_in_backend_url_env_var_is_rejected_without_a_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The env path raises pydantic's ValidationError (which echoes the
+        raw input) rather than the CLI path's plain ValueError."""
+        monkeypatch.setenv("BACKEND_URL", f"https://u:{self.MARKER}@h.test")
+        runner = CliRunner()
+        with caplog.at_level(logging.ERROR), patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(server.main, ["--print-config"])
+
+        assert result.exit_code == 1
+        assert self.MARKER not in result.output
+        assert self.MARKER not in caplog.text
+        (record,) = [r for r in caplog.records if "Configuration error" in r.message]
+        assert record.exc_info is None
+        assert "[REDACTED]@h.test" in record.message
+
+    def test_doctor_prints_a_redacted_configuration_failure(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(
+            server.main,
+            ["doctor", "--backend", "jaeger", "--url", f"https://u:{self.MARKER}@h.test"],
+        )
+
+        assert result.exit_code == 1
+        assert "[FAIL] Configuration" in result.output
+        assert "must not embed credentials" in result.output
+        assert self.MARKER not in result.output
+
+    def test_doctor_env_path_prints_a_redacted_configuration_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BACKEND_URL", f"https://u:{self.MARKER}@h.test")
+        runner = CliRunner()
+        result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Configuration" in result.output
+        assert "[REDACTED]@h.test" in result.output
+        assert self.MARKER not in result.output
+
+    def test_doctor_backend_lines_are_redacted(self) -> None:
+        """doctor's own [OK]/[FAIL] lines print the URL and the probe
+        errors; _run_backend_checks redacts the errors and doctor the URL."""
+        from opentelemetry_mcp.attributes import HealthCheckResponse
+
+        fake_backend = AsyncMock()
+        fake_backend.health_check = AsyncMock(
+            return_value=HealthCheckResponse(
+                status="unhealthy",
+                backend="jaeger",
+                url=f"https://u:{self.MARKER}@h.test",
+                error=f"Client error '401 Unauthorized' for url 'https://u:{self.MARKER}@h.test/api'",
+            )
+        )
+        fake_backend.list_services = AsyncMock(
+            side_effect=RuntimeError(
+                f"Client error '401' for url 'https://u:{self.MARKER}@h.test/api'"
+            )
+        )
+        fake_backend.close = AsyncMock()
+        unvalidated = ServerConfig(
+            backend=BackendConfig(type="jaeger", url=HttpUrl("http://localhost"))
+        )
+        unvalidated.backend = BackendConfig.model_construct(
+            type="jaeger",
+            url=HttpUrl(f"https://u:{self.MARKER}@h.test/"),
+            api_key=None,
+            app_key=None,
+            sentry_org=None,
+            sentry_project=None,
+            tempo_instance_id=None,
+            aws_region=None,
+            newrelic_account_id=None,
+            honeycomb_dataset=None,
+            timeout=30.0,
+            max_response_bytes=64 * 1024 * 1024,
+            environments=["prd"],
+        )
+        runner = CliRunner()
+        with (
+            patch.object(ServerConfig, "from_env", return_value=unvalidated),
+            patch.object(server, "_create_backend", return_value=fake_backend),
+        ):
+            result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[OK] Backend constructed: jaeger @ https://h.test/" in result.output
+        assert "[FAIL] Health check" in result.output
+        assert "[FAIL] Connectivity probe" in result.output
+        assert self.MARKER not in result.output
+
+    def test_print_config_url_is_redacted_even_for_an_unvalidated_config(self) -> None:
+        unvalidated = BackendConfig.model_construct(
+            type="jaeger",
+            url=HttpUrl(f"https://u:{self.MARKER}@h.test/"),
+            api_key=None,
+            app_key=None,
+            sentry_org=None,
+            sentry_project=None,
+            tempo_instance_id=None,
+            aws_region=None,
+            newrelic_account_id=None,
+            honeycomb_dataset=None,
+            timeout=30.0,
+            max_response_bytes=64 * 1024 * 1024,
+            environments=["prd"],
+        )
+
+        printed = server._print_config_backend_dict(unvalidated)
+
+        assert printed["url"] == "https://h.test/"
+        assert self.MARKER not in json.dumps(printed)
+
+    def test_stdio_startup_line_is_redacted(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        unvalidated = ServerConfig(
+            backend=BackendConfig(type="jaeger", url=HttpUrl("http://localhost"))
+        )
+        unvalidated.backend = BackendConfig.model_construct(
+            type="jaeger",
+            url=HttpUrl(f"https://u:{self.MARKER}@h.test/"),
+            api_key=None,
+            app_key=None,
+            sentry_org=None,
+            sentry_project=None,
+            tempo_instance_id=None,
+            aws_region=None,
+            newrelic_account_id=None,
+            honeycomb_dataset=None,
+            timeout=30.0,
+            max_response_bytes=64 * 1024 * 1024,
+            environments=["prd"],
+        )
+        runner = CliRunner()
+        with (
+            caplog.at_level(logging.INFO),
+            patch.object(ServerConfig, "from_env", return_value=unvalidated),
+            patch.object(server, "mcp") as mock_mcp,
+        ):
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(server.main, ["--transport", "stdio"])
+
+        assert result.exit_code == 0, result.output
+        (line,) = [r.message for r in caplog.records if "connected to:" in r.message]
+        assert "https://h.test/" in line
+        assert self.MARKER not in line

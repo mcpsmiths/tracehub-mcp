@@ -82,6 +82,9 @@ _SECRET_PATTERNS = [
         r"\s*[:=]\s*)(?P<quote>['\"]?)(?P<value>[^\s'\",}&]+)(?P=quote)",
         re.IGNORECASE,
     ),
+    # user:password@ inside any URL (httpx error text embeds the request
+    # URL verbatim); keeps "://" and the host that follows the "@".
+    re.compile(r"(?P<field>://)[^/\s@]+:[^/\s@]*(?=@)"),
     re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key ID
     re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"),  # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
     re.compile(r"sk-[A-Za-z0-9]{20,}"),  # a common vendor secret-key prefix shape

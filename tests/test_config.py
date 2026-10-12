@@ -6,7 +6,7 @@ import pytest
 from pydantic import HttpUrl, ValidationError
 
 from opentelemetry_mcp.backends.base import DEFAULT_MAX_RESPONSE_BYTES
-from opentelemetry_mcp.config import BackendConfig
+from opentelemetry_mcp.config import BackendConfig, ServerConfig
 
 
 def test_non_local_http_url_logs_a_warning(caplog: pytest.LogCaptureFixture) -> None:
@@ -159,3 +159,89 @@ class TestMaxResponseBytes:
             BackendConfig(
                 type="jaeger", url=HttpUrl("http://localhost:16686"), max_response_bytes=value
             )
+
+
+# Dummy markers standing in for a credential; nothing real.
+VFY_MARKER = "VFY-PW-7c1e"
+VFY_MARKER_A = "VFY-A1-9f3b"
+VFY_MARKER_B = "VFY-B2-9f3b"
+
+
+class TestUserinfoInBackendUrl:
+    """A credential embedded in BACKEND_URL (user:password@host) is rejected
+    at the config boundary: str(url) is logged, printed by --print-config
+    and doctor, and echoed by httpx error text into /ready and tool errors,
+    so the only safe place for a backend credential is a dedicated field."""
+
+    def test_user_and_password_are_rejected_without_echoing_the_password(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            BackendConfig(type="jaeger", url=HttpUrl(f"https://u:{VFY_MARKER}@h.test"))
+
+        (error,) = exc_info.value.errors()
+        assert "BACKEND_URL" in error["msg"]
+        assert "BACKEND_API_KEY" in error["msg"]
+        assert "BACKEND_TEMPO_INSTANCE_ID" in error["msg"]
+        assert VFY_MARKER not in error["msg"]
+
+    def test_username_only_userinfo_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="must not embed credentials"):
+            BackendConfig(type="jaeger", url=HttpUrl("https://svc-account@h.test"))
+
+    def test_apply_cli_overrides_rejects_userinfo_without_echoing_the_password(self) -> None:
+        config = ServerConfig(backend=BackendConfig(type="jaeger", url=HttpUrl("http://localhost")))
+
+        with pytest.raises(ValueError, match="must not embed credentials") as exc_info:
+            config.apply_cli_overrides(backend_url=f"https://u:{VFY_MARKER}@h.test")
+
+        assert VFY_MARKER not in str(exc_info.value)
+        assert str(config.backend.url) == "http://localhost/"
+
+    def test_secondary_backend_url_with_userinfo_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("SECONDARY_BACKEND_URL", f"https://u:{VFY_MARKER}@h.test")
+
+        with pytest.raises(ValidationError, match="must not embed credentials"):
+            BackendConfig.from_env_optional()
+
+    def test_rejection_logs_nothing_containing_the_password(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A userinfo URL is refused before the plain-HTTP warning or the
+        metadata check could stringify it."""
+        with caplog.at_level(logging.DEBUG), pytest.raises(ValidationError):
+            BackendConfig(type="jaeger", url=HttpUrl(f"http://u:{VFY_MARKER}@169.254.169.254/"))
+
+        assert VFY_MARKER not in caplog.text
+
+    def test_metadata_rejection_names_the_host_not_the_whole_url(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            BackendConfig(type="jaeger", url=HttpUrl("http://169.254.169.254/latest/meta-data/"))
+
+        (error,) = exc_info.value.errors()
+        assert "169.254.169.254" in error["msg"]
+        assert "/latest/meta-data/" not in error["msg"]
+
+    def test_plain_http_warning_names_the_host_not_the_whole_url(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            BackendConfig(type="jaeger", url=HttpUrl("http://example.com:16686/some/path?k=v"))
+
+        (record,) = [r for r in caplog.records if "plain HTTP" in r.message]
+        assert "example.com" in record.message
+        assert "/some/path" not in record.message
+        assert "k=v" not in record.message
+
+    def test_credential_fields_are_hidden_from_repr(self) -> None:
+        config = BackendConfig(
+            type="datadog",
+            url=HttpUrl("https://api.datadoghq.com"),
+            api_key=VFY_MARKER_A,
+            app_key=VFY_MARKER_B,
+        )
+
+        assert VFY_MARKER_A not in repr(config)
+        assert VFY_MARKER_B not in repr(config)
+        assert VFY_MARKER_A not in str(config)

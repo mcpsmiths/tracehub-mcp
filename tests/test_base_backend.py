@@ -288,6 +288,34 @@ class TestSlowRequestLogging:
         assert "super-secret-value" not in messages[0]
         assert "api_key" not in messages[0]
 
+    async def test_userinfo_is_stripped_from_the_logged_url(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A credential a bypassed config left in BACKEND_URL's userinfo
+        rides along on every request URL; the slow-request WARNING must
+        strip it the same way it strips the query string."""
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(0.05)
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), slow_request_threshold_ms=10.0
+        )
+
+        with caplog.at_level(logging.WARNING):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://u:VFY-PW-slow@backend.test"
+            ) as client:
+                await client.get("/search")
+
+        messages = [r.message for r in caplog.records if "Slow backend request" in r.message]
+        assert len(messages) == 1
+        assert "/search" in messages[0]
+        assert "backend.test" in messages[0]
+        assert "VFY-PW-slow" not in messages[0]
+        assert "u:" not in messages[0]
+
 
 class TestMetadataEndpointBlocking:
     """A compromised or misconfigured backend must never be able to steer a

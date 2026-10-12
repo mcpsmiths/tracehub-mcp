@@ -55,6 +55,7 @@ from opentelemetry_mcp.models import SearchTracesResult
 from opentelemetry_mcp.observability import (
     McpServerTracingMiddleware,
     TraceContextLogFilter,
+    _redact_secrets,
     configure_metrics,
     configure_tracing,
     install_trace_context_log_filter,
@@ -467,6 +468,27 @@ class TestMcpServerTracingMiddlewareErrorHandling:
         assert description is not None
         assert fake_token not in description
         assert "REDACTED" in description
+
+    async def test_exception_message_url_userinfo_is_redacted(self) -> None:
+        """An httpx.HTTPStatusError message embeds the request URL verbatim;
+        a credential a bypassed config left in BACKEND_URL's userinfo must
+        not reach the OTLP collector via the span status."""
+        tracer, exporter = _tracer_with_exporter()
+        middleware = McpServerTracingMiddleware(include_args=False, tracer=tracer)
+        marker = "VFY-PW-span"
+
+        async def call_next(ctx: MiddlewareContext[Any]) -> str:
+            raise RuntimeError(
+                f"Client error '401 Unauthorized' for url 'https://u:{marker}@h.test/api'"
+            )
+
+        with pytest.raises(RuntimeError, match="401"):
+            await middleware.on_call_tool(_context(), call_next)
+
+        description = exporter.get_finished_spans()[0].status.description
+        assert description is not None
+        assert marker not in description
+        assert "https://[REDACTED]@h.test/api" in description
 
 
 class TestMcpServerTracingMiddlewareIncludeArgs:
@@ -887,3 +909,14 @@ class TestClientTraceContextTrustOverHttp:
 
         assert result == "ok"
         assert "mcp.session.id" not in _last_span_attrs(exporter)
+
+
+class TestRedactSecretsUrlUserinfo:
+    def test_userinfo_is_redacted_and_host_kept(self) -> None:
+        assert _redact_secrets("GET https://u:VFY-PW-x@h.test/x?trace_id=abc123") == (
+            "GET https://[REDACTED]@h.test/x?trace_id=abc123"
+        )
+
+    def test_plain_urls_are_untouched(self) -> None:
+        text = "GET https://h.test/x?trace_id=abc123 by someone@example.com"
+        assert _redact_secrets(text) == text

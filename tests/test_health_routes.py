@@ -105,6 +105,56 @@ def test_ready_returns_503_when_get_backend_itself_raises() -> None:
     assert response.json()["error"] == "Server configuration not set"
 
 
+class TestReadyNeverEchoesUrlUserinfo:
+    """/ready answers unauthenticated peers; the error strings it copies out
+    of health_check/list_services embed the request URL (httpx's
+    HTTPStatusError text), so any credential a bypassed config left in the
+    URL must be redacted inside _run_backend_checks - doctor inherits it."""
+
+    MARKER = "VFY-PW-ready"
+    ERROR = f"Client error '401 Unauthorized' for url 'https://u:{MARKER}@h.test/api/services'"
+
+    def test_health_check_error_is_redacted(self) -> None:
+        fake_backend = _healthy_backend()
+        fake_backend.health_check = AsyncMock(
+            return_value=HealthCheckResponse(
+                status="unhealthy",
+                backend="jaeger",
+                url=f"https://u:{self.MARKER}@h.test",
+                error=self.ERROR,
+            )
+        )
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                response = client.get("/ready")
+
+        assert response.status_code == 503
+        assert self.MARKER not in response.text
+        assert "h.test/api/services" in response.json()["health_check"]["error"]
+
+    def test_health_check_exception_and_list_services_error_are_redacted(self) -> None:
+        fake_backend = _healthy_backend()
+        fake_backend.health_check = AsyncMock(side_effect=RuntimeError(self.ERROR))
+        fake_backend.list_services = AsyncMock(side_effect=RuntimeError(self.ERROR))
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                response = client.get("/ready")
+
+        assert response.status_code == 503
+        assert self.MARKER not in response.text
+        body = response.json()
+        assert "[REDACTED]@h.test" in body["health_check"]["error"]
+        assert "[REDACTED]@h.test" in body["list_services"]["error"]
+
+    def test_get_backend_failure_is_redacted(self) -> None:
+        with patch.object(server, "_get_backend", AsyncMock(side_effect=RuntimeError(self.ERROR))):
+            with _build_client() as client:
+                response = client.get("/ready")
+
+        assert response.status_code == 503
+        assert self.MARKER not in response.text
+
+
 class TestReadyBehindHostValidation:
     """/ready drives real backend calls, so a DNS-rebound browser's
     Origin-less GET must be refused by the Host check before the route runs

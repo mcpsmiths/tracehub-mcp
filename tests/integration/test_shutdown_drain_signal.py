@@ -123,6 +123,10 @@ class TestShutdownDrainSignal:
                 "--shutdown-drain-seconds": "3",
                 "--backend-close-timeout-seconds": "2",
                 "--graceful-shutdown-timeout-seconds": "10",
+                # The "/api/traces" evidence below is httpx's own per-request
+                # INFO line, which the server quiets to WARNING unless the
+                # operator asks for DEBUG (it prints the full request URL).
+                "--log-level": "DEBUG",
             },
         )
         try:

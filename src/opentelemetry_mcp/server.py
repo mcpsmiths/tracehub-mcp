@@ -16,9 +16,11 @@ from typing import Any, Literal, NoReturn
 import click
 import uvicorn
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.auth import AccessToken, TokenVerifier
 from fastmcp.server.http import StarletteWithLifespan
 from mcp.types import ToolAnnotations
+from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -26,6 +28,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from opentelemetry_mcp import __version__
+from opentelemetry_mcp.attributes import HealthCheckResponse
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.datadog import DatadogBackend
 from opentelemetry_mcp.backends.honeycomb import HoneycombBackend
@@ -49,7 +52,12 @@ from opentelemetry_mcp.observability import (
     configure_tracing,
     install_trace_context_log_filter,
 )
-from opentelemetry_mcp.security import is_loopback_host
+from opentelemetry_mcp.security import (
+    UserinfoRedactingFilter,
+    is_loopback_host,
+    redact_url_userinfo,
+    redact_userinfo_in_text,
+)
 from opentelemetry_mcp.tools import (
     compare,
     correlate,
@@ -70,11 +78,33 @@ from opentelemetry_mcp.tools import (
     usage,
 )
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+# Set up logging. The root stderr handler is built explicitly (rather than
+# left to basicConfig) so the userinfo-redacting filter sits on the one
+# HANDLER every record passes through - a filter on the root *logger* is
+# never consulted for records propagated from child loggers (httpx, fastmcp,
+# opentelemetry_mcp.*). basicConfig is a no-op when the root already has
+# handlers (pytest), so tests drive _ROOT_LOG_HANDLER directly.
+_ROOT_LOG_HANDLER = logging.StreamHandler()
+_ROOT_LOG_HANDLER.setFormatter(
+    logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 )
+_ROOT_LOG_HANDLER.addFilter(UserinfoRedactingFilter())
+logging.basicConfig(level=logging.INFO, handlers=[_ROOT_LOG_HANDLER])
 logger = logging.getLogger(__name__)
+
+
+def _apply_log_level(level: str) -> None:
+    """Set the root level and, unless the operator asked for DEBUG, quiet
+    httpx's per-request INFO line ("HTTP Request: GET <url> ..."), which
+    prints the full request URL - the one URL sink that cannot be redacted
+    at creation time. LOG_LEVEL=DEBUG keeps that line for connectivity
+    debugging; it then passes through the redacting handler filter like
+    every other record."""
+    root = logging.getLogger()
+    root.setLevel(level)
+    httpx_level = logging.NOTSET if root.getEffectiveLevel() <= logging.DEBUG else logging.WARNING
+    logging.getLogger("httpx").setLevel(httpx_level)
+
 
 # All 19 tools below only ever query trace/span backends and never mutate
 # backend state, so the same read-only/destructive/idempotent/open-world
@@ -98,12 +128,25 @@ def _handle_tool_error(tool_name: str, error: Exception) -> NoReturn:
     CallToolResult(isError=True), per SEP-2140 - a plain successful return
     would leave isError=False even though the tool call failed.
 
+    The one exception to the identity re-raise: when the error text embeds a
+    URL userinfo (httpx's HTTPStatusError message carries the request URL
+    verbatim, so a credential a bypassed config left in BACKEND_URL would
+    otherwise reach the MCP client as tool-error content), a ToolError with
+    the redacted text is raised from it instead - still isError=True, and
+    fastmcp logs a ToolError without exc_info, so no traceback re-prints it.
+
     Args:
         tool_name: Name of the tool that encountered the error
         error: The exception that was raised
     """
-    logger.error(f"Error executing {tool_name}: {error}", exc_info=True)
-    raise error
+    message = str(error)
+    redacted = redact_userinfo_in_text(message)
+    if redacted == message:
+        logger.error(f"Error executing {tool_name}: {error}", exc_info=True)
+        raise error
+    # The traceback's final line would repeat the raw message: log without it.
+    logger.error(f"Error executing {tool_name}: {redacted}")
+    raise ToolError(redacted) from error
 
 
 # Global backend instance
@@ -144,14 +187,14 @@ def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
     backend: BaseBackend
 
     if backend_config.type == "jaeger":
-        logger.info(f"Initializing Jaeger backend: {backend_config.url}")
+        logger.info(f"Initializing Jaeger backend: {redact_url_userinfo(backend_config.url)}")
         backend = JaegerBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             timeout=backend_config.timeout,
         )
     elif backend_config.type == "tempo":
-        logger.info(f"Initializing Tempo backend: {backend_config.url}")
+        logger.info(f"Initializing Tempo backend: {redact_url_userinfo(backend_config.url)}")
         backend = TempoBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
@@ -159,7 +202,7 @@ def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
             tempo_instance_id=backend_config.tempo_instance_id,
         )
     elif backend_config.type == "traceloop":
-        logger.info(f"Initializing Traceloop backend: {backend_config.url}")
+        logger.info(f"Initializing Traceloop backend: {redact_url_userinfo(backend_config.url)}")
         backend = TraceloopBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
@@ -167,7 +210,7 @@ def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
             environments=backend_config.environments,
         )
     elif backend_config.type == "datadog":
-        logger.info(f"Initializing Datadog backend: {backend_config.url}")
+        logger.info(f"Initializing Datadog backend: {redact_url_userinfo(backend_config.url)}")
         backend = DatadogBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
@@ -175,7 +218,7 @@ def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
             timeout=backend_config.timeout,
         )
     elif backend_config.type == "sentry":
-        logger.info(f"Initializing Sentry backend: {backend_config.url}")
+        logger.info(f"Initializing Sentry backend: {redact_url_userinfo(backend_config.url)}")
         backend = SentryBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
@@ -232,6 +275,14 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
     return backend
 
 
+def _describe_health(health: HealthCheckResponse) -> str:
+    """status plus the redacted error, never the model repr (which carries
+    the backend URL and the raw error text)."""
+    if health.error:
+        return f"{health.status} ({redact_userinfo_in_text(health.error)})"
+    return health.status
+
+
 async def _get_backend() -> BaseBackend:
     """Get or lazily create backend in the current event loop.
 
@@ -257,11 +308,11 @@ async def _get_backend() -> BaseBackend:
         # Perform health check on first initialization
         try:
             health = await _backend.health_check()
-            logger.info(f"Backend health check: {health}")
+            logger.info(f"Backend health check: {_describe_health(health)}")
             if health.status != "healthy":
                 logger.warning("Backend is not healthy, but continuing...")
         except Exception as e:
-            logger.error(f"Backend health check failed: {e}")
+            logger.error(f"Backend health check failed: {redact_userinfo_in_text(str(e))}")
             logger.warning("Continuing anyway, requests may fail...")
 
     return _backend
@@ -302,11 +353,13 @@ async def _get_secondary_backend() -> BaseBackend:
 
         try:
             health = await _secondary_backend.health_check()
-            logger.info(f"Secondary backend health check: {health}")
+            logger.info(f"Secondary backend health check: {_describe_health(health)}")
             if health.status != "healthy":
                 logger.warning("Secondary backend is not healthy, but continuing...")
         except Exception as e:
-            logger.error(f"Secondary backend health check failed: {e}")
+            logger.error(
+                f"Secondary backend health check failed: {redact_userinfo_in_text(str(e))}"
+            )
             logger.warning("Continuing anyway, requests may fail...")
 
     return _secondary_backend
@@ -318,24 +371,31 @@ async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any
     lifecycle (construct/close) - this never closes it, so it is safe to
     call against the server's own cached _get_backend() instance without
     disrupting subsequent real tool calls that share it.
+
+    Every error string is redacted HERE, not by the callers: /ready hands
+    the details to unauthenticated peers and doctor prints them, and httpx
+    error text embeds the request URL (userinfo included) verbatim.
     """
     all_ok = True
     details: dict[str, Any] = {}
 
     try:
         health = await backend.health_check()
-        details["health_check"] = {"status": health.status, "error": health.error}
+        details["health_check"] = {
+            "status": health.status,
+            "error": redact_userinfo_in_text(health.error),
+        }
         if health.status != "healthy":
             all_ok = False
     except Exception as e:
-        details["health_check"] = {"status": "error", "error": str(e)}
+        details["health_check"] = {"status": "error", "error": redact_userinfo_in_text(str(e))}
         all_ok = False
 
     try:
         services_found = await backend.list_services()
         details["list_services"] = {"count": len(services_found)}
     except Exception as e:
-        details["list_services"] = {"error": str(e)}
+        details["list_services"] = {"error": redact_userinfo_in_text(str(e))}
         all_ok = False
 
     return all_ok, details
@@ -358,7 +418,9 @@ async def ready_route(request: Request) -> Response:
     try:
         backend = await _get_backend()
     except Exception as e:
-        return JSONResponse({"status": "not_ready", "error": str(e)}, status_code=503)
+        return JSONResponse(
+            {"status": "not_ready", "error": redact_userinfo_in_text(str(e))}, status_code=503
+        )
 
     all_ok, details = await _run_backend_checks(backend)
     return JSONResponse(
@@ -1781,7 +1843,7 @@ def _print_config_backend_dict(backend_config: BackendConfig) -> dict[str, Any]:
     they are not secrets (only api_key/app_key are)."""
     return {
         "type": backend_config.type,
-        "url": str(backend_config.url),
+        "url": redact_url_userinfo(backend_config.url),
         "environments": backend_config.environments,
         "timeout": backend_config.timeout,
         "max_response_bytes": backend_config.max_response_bytes,
@@ -2177,48 +2239,54 @@ def main(
         trust_client_trace_context = transport == "stdio"
 
     try:
-        # Load configuration from environment
-        _config = ServerConfig.from_env()
+        try:
+            # Load configuration from environment
+            _config = ServerConfig.from_env()
 
-        # Set logging level
-        logging.getLogger().setLevel(_config.log_level)
+            # Set logging level
+            _apply_log_level(_config.log_level)
 
-        # Apply CLI overrides
-        if (
-            backend
-            or url
-            or api_key
-            or app_key
-            or tempo_instance_id
-            or sentry_org
-            or sentry_project
-            or environments
-            or aws_region
-            or newrelic_account_id
-            or honeycomb_dataset
-            or log_level
-            or max_traces_per_query is not None
-            or slow_request_threshold_ms is not None
-            or query_cache_ttl_seconds is not None
-        ):
-            _config.apply_cli_overrides(
-                backend_type=backend,
-                backend_url=url,
-                api_key=api_key,
-                app_key=app_key,
-                sentry_org=sentry_org,
-                sentry_project=sentry_project,
-                tempo_instance_id=tempo_instance_id,
-                aws_region=aws_region,
-                newrelic_account_id=newrelic_account_id,
-                honeycomb_dataset=honeycomb_dataset,
-                environments=environments,
-                log_level=log_level,
-                max_traces_per_query=max_traces_per_query,
-                slow_request_threshold_ms=slow_request_threshold_ms,
-                query_cache_ttl_seconds=query_cache_ttl_seconds,
-            )
-            logging.getLogger().setLevel(_config.log_level)
+            # Apply CLI overrides
+            if (
+                backend
+                or url
+                or api_key
+                or app_key
+                or tempo_instance_id
+                or sentry_org
+                or sentry_project
+                or environments
+                or aws_region
+                or newrelic_account_id
+                or honeycomb_dataset
+                or log_level
+                or max_traces_per_query is not None
+                or slow_request_threshold_ms is not None
+                or query_cache_ttl_seconds is not None
+            ):
+                _config.apply_cli_overrides(
+                    backend_type=backend,
+                    backend_url=url,
+                    api_key=api_key,
+                    app_key=app_key,
+                    sentry_org=sentry_org,
+                    sentry_project=sentry_project,
+                    tempo_instance_id=tempo_instance_id,
+                    aws_region=aws_region,
+                    newrelic_account_id=newrelic_account_id,
+                    honeycomb_dataset=honeycomb_dataset,
+                    environments=environments,
+                    log_level=log_level,
+                    max_traces_per_query=max_traces_per_query,
+                    slow_request_threshold_ms=slow_request_threshold_ms,
+                    query_cache_ttl_seconds=query_cache_ttl_seconds,
+                )
+                _apply_log_level(_config.log_level)
+        except (ValidationError, ValueError) as e:
+            # pydantic's ValidationError echoes input_value='<the URL>' and a
+            # traceback would print it again: the redacted message only.
+            logger.error(f"Configuration error: {redact_userinfo_in_text(str(e))}")
+            sys.exit(1)
 
         if print_config:
             # Built by hand, not model_dump(): sentry_org/sentry_project/
@@ -2332,7 +2400,8 @@ def main(
             asyncio.run(uvicorn.Server(uvicorn_config).serve())
         else:
             logger.info(
-                f"Starting MCP server with stdio transport using Backend: {_config.backend.type} connected to: {_config.backend.url}"
+                f"Starting MCP server with stdio transport using Backend: {_config.backend.type} "
+                f"connected to: {redact_url_userinfo(_config.backend.url)}"
             )
             mcp.run(transport="stdio")
 
@@ -2433,16 +2502,19 @@ def doctor(
             )
         click.secho("[OK] Configuration loaded and validated", fg="green")
     except Exception as e:
-        click.secho(f"[FAIL] Configuration: {e}", fg="red")
+        # pydantic's ValidationError echoes the raw input URL (see main()).
+        click.secho(f"[FAIL] Configuration: {redact_userinfo_in_text(str(e))}", fg="red")
         sys.exit(1)
 
     try:
         backend_instance = _create_backend(config)
         click.secho(
-            f"[OK] Backend constructed: {config.backend.type} @ {config.backend.url}", fg="green"
+            f"[OK] Backend constructed: {config.backend.type} @ "
+            f"{redact_url_userinfo(config.backend.url)}",
+            fg="green",
         )
     except Exception as e:
-        click.secho(f"[FAIL] Backend construction: {e}", fg="red")
+        click.secho(f"[FAIL] Backend construction: {redact_userinfo_in_text(str(e))}", fg="red")
         sys.exit(1)
 
     async def _run_checks() -> int:
@@ -2465,11 +2537,14 @@ def doctor(
                 secondary_instance = _build_backend_from_config(config.secondary_backend)
                 click.secho(
                     f"[OK] Secondary backend constructed: {config.secondary_backend.type} "
-                    f"@ {config.secondary_backend.url}",
+                    f"@ {redact_url_userinfo(config.secondary_backend.url)}",
                     fg="green",
                 )
             except Exception as e:
-                click.secho(f"[FAIL] Secondary backend construction: {e}", fg="red")
+                click.secho(
+                    f"[FAIL] Secondary backend construction: {redact_userinfo_in_text(str(e))}",
+                    fg="red",
+                )
                 return 1
 
             try:

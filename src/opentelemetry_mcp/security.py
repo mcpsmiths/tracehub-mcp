@@ -17,12 +17,24 @@ Two callers with different trust levels share these helpers:
   spellings before the denylist comparison. DNS aliases of a metadata address
   are not resolved here - the transport's host pin (allowed_host) is the
   layer that refuses them, by refusing every host but the configured one.
+
+The module also owns the URL-userinfo redaction helpers. BackendConfig
+rejects `user:password@host` in BACKEND_URL outright, so a validated config
+never carries a credential in its URL; redact_url_userinfo /
+redact_userinfo_in_text / UserinfoRedactingFilter are the defence in depth
+for every sink that stringifies a URL or a backend exception (httpx's
+HTTPStatusError text embeds the request URL verbatim) in case one does.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import logging
+import re
 import socket
+from typing import overload
+
+import httpx
 
 # Cloud instance-metadata endpoints. 169.254.169.254 is shared by AWS, Azure,
 # GCP, DigitalOcean, and Oracle Cloud; the others are provider-specific
@@ -106,3 +118,70 @@ def is_loopback_host(host: str | None) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+# "<scheme>://" then a run with no "/", "?", "#", "@" or whitespace, then "@":
+# the userinfo component of a URL embedded anywhere in free text. The host
+# and path after the "@" are kept so an error stays actionable.
+_URL_USERINFO_RE = re.compile(r"(?<=://)[^/?#@\s]+@")
+_REDACTED_USERINFO = "[REDACTED]@"
+
+
+def redact_url_userinfo(url: object) -> str:
+    """str(url) with any user:password@ component removed.
+
+    Accepts anything whose str() is a URL (pydantic HttpUrl, httpx.URL, str).
+    A string httpx cannot parse falls back to the textual redaction so the
+    result is never the raw input.
+    """
+    text = str(url)
+    try:
+        return str(httpx.URL(text).copy_with(username=None, password=None))
+    except httpx.InvalidURL:
+        return _URL_USERINFO_RE.sub(_REDACTED_USERINFO, text)
+
+
+@overload
+def redact_userinfo_in_text(text: str) -> str: ...
+
+
+@overload
+def redact_userinfo_in_text(text: None) -> None: ...
+
+
+def redact_userinfo_in_text(text: str | None) -> str | None:
+    """Replace the userinfo of every URL embedded in `text` with
+    "[REDACTED]@", keeping scheme, host and path. For exception messages
+    (httpx error text, pydantic's input_value echo) and log lines."""
+    if text is None:
+        return None
+    return _URL_USERINFO_RE.sub(_REDACTED_USERINFO, text)
+
+
+class UserinfoRedactingFilter(logging.Filter):
+    """Handler-level last line of defence: rewrites a record so neither its
+    message nor its formatted traceback carries a URL userinfo component.
+
+    Attach to HANDLERS (server.py's root stderr handler), not to the root
+    logger - logger-level filters are never consulted for records that
+    propagate up from child loggers (httpx, fastmcp, opentelemetry_mcp.*).
+    Creation-time redaction at every known sink remains the primary
+    control; this catches the sinks nobody named, such as a third-party
+    logger echoing an exception. Mutating the record is how logging filters
+    work: every handler after this one sees the redacted record too.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = redact_userinfo_in_text(message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = None
+        if record.exc_info:
+            exc_text = record.exc_text or logging.Formatter().formatException(record.exc_info)
+            record.exc_text = redact_userinfo_in_text(exc_text)
+            # Formatter.format() re-renders exc_info only when exc_text is
+            # unset, but other formatters may not; drop exc_info so the
+            # redacted cache is the only thing that can print.
+            record.exc_info = None
+        return True

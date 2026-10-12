@@ -147,7 +147,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 **Environment Variables** (see [.env.example](.env.example)):
 
 - `BACKEND_TYPE` - Required: `jaeger`, `tempo`, `traceloop`, `datadog`, `sentry`, `xray`, `newrelic`, or `honeycomb`
-- `BACKEND_URL` - Required: Backend API endpoint (decorative-only placeholder for X-Ray - see config.py's `BackendConfig.url` docstring)
+- `BACKEND_URL` - Required: Backend API endpoint (decorative-only placeholder for X-Ray - see config.py's `BackendConfig.url` docstring). `BackendConfig.validate_url` rejects a `user:password@host` URL outright (the URL is logged, printed and echoed by httpx error text); `security.redact_url_userinfo` / `redact_userinfo_in_text` are the defence in depth applied at every sink that stringifies a URL or backend error (startup INFO lines, lazy-init health log, `_run_backend_checks` details for `/ready` and `doctor`, `--print-config`, `_handle_tool_error`, the slow-request WARNING)
 - `BACKEND_API_KEY` - Optional: Authentication key (unused by X-Ray, which authenticates via boto3's standard AWS credential chain)
 - `BACKEND_APP_KEY` - Required for Datadog backend only: Application key, in addition to `BACKEND_API_KEY`
 - `BACKEND_SENTRY_ORG` - Required for Sentry backend only: Organization slug
@@ -159,7 +159,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `BACKEND_MAX_RESPONSE_BYTES` - Optional: ceiling on the *decoded* size of any single backend response (default: 64 MiB, range 1 to 1 GiB; `SECONDARY_BACKEND_MAX_RESPONSE_BYTES` for the secondary backend). Enforced in `backends/base.py`'s `_RetryingTransport` (`_BoundedResponse` counts post-`Content-Encoding` bytes on httpx's `aread()` path, so every `response.json()` site and every redirect hop is covered without call-site changes); an oversized body raises `ResponseTooLargeError`, which is not retried
 - `BACKEND_TEMPO_INSTANCE_ID` - Optional for Tempo backend: Grafana Cloud stack/instance ID (Basic Auth with `BACKEND_API_KEY` instead of Bearer auth)
 - `SECONDARY_BACKEND_TYPE` / `SECONDARY_BACKEND_URL` / ... - Optional, opt-in: a second, independently-configured backend for `correlate_trace` (cross-backend correlation) - every `BACKEND_*` variable above has a `SECONDARY_BACKEND_*` equivalent. Env-var only (no CLI override), see `config.py`'s `BackendConfig.from_env_optional`
-- `LOG_LEVEL` - Optional: Logging level (default: INFO)
+- `LOG_LEVEL` - Optional: Logging level (default: INFO). `server._apply_log_level` also sets the `httpx` logger to WARNING unless the level is DEBUG, because httpx's per-request INFO line prints the full request URL; `LOG_LEVEL=DEBUG` keeps those lines for connectivity debugging. The root stderr handler (`server._ROOT_LOG_HANDLER`) carries `security.UserinfoRedactingFilter`, which strips any `user:password@` URL component from every record's message and formatted traceback - attached to the handler, not the root logger, because logger-level filters never see propagated child-logger records
 - `MAX_TRACES_PER_QUERY` - Optional: Result limit (default: 500, 1-1000)
 - `SLOW_REQUEST_THRESHOLD_MS` - Optional: Logs a WARNING for any backend request slower than this, independent of `LOG_LEVEL` (default: unset/disabled)
 - `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` - Optional: Env-var equivalents of `--transport`/`--host`/`--port` (see CLI flags below). HTTP binds loopback (`127.0.0.1`) by default; a non-loopback host requires `MCP_HTTP_BEARER_TOKEN` or `MCP_ALLOW_UNAUTHENTICATED_HTTP`
@@ -255,7 +255,10 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
   let backend exceptions bubble up as-is) rather than catching them and returning `{"error": ...}`
   JSON. `server.py`'s shared `_handle_tool_error` logs then re-raises; letting the exception
   reach the MCP SDK's lowlevel server is what makes it build `CallToolResult(isError=True)` per
-  SEP-2140. A tool function that swallows an exception and returns a normal JSON string produces
+  SEP-2140. The one exception to the identity re-raise: when the message embeds a URL userinfo
+  (httpx's `HTTPStatusError` text carries the request URL verbatim) it raises a
+  `fastmcp.exceptions.ToolError` with the redacted text `from` the original - still
+  `isError=True`, and fastmcp logs a `ToolError` without a traceback. A tool function that swallows an exception and returns a normal JSON string produces
   `isError=False` even though the call failed - a client checking the spec-correct `isError` flag
   would see it as a success.
 - Backend health checks are non-blocking

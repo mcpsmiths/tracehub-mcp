@@ -17,7 +17,11 @@ or any third party. There is no tracking of any kind baked into the software.
   environment variables you provide and used only to authenticate to the observability
   backend *you* configure (`BACKEND_URL`). They are never logged, never sent anywhere
   else, and never leave the process — redaction is applied on the one code path that
-  could otherwise echo them back (see [Secret Flow](#secret-flow) below).
+  could otherwise echo them back (see [Secret Flow](#secret-flow) below). `BACKEND_URL`
+  itself may not carry a credential: a `user:password@host` URL is rejected at startup,
+  and as defence in depth every URL and backend error text that is logged, printed
+  (`--print-config`, `doctor`) or returned (`/ready`, tool errors) is stripped of any
+  userinfo component first.
 - **Trace and span data** returned by tools comes from whatever application your own
   observability backend is instrumenting. tracehub-mcp queries that backend using your
   credentials and returns the results to your MCP client (Claude, Cursor, etc.) — it does
