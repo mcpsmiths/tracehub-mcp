@@ -1,6 +1,7 @@
 """Tests for the host-classification and userinfo-redaction helpers in
 security.py."""
 
+import io
 import logging
 import sys
 
@@ -134,6 +135,32 @@ class TestRedactUserinfoInText:
             redact_userinfo_in_text("see https://svc@h.test/") == "see https://[REDACTED]@h.test/"
         )
 
+    def test_password_containing_at_is_redacted_up_to_the_last_at(self) -> None:
+        """WHATWG (and so pydantic) accept a literal '@' inside the password:
+        host h.test, password p%40<marker>. The userinfo therefore runs to
+        the LAST '@' before the authority ends; stopping at the first one
+        would leave the password's tail in place."""
+        redacted = redact_userinfo_in_text(f"input_value='https://u:p@{VFY_MARKER}@h.test/x'")
+
+        assert redacted == "input_value='https://[REDACTED]@h.test/x'"
+
+    def test_pydantic_echo_of_a_password_containing_at_is_fully_redacted(self) -> None:
+        """The string path is what from_env() takes, and the one message
+        main()/doctor are guaranteed to emit for a rejected credential."""
+        with pytest.raises(ValidationError) as exc_info:
+            BackendConfig.model_validate(
+                {"type": "jaeger", "url": f"https://u:p@{VFY_MARKER}@h.test/x"}
+            )
+        raw = str(exc_info.value)
+        assert f"p@{VFY_MARKER}@h.test" in raw  # the premise: pydantic echoes input_value
+
+        redacted = redact_userinfo_in_text(raw)
+
+        assert redacted is not None
+        assert VFY_MARKER not in redacted
+        assert "p@" not in redacted
+        assert "[REDACTED]@h.test/x" in redacted
+
     @pytest.mark.parametrize(
         "text",
         [
@@ -202,3 +229,65 @@ class TestUserinfoRedactingFilter:
         assert record.args == ("healthy",)
         assert record.exc_info is None
         assert record.exc_text is None
+
+    def test_malformed_format_call_passes_without_raising_and_redacts_args(self) -> None:
+        """Handler.handle() runs filters OUTSIDE emit()'s try/except, so an
+        exception here would escape into the logging caller (any dependency
+        with a mismatched %-format call) - where, without the filter,
+        Handler.handleError would have swallowed it. The record is instead
+        redacted piecewise so the Formatter failure that follows prints no
+        userinfo either."""
+        record = self._record("HTTP Request: %s %s", f"https://u:{VFY_MARKER}@h.test/x")
+
+        assert UserinfoRedactingFilter().filter(record) is True
+
+        assert record.args == ("https://[REDACTED]@h.test/x",)
+        assert record.msg == "HTTP Request: %s %s"
+        assert VFY_MARKER not in repr(record.__dict__)
+
+    def test_malformed_mapping_args_are_redacted_per_value(self) -> None:
+        record = self._record(
+            "%(method)s %(url)s %(missing)s",
+            {"method": "GET", "url": f"https://u:{VFY_MARKER}@h.test/x"},
+        )
+
+        assert UserinfoRedactingFilter().filter(record) is True
+
+        assert isinstance(record.args, dict)
+        assert record.args["url"] == "https://[REDACTED]@h.test/x"
+        assert VFY_MARKER not in repr(record.__dict__)
+
+    def test_malformed_format_call_reaches_handle_error_not_the_caller(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """End to end through a real handler: the caller gets no exception,
+        and the '--- Logging error ---' notice handleError prints to stderr
+        (Message: %r / Arguments: %s) carries the redacted pieces only."""
+        handler = logging.StreamHandler(io.StringIO())
+        handler.addFilter(UserinfoRedactingFilter())
+        log = logging.getLogger("tests.security.malformed_format")
+        log.handlers = [handler]
+        log.propagate = False
+        try:
+            log.error("%s %s", f"https://u:{VFY_MARKER}@h.test/x")  # one arg, two slots
+        finally:
+            log.handlers = []
+            log.propagate = True
+
+        err = capsys.readouterr().err
+        assert "--- Logging error ---" in err
+        assert "https://[REDACTED]@h.test/x" in err
+        assert VFY_MARKER not in err
+
+    def test_unrenderable_traceback_is_dropped_rather_than_raised(self) -> None:
+        """A traceback the Formatter cannot render cannot be proven
+        credential-free, and raising here would hit the caller: drop it."""
+        record = self._record("Server error: %s", "x", exc_info=(None, None, "not a traceback"))
+
+        assert UserinfoRedactingFilter().filter(record) is True
+
+        assert record.exc_info is None
+        assert record.exc_text == "<traceback unavailable>"
+        assert logging.Formatter("%(message)s").format(record) == (
+            "Server error: x\n<traceback unavailable>"
+        )

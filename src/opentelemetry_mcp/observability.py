@@ -33,6 +33,8 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased, Sampler
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
 
+from opentelemetry_mcp.security import redact_userinfo_in_text
+
 logger = logging.getLogger(__name__)
 
 _TRACER_NAME = "opentelemetry_mcp"
@@ -82,9 +84,6 @@ _SECRET_PATTERNS = [
         r"\s*[:=]\s*)(?P<quote>['\"]?)(?P<value>[^\s'\",}&]+)(?P=quote)",
         re.IGNORECASE,
     ),
-    # user:password@ inside any URL (httpx error text embeds the request
-    # URL verbatim); keeps "://" and the host that follows the "@".
-    re.compile(r"(?P<field>://)[^/\s@]+:[^/\s@]*(?=@)"),
     re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key ID
     re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"),  # GitHub tokens (ghp_/gho_/ghu_/ghs_/ghr_)
     re.compile(r"sk-[A-Za-z0-9]{20,}"),  # a common vendor secret-key prefix shape
@@ -94,8 +93,14 @@ _SECRET_PATTERNS = [
 def _redact_secrets(text: str) -> str:
     """Replace anything matching a known credential shape with [REDACTED],
     for the opt-in --include-args-in-spans/gen_ai.tool.call.arguments and
-    .result span attributes. Applied before truncation so a match near the
-    truncation boundary cannot end up half-redacted, half-exposed."""
+    .result span attributes and for the exported span status. Applied
+    before truncation so a match near the truncation boundary cannot end
+    up half-redacted, half-exposed.
+
+    URL userinfo (httpx error text embeds the request URL verbatim) goes
+    through security.redact_userinfo_in_text - the one implementation every
+    other sink uses, so the two cannot drift - not a second pattern here."""
+    text = redact_userinfo_in_text(text)
     for pattern in _SECRET_PATTERNS:
         if pattern.groups:
             text = pattern.sub(lambda m: f"{m.group('field')}[REDACTED]", text)

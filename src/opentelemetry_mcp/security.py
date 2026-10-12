@@ -32,6 +32,7 @@ import ipaddress
 import logging
 import re
 import socket
+from collections.abc import Mapping
 from typing import overload
 
 import httpx
@@ -120,10 +121,14 @@ def is_loopback_host(host: str | None) -> bool:
         return False
 
 
-# "<scheme>://" then a run with no "/", "?", "#", "@" or whitespace, then "@":
-# the userinfo component of a URL embedded anywhere in free text. The host
-# and path after the "@" are kept so an error stays actionable.
-_URL_USERINFO_RE = re.compile(r"(?<=://)[^/?#@\s]+@")
+# "<scheme>://" then a run with no "/", "?", "#" or whitespace, then "@": the
+# userinfo component of a URL embedded anywhere in free text. "@" itself is
+# NOT excluded from the run - WHATWG (and so pydantic's HttpUrl) accept a
+# literal "@" inside the password (`https://u:p@ss@h.test/` is host h.test,
+# password p%40ss), so the match must run greedily to the LAST "@" before
+# the authority ends; stopping at the first would leave the password's tail.
+# The host and path after the "@" are kept so an error stays actionable.
+_URL_USERINFO_RE = re.compile(r"(?<=://)[^/?#\s]+@")
 _REDACTED_USERINFO = "[REDACTED]@"
 
 
@@ -158,30 +163,87 @@ def redact_userinfo_in_text(text: str | None) -> str | None:
     return _URL_USERINFO_RE.sub(_REDACTED_USERINFO, text)
 
 
+def _safe_redacted_text(value: object) -> str:
+    """str(value) with URL userinfo redacted. A value whose __str__ raises
+    becomes a type-name placeholder: this runs inside a logging filter,
+    which must never raise."""
+    try:
+        text = str(value)
+    except Exception:
+        text = f"<unprintable {type(value).__name__}>"
+    return redact_userinfo_in_text(text)
+
+
+def _redact_log_args(args: object) -> tuple[object, ...] | Mapping[str, object] | None:
+    """record.args with every value redacted individually, preserving the
+    tuple-or-mapping shape %-formatting expects."""
+    if args is None:
+        return None
+    if isinstance(args, Mapping):
+        return {key: _safe_redacted_text(value) for key, value in args.items()}
+    if isinstance(args, tuple):
+        return tuple(_safe_redacted_text(value) for value in args)
+    return (_safe_redacted_text(args),)
+
+
 class UserinfoRedactingFilter(logging.Filter):
     """Handler-level last line of defence: rewrites a record so neither its
     message nor its formatted traceback carries a URL userinfo component.
 
     Attach to HANDLERS (server.py's root stderr handler), not to the root
     logger - logger-level filters are never consulted for records that
-    propagate up from child loggers (httpx, fastmcp, opentelemetry_mcp.*).
-    Creation-time redaction at every known sink remains the primary
-    control; this catches the sinks nobody named, such as a third-party
-    logger echoing an exception. Mutating the record is how logging filters
-    work: every handler after this one sees the redacted record too.
+    propagate up from child loggers (httpx, opentelemetry_mcp.*). Loggers
+    that do not propagate at all are outside its reach: fastmcp's installs
+    its own RichHandlers with propagate=False at import, and uvicorn's
+    default log config does the same - server._handle_tool_error is what
+    keeps userinfo out of the records fastmcp itself emits. Creation-time
+    redaction at every known sink remains the primary control; this
+    catches the sinks nobody named, such as a third-party logger echoing an
+    exception. Mutating the record is how logging filters work: every
+    handler after this one sees the redacted record too.
+
+    Never raises. Handler.handle() runs filters OUTSIDE emit()'s
+    try/except, so an exception here would propagate into the logging
+    caller: a malformed %-format call anywhere (uvicorn, starlette,
+    httpcore, the OTel SDK, this code) would then crash the request or
+    startup path it occurs in, where without the filter Handler.handleError
+    would merely print a "--- Logging error ---" notice.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
+        self._redact_message(record)
+        self._redact_traceback(record)
+        return True
+
+    @staticmethod
+    def _redact_message(record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:
+            # Mismatched %-format arity or type. The Formatter will fail the
+            # same way inside emit(), and handleError then prints
+            # "Message: %r / Arguments: %s" - so redact the format string and
+            # each argument separately and let that notice be credential-free.
+            record.msg = _safe_redacted_text(record.msg)
+            record.args = _redact_log_args(record.args)
+            return
         redacted = redact_userinfo_in_text(message)
         if redacted != message:
             record.msg = redacted
             record.args = None
-        if record.exc_info:
+
+    @staticmethod
+    def _redact_traceback(record: logging.LogRecord) -> None:
+        if not record.exc_info:
+            return
+        try:
             exc_text = record.exc_text or logging.Formatter().formatException(record.exc_info)
-            record.exc_text = redact_userinfo_in_text(exc_text)
-            # Formatter.format() re-renders exc_info only when exc_text is
-            # unset, but other formatters may not; drop exc_info so the
-            # redacted cache is the only thing that can print.
-            record.exc_info = None
-        return True
+        except Exception:
+            # A traceback that cannot be rendered cannot be proven
+            # credential-free, and raising here would hit the caller: drop it.
+            exc_text = "<traceback unavailable>"
+        record.exc_text = redact_userinfo_in_text(exc_text)
+        # Formatter.format() re-renders exc_info only when exc_text is
+        # unset, but other formatters may not; drop exc_info so the
+        # redacted cache is the only thing that can print.
+        record.exc_info = None

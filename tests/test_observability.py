@@ -60,6 +60,7 @@ from opentelemetry_mcp.observability import (
     configure_tracing,
     install_trace_context_log_filter,
 )
+from opentelemetry_mcp.security import redact_userinfo_in_text
 from opentelemetry_mcp.server import OriginValidationMiddleware, RateLimitMiddleware
 from tests.streamable_http_client import call_tool, open_session, sse_json
 
@@ -920,3 +921,21 @@ class TestRedactSecretsUrlUserinfo:
     def test_plain_urls_are_untouched(self) -> None:
         text = "GET https://h.test/x?trace_id=abc123 by someone@example.com"
         assert _redact_secrets(text) == text
+
+    def test_username_only_userinfo_is_redacted(self) -> None:
+        """A token used as the Basic-auth username has no ':' - the pattern
+        must not require one."""
+        assert _redact_secrets("err for url 'https://TOKEN123@h.test/x'") == (
+            "err for url 'https://[REDACTED]@h.test/x'"
+        )
+
+    def test_password_containing_at_is_fully_redacted(self) -> None:
+        assert _redact_secrets("err for url 'https://u:p@ss@h.test/x'") == (
+            "err for url 'https://[REDACTED]@h.test/x'"
+        )
+
+    def test_shares_the_security_module_redaction(self) -> None:
+        """One implementation (security.redact_userinfo_in_text), not a
+        second hand-rolled pattern the two sinks could drift between."""
+        text = "GET https://u:VFY-PW-x@h.test/x then https://svc@two.test/ by someone@example.com"
+        assert _redact_secrets(text) == redact_userinfo_in_text(text)
