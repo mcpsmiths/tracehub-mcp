@@ -20,7 +20,8 @@ Include, where relevant:
 - A description of the vulnerability and its potential impact
 - Steps to reproduce (a minimal repro is ideal)
 - The affected version(s)
-- Whether it requires a specific backend (Jaeger, Tempo, Traceloop, Datadog, Sentry) to trigger
+- Whether it requires a specific backend (Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry,
+  AWS X-Ray, New Relic, Honeycomb) to trigger
 
 We aim to acknowledge new reports within a few days. Since this is an independently maintained
 open-source project rather than a funded security team, response and fix timelines are
@@ -41,6 +42,10 @@ For anyone auditing this project as a dependency:
   persist it to disk.
 - CI runs [`ruff`](https://docs.astral.sh/ruff/) with the `S` (flake8-bandit) ruleset and
   [`pip-audit`](https://pypi.org/project/pip-audit/) against the resolved lockfile on every push.
+- Secret detection: TruffleHog scans the commit range of every push to `main` and every pull
+  request, and weekly (plus on demand) the whole history of every branch, with a custom detector
+  for Traceloop API keys (`.trufflehog.yaml`) that no built-in detector or GitHub partner pattern
+  covers; a `gitleaks` pre-commit hook with the same rule (`.gitleaks.toml`) runs locally.
 - Published container images (`ghcr.io/mcpsmiths/tracehub-mcp`) include build provenance
   attestation and an SBOM via `docker/build-push-action`.
 - Releases are published to PyPI via GitHub Actions using
@@ -70,6 +75,7 @@ full explanation; this document's scope is the vulnerability reporting process b
 
 This policy covers the tracehub-mcp server code itself (this repository). It does not cover:
 
-- The observability backends it connects to (Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry) —
-  report vulnerabilities in those systems to their respective maintainers.
+- The observability backends it connects to (Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry,
+  AWS X-Ray, New Relic, Honeycomb) — report vulnerabilities in those systems to their respective
+  maintainers.
 - MCP clients that connect to this server (Claude Desktop, Cursor, etc.).

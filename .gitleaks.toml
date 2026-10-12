@@ -1,0 +1,18 @@
+# gitleaks configuration for the pre-commit hook declared in
+# .pre-commit-config.yaml (gitleaks picks this file up automatically from the
+# repository root). It keeps every default rule and adds the one credential
+# class this repository already leaked once and that no default rule, GitHub
+# partner pattern or built-in TruffleHog detector knows: Traceloop API keys.
+# Same regex as the custom detector in .trufflehog.yaml;
+# tests/test_secret_scan_workflow.py asserts both and runs a positive and a
+# negative control against this file with the local gitleaks binary.
+title = "tracehub-mcp"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "traceloop-api-key"
+description = "Traceloop API key (tl_ followed by 32 lowercase alphanumerics)"
+regex = '''tl_[a-z0-9]{32}'''
+keywords = ["tl_"]
