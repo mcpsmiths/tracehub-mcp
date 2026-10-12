@@ -11,7 +11,10 @@ the top-level `on` key parses as the boolean True.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +23,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 RELEASE_YML = WORKFLOWS_DIR / "release.yml"
+DOCKER_PUBLISH_YML = WORKFLOWS_DIR / "docker-publish.yml"
 DEPENDABOT_YML = REPO_ROOT / ".github" / "dependabot.yml"
 REQUIREMENTS_RELEASE = REPO_ROOT / ".github" / "requirements-release.txt"
 SECURITY_MD = REPO_ROOT / "SECURITY.md"
@@ -35,6 +39,12 @@ def _load_yaml(path: Path) -> dict[Any, Any]:
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert isinstance(data, dict), path
     return data
+
+
+def _triggers(workflow: dict[Any, Any]) -> dict[str, Any]:
+    triggers = workflow[True]  # the `on` key, see the module docstring
+    assert isinstance(triggers, dict)
+    return triggers
 
 
 def _jobs(workflow: dict[Any, Any]) -> dict[str, Job]:
@@ -382,3 +392,183 @@ def test_security_md_binds_the_pypi_publisher_to_the_environment() -> None:
     text = SECURITY_MD.read_text(encoding="utf-8")
     section = text.split("### Release authorization", 1)[1].split("\n## ", 1)[0]
     assert "PyPI" in section and "MCP Registry" in section, section
+
+
+# --- docker-publish: :latest and :<X.Y.Z> only from the tree behind refs/tags/vX.Y.Z --
+
+IMAGE = "ghcr.io/mcpsmiths/tracehub-mcp"
+
+
+def _docker_publish_steps() -> list[Step]:
+    return _steps(_jobs(_load_yaml(DOCKER_PUBLISH_YML))["build-and-push"])
+
+
+def _parse_github_output(text: str) -> dict[str, str]:
+    """Parse the `key=value` and `key<<DELIM ... DELIM` forms of $GITHUB_OUTPUT."""
+    parsed: dict[str, str] = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if "<<" in line:
+            key, delimiter = line.split("<<", 1)
+            body: list[str] = []
+            i += 1
+            while lines[i] != delimiter:
+                body.append(lines[i])
+                i += 1
+            parsed[key] = "\n".join(body)
+        else:
+            key, _, value = line.partition("=")
+            parsed[key] = value
+        i += 1
+    return parsed
+
+
+def _replay_resolve_release_tag(tmp_path: Path, **env: str) -> tuple[int, dict[str, str]]:
+    steps = _docker_publish_steps()
+    run = _run(steps[_step_index(steps, lambda s: s.get("id") == "version")])
+    script = tmp_path / "resolve.sh"
+    script.write_text(run, encoding="utf-8")
+    output = tmp_path / "github_output"
+    output.write_text("", encoding="utf-8")
+    bash = shutil.which("bash")
+    assert bash is not None
+    proc = subprocess.run(  # noqa: S603 - replaying our own workflow step under test
+        [bash, "-eo", "pipefail", str(script)],
+        env={"PATH": os.environ["PATH"], "GITHUB_OUTPUT": str(output), **env},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode, _parse_github_output(output.read_text(encoding="utf-8"))
+
+
+def test_docker_publish_dispatch_requires_an_existing_release_tag() -> None:
+    inputs = _triggers(_load_yaml(DOCKER_PUBLISH_YML))["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"tag", "also_tag_latest"}, inputs
+    assert inputs["tag"]["required"] is True and inputs["tag"]["type"] == "string", inputs["tag"]
+    assert inputs["also_tag_latest"]["type"] == "boolean", inputs["also_tag_latest"]
+    assert inputs["also_tag_latest"]["default"] is False, inputs["also_tag_latest"]
+
+
+def test_docker_publish_image_tags_come_only_from_the_resolved_release() -> None:
+    steps = _docker_publish_steps()
+    build = steps[_step_index(steps, lambda s: _uses(s).startswith("docker/build-push-action"))]
+    assert _with(build)["tags"] == "${{ steps.version.outputs.tags }}", _with(build)
+    assert _with(build).get("push") is True and _with(build).get("sbom") is True, _with(build)
+    assert _with(build).get("provenance") == "mode=max", _with(build)
+    for step in steps:
+        assert ":latest" not in yaml.safe_dump(_with(step)), step
+
+
+def test_docker_publish_resolves_then_checks_out_then_guards_the_tag() -> None:
+    steps = _docker_publish_steps()
+    version_idx = _step_index(steps, lambda s: s.get("id") == "version")
+    checkout_idx = _step_index(steps, lambda s: _uses(s).startswith("actions/checkout"))
+    login_idx = _step_index(steps, lambda s: _uses(s).startswith("docker/login-action"))
+    guard_idx = _step_index(steps, lambda s: "refs/tags/v${TAG}^{commit}" in _run(s))
+    build_idx = _step_index(steps, lambda s: _uses(s).startswith("docker/build-push-action"))
+    assert version_idx < checkout_idx < guard_idx < build_idx
+    assert version_idx < login_idx, "a non-release ref must fail before GHCR login"
+    checkout = _with(steps[checkout_idx])
+    assert checkout.get("ref") == "${{ steps.version.outputs.ref }}", checkout
+    assert checkout.get("persist-credentials") is False and checkout.get("fetch-depth") == 0
+
+
+def test_resolve_release_tag_push_of_a_release_tag_publishes_version_and_latest(
+    tmp_path: Path,
+) -> None:
+    code, out = _replay_resolve_release_tag(
+        tmp_path, GITHUB_EVENT_NAME="push", GITHUB_REF="refs/tags/v0.12.3"
+    )
+    assert code == 0, out
+    assert out["tag"] == "0.12.3" and out["ref"] == "refs/tags/v0.12.3", out
+    assert out["latest"] == "true", out
+    assert out["tags"] == f"{IMAGE}:0.12.3\n{IMAGE}:latest", out
+
+
+def test_resolve_release_tag_dispatch_moves_latest_only_when_asked(tmp_path: Path) -> None:
+    code, out = _replay_resolve_release_tag(
+        tmp_path,
+        GITHUB_EVENT_NAME="workflow_dispatch",
+        GITHUB_REF="refs/heads/main",
+        TAG_INPUT="v0.12.3",
+        ALSO_LATEST="false",
+    )
+    assert code == 0, out
+    assert out["ref"] == "refs/tags/v0.12.3" and out["latest"] == "false", out
+    assert out["tags"] == f"{IMAGE}:0.12.3", out
+
+    code, out = _replay_resolve_release_tag(
+        tmp_path,
+        GITHUB_EVENT_NAME="workflow_dispatch",
+        GITHUB_REF="refs/heads/main",
+        TAG_INPUT="v0.12.3",
+        ALSO_LATEST="true",
+    )
+    assert code == 0 and out["tags"] == f"{IMAGE}:0.12.3\n{IMAGE}:latest", out
+
+
+def test_resolve_release_tag_refuses_non_release_refs(tmp_path: Path) -> None:
+    """The audit's sandbox cases: a dispatch naming a branch and a push of
+    main used to publish `manual-<run_id>` plus :latest; both now fail closed
+    with nothing written to $GITHUB_OUTPUT."""
+    for env in (
+        {
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_REF": "refs/heads/feature/unreviewed",
+            "TAG_INPUT": "refs/heads/feature/unreviewed",
+            "ALSO_LATEST": "true",
+        },
+        {
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_REF": "refs/heads/main",
+            "TAG_INPUT": "",
+            "ALSO_LATEST": "true",
+        },
+        {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main"},
+        {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/tags/v1.2"},
+        {"GITHUB_EVENT_NAME": "schedule", "GITHUB_REF": "refs/heads/main"},
+    ):
+        code, out = _replay_resolve_release_tag(tmp_path, **env)
+        assert code == 1, (env, out)
+        assert out == {}, (env, out)
+
+
+# --- every publishing job builds an explicit, immutable release ref ------------------
+
+_RELEASE_REF_RE = re.compile(
+    r"^\$\{\{ .*(bump_sha|steps\.version\.outputs\.ref|format\('refs/tags/v\{0\}'|inputs\.ref).* \}\}$"
+)
+
+
+def _publishes_an_artifact(job: Job) -> bool:
+    for step in _steps(job):
+        if _uses(step).startswith("pypa/gh-action-pypi-publish"):
+            return True
+        if _uses(step).startswith("docker/build-push-action") and _with(step).get("push") is True:
+            return True
+        if "mcp-publisher publish" in _run(step):
+            return True
+    return False
+
+
+def test_every_publishing_job_checks_out_an_explicit_release_ref() -> None:
+    publishing = {
+        f"{path.name}:{job_name}": job
+        for path in sorted(WORKFLOWS_DIR.glob("*.yml"))
+        for job_name, job in _jobs(_load_yaml(path)).items()
+        if _publishes_an_artifact(job)
+    }
+    assert set(publishing) == {
+        "docker-publish.yml:build-and-push",
+        "mcp-registry-publish.yml:publish-mcp",
+        "release.yml:build-and-publish",
+    }, set(publishing)
+    for name, job in publishing.items():
+        checkouts = [s for s in _steps(job) if _uses(s).startswith("actions/checkout")]
+        assert checkouts, f"{name}: no checkout step"
+        for checkout in checkouts:
+            ref = str(_with(checkout).get("ref", ""))
+            assert _RELEASE_REF_RE.match(ref), f"{name}: checkout ref {ref!r} is not a release ref"

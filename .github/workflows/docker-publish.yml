@@ -4,7 +4,21 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: # Manual trigger via GitHub Actions UI, for re-publishing without a new tag
+  workflow_dispatch:
+    # Manual re-publish of an EXISTING release tag (e.g. after a base-image
+    # refresh), never of an arbitrary branch: the job below refuses any ref
+    # that is not refs/tags/vX.Y.Z before it logs in to GHCR. Moving the
+    # mutable :latest tag is an explicit per-dispatch choice, off by default.
+    inputs:
+      tag:
+        description: Existing release tag to re-publish, e.g. v0.12.3
+        required: true
+        type: string
+      also_tag_latest:
+        description: Also move ghcr.io/mcpsmiths/tracehub-mcp:latest to this build
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read  # Restrictive default; build-and-push escalates to packages:write itself
@@ -17,8 +31,68 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Resolve release tag
+        id: version
+        # Runs BEFORE checkout and login so a non-release ref fails the job
+        # with nothing fetched and no registry session. Reads every value
+        # through env vars - inlining ${{ }} expressions into the script text
+        # is the GitHub Actions injection pattern (substitution happens before
+        # bash parses the script). GITHUB_EVENT_NAME and GITHUB_REF are real
+        # runner env vars already.
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          ALSO_LATEST: ${{ inputs.also_tag_latest }}
+        run: |
+          image="ghcr.io/mcpsmiths/tracehub-mcp"
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ref="$GITHUB_REF"
+            latest=true
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$TAG_INPUT" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ref="refs/tags/${TAG_INPUT}"
+            latest=false
+            [[ "$ALSO_LATEST" == "true" ]] && latest=true
+          else
+            echo "::error::refusing to publish from a non-release ref (event=${GITHUB_EVENT_NAME} ref=${GITHUB_REF} tag=${TAG_INPUT})"
+            exit 1
+          fi
+          tag="${ref#refs/tags/v}"
+          {
+            echo "ref=${ref}"
+            echo "tag=${tag}"
+            echo "latest=${latest}"
+            # The complete image tag list, so the build step never sees an
+            # empty line and :latest appears only when explicitly resolved.
+            echo "tags<<TAGS_EOF"
+            echo "${image}:${tag}"
+            if [[ "$latest" == "true" ]]; then
+              echo "${image}:latest"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: ${{ steps.version.outputs.ref }}
+          fetch-depth: 0  # tags are needed for the guard below
+          persist-credentials: false
+
+      - name: Verify checkout is the release tag
+        # Fails closed if the ref did not resolve to the tag's commit, and if
+        # the tree's own version string disagrees with the tag it was named
+        # by (a re-pointed tag or a mislabelled tree never becomes :X.Y.Z).
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/v${TAG}^{commit}")"
+          python3 - "$TAG" <<'PY'
+          import sys, tomllib
+          with open("pyproject.toml", "rb") as f:
+              declared = tomllib.load(f)["project"]["version"]
+          if declared != sys.argv[1]:
+              print(f"::error::pyproject.toml declares {declared}, tag is v{sys.argv[1]}")
+              sys.exit(1)
+          PY
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
@@ -26,23 +100,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract version tag
-        id: version
-        env:
-          GH_RUN_ID: ${{ github.run_id }}
-        run: |
-          # GITHUB_REF is already provided as a real env var by the runner -
-          # inlining ${{ github.ref }} (or any other expression) directly
-          # into this script's text is a known GitHub Actions injection
-          # pattern, since the substitution happens before bash parses the
-          # script. Read every expression through an env var instead, so
-          # the value is always treated as data, never as script text.
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "tag=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=manual-${GH_RUN_ID}" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
@@ -54,9 +111,10 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           sbom: true
-          tags: |
-            ghcr.io/mcpsmiths/tracehub-mcp:${{ steps.version.outputs.tag }}
-            ghcr.io/mcpsmiths/tracehub-mcp:latest
+          # mode=max records the full build definition in the attestation so
+          # SECURITY.md's provenance claim names the exact source commit.
+          provenance: mode=max
+          tags: ${{ steps.version.outputs.tags }}
 
       # GHCR packages default to private on first publish. Changing that needs
       # a token with the packages scope - the default GITHUB_TOKEN does not
