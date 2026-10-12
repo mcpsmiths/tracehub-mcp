@@ -31,7 +31,9 @@ _SEARCH_WINDOW_PAD = timedelta(seconds=5)
 _MAX_SEARCH_WINDOW = timedelta(hours=24)
 _MAX_SEARCH_WINDOW_MS = _MAX_SEARCH_WINDOW / timedelta(milliseconds=1)
 _MS_PER_HOUR = timedelta(hours=1) / timedelta(milliseconds=1)
-_MAX_CANDIDATES_PER_SERVICE_QUERY = 20
+# Public: server.py clamps exactly this default to MAX_TRACES_PER_QUERY and
+# passes the result as `max_candidates_per_service`.
+MAX_CANDIDATES_PER_SERVICE_QUERY = 20
 _MAX_SERVICE_QUERIES = 10
 _MAX_REPORTED_MATCHES = 5
 
@@ -93,7 +95,10 @@ def _root_cause_consistent(
 
 
 async def correlate_trace(
-    primary_backend: BaseBackend, secondary_backend: BaseBackend, trace_id: str
+    primary_backend: BaseBackend,
+    secondary_backend: BaseBackend,
+    trace_id: str,
+    max_candidates_per_service: int = MAX_CANDIDATES_PER_SERVICE_QUERY,
 ) -> CorrelationResult:
     """Fetch a trace from the primary backend and try to find the
     corresponding trace in the secondary backend.
@@ -102,6 +107,9 @@ async def correlate_trace(
         primary_backend: The backend `trace_id` is already known to.
         secondary_backend: The independently-configured backend to search.
         trace_id: Trace identifier, as known to `primary_backend`.
+        max_candidates_per_service: `limit` of each per-service heuristic
+            search_traces call against `secondary_backend`. The server
+            passes this clamped to MAX_TRACES_PER_QUERY.
 
     Returns:
         CorrelationResult with every candidate match found (direct
@@ -210,7 +218,7 @@ async def correlate_trace(
             service_name=service_name,
             start_time=start_time,
             end_time=end_time,
-            limit=_MAX_CANDIDATES_PER_SERVICE_QUERY,
+            limit=max_candidates_per_service,
         )
         try:
             for candidate in await secondary_backend.search_traces(query):

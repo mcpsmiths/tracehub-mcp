@@ -632,7 +632,15 @@ async def correlate_trace(trace_id: str) -> CorrelationResult:
     try:
         backend = await _get_backend()
         secondary = await _get_secondary_backend()
-        result = await correlate.correlate_trace(backend, secondary, trace_id=trace_id)
+        # The heuristic fallback's per-service candidate count is a helper-
+        # internal limit with no caller-facing argument; it still goes
+        # through the operator ceiling like every other search limit.
+        result = await correlate.correlate_trace(
+            backend,
+            secondary,
+            trace_id=trace_id,
+            max_candidates_per_service=_clamp_limit(correlate.MAX_CANDIDATES_PER_SERVICE_QUERY),
+        )
         return result
     except Exception as e:
         return _handle_tool_error("correlate_trace", e)
@@ -773,6 +781,7 @@ async def get_llm_model_stats(
     start_time: str | None = None,
     end_time: str | None = None,
     service_name: str | None = None,
+    limit: int = 1000,
 ) -> str:
     """Get detailed performance statistics for a specific LLM model.
 
@@ -784,6 +793,7 @@ async def get_llm_model_stats(
         start_time: Start time in ISO 8601 format (e.g., 2024-01-01T00:00:00Z)
         end_time: End time in ISO 8601 format
         service_name: Filter by service name
+        limit: Maximum traces to analyze (default: 1000, capped by MAX_TRACES_PER_QUERY / --max-traces-per-query)
 
     Returns:
         JSON string with comprehensive model statistics including duration/token percentiles
@@ -796,6 +806,7 @@ async def get_llm_model_stats(
             start_time=start_time,
             end_time=end_time,
             service_name=service_name,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:

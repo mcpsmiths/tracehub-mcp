@@ -16,6 +16,7 @@ import pytest
 from opentelemetry_mcp.attributes import SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.models import SpanData, TraceData, TraceQuery
+from opentelemetry_mcp.tools import correlate as correlate_module
 from opentelemetry_mcp.tools.correlate import (
     _LIMITATIONS,
     _MAX_SEARCH_WINDOW,
@@ -234,6 +235,23 @@ class TestHeuristicFallback:
         assert result.matches[0].correlation_method == "time_window_heuristic"
         assert result.matches[0].confidence == "low"
         assert result.matches[0].secondary_trace_id == "c1"
+
+    async def test_fallback_uses_the_requested_per_service_limit(self) -> None:
+        """The server handler passes the operator-clamped candidate count;
+        the helper must build its per-service TraceQuery from it. The public
+        constant stays the default so the handler can clamp exactly it."""
+        primary = _backend()
+        primary.get_trace.return_value = _trace([_span("p1", service_name="svc-a")])
+        secondary = _backend()
+        secondary.get_trace.side_effect = ValueError("not found")
+        secondary.search_traces.return_value = []
+
+        await correlate_trace(primary, secondary, "t1", max_candidates_per_service=3)
+        assert secondary.search_traces.call_args.args[0].limit == 3
+
+        await correlate_trace(primary, secondary, "t1")
+        assert secondary.search_traces.call_args.args[0].limit == 20
+        assert correlate_module.MAX_CANDIDATES_PER_SERVICE_QUERY == 20
 
     async def test_candidate_matching_the_primary_trace_id_itself_is_excluded(self) -> None:
         """Regression: get_trace(trace_id) failing doesn't mean

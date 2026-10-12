@@ -1049,6 +1049,19 @@ class TestToolAnnotationsComplete:
         assert all(isinstance(title, str) and title for title in titles), titles
         assert len(set(titles)) == 19, "titles must be distinct per tool"
 
+    async def test_get_llm_model_stats_advertises_an_optional_limit(self) -> None:
+        """The one intended tools/list inputSchema change of the security
+        remediation: get_llm_model_stats gains `limit` (integer, default
+        1000, optional) so callers can lower it and the handler clamps it
+        like list_llm_models/get_llm_usage do. Nothing becomes required."""
+        async with Client(server.mcp) as client:
+            tools = await client.list_tools()
+
+        schema = next(t for t in tools if t.name == "get_llm_model_stats").input_schema
+        assert schema["properties"]["limit"]["type"] == "integer"
+        assert schema["properties"]["limit"]["default"] == 1000
+        assert schema.get("required", []) == ["model_name"]
+
 
 class TestClampLimit:
     """_clamp_limit enforces --max-traces-per-query/MAX_TRACES_PER_QUERY as
@@ -1097,6 +1110,56 @@ class TestClampLimit:
 
         _, kwargs = mocked.call_args
         assert kwargs["limit"] == 5
+
+    async def test_get_llm_model_stats_wrapper_clamps_default_limit(self) -> None:
+        """Regression: the handler declared no limit parameter and omitted
+        limit= in its call, so model_stats.get_model_stats's default 1000
+        reached the backend unclamped under any ceiling."""
+        server._config = _config()
+        server._config.max_traces_per_query = 5
+        server._get_backend = AsyncMock(return_value=AsyncMock())
+
+        with patch.object(
+            server.model_stats, "get_model_stats", AsyncMock(return_value="{}")
+        ) as mocked:
+            await server.get_llm_model_stats(model_name="gpt-4")
+
+        _, kwargs = mocked.call_args
+        assert kwargs["limit"] == 5
+
+    async def test_get_llm_model_stats_wrapper_clamps_caller_limit(self) -> None:
+        server._config = _config()
+        server._config.max_traces_per_query = 5
+        server._get_backend = AsyncMock(return_value=AsyncMock())
+
+        with patch.object(
+            server.model_stats, "get_model_stats", AsyncMock(return_value="{}")
+        ) as mocked:
+            await server.get_llm_model_stats(model_name="gpt-4", limit=1000)
+            assert mocked.call_args.kwargs["limit"] == 5
+
+            await server.get_llm_model_stats(model_name="gpt-4", limit=3)
+            assert mocked.call_args.kwargs["limit"] == 3
+
+    async def test_correlate_trace_wrapper_clamps_per_service_limit(self) -> None:
+        """Regression: correlate_trace passed only trace_id, so the heuristic
+        fallback's per-service candidate count (20) hit the secondary backend
+        unclamped under a ceiling of 1..19."""
+        server._config = _config()
+        server._get_backend = AsyncMock(return_value=AsyncMock())
+        server._get_secondary_backend = AsyncMock(return_value=AsyncMock())
+        sentinel = CorrelationResult(primary_trace_id="t1", matches=[], limitations=[])
+
+        with patch.object(
+            server.correlate, "correlate_trace", AsyncMock(return_value=sentinel)
+        ) as mocked:
+            server._config.max_traces_per_query = 1
+            await server.correlate_trace(trace_id="t1")
+            assert mocked.call_args.kwargs["max_candidates_per_service"] == 1
+
+            server._config.max_traces_per_query = 500
+            await server.correlate_trace(trace_id="t1")
+            assert mocked.call_args.kwargs["max_candidates_per_service"] == 20
 
 
 class TestApplyToolGating:

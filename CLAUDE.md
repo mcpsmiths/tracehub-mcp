@@ -352,6 +352,7 @@ Get detailed performance statistics for a specific model including latency perce
 - `model_name` - Model to analyze (required)
 - `start_time`, `end_time` - Time range filter
 - `service_name` - Filter by service
+- `limit` - Maximum traces to analyze (default: 1000, capped by `MAX_TRACES_PER_QUERY`)
 
 **Returns:**
 
