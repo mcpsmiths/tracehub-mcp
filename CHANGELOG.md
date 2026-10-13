@@ -34,7 +34,9 @@
 - **security**: bound the backend-chosen host in the origin-refusal text <!-- IF6 -->
 - **security**: redact a truncated authority only when its visible head carries a colon <!-- IF7 -->
 - **security**: refuse a Host header with text after an IPv6 literal's bracket <!-- IF9 -->
+- **security**: refuse a Host with two or more trailing dots at the request surface <!-- R5 -->
 - **security**: cut percent-encoded matrix parameters from access-log targets <!-- R6a -->
+- **security**: never report an empty list_services probe error text <!-- R6b -->
 
 ### Refactor
 
