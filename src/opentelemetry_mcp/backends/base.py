@@ -145,10 +145,29 @@ class MetadataEndpointBlockedError(httpx.TransportError):
 
 class RedirectTargetBlockedError(httpx.TransportError):
     """Raised when a request (in practice a redirect hop chosen by the
-    backend's own 3xx response) targets a host other than the operator-
-    configured backend host. Like MetadataEndpointBlockedError, never
-    retried - the hop is refused before the wrapped transport sees it.
+    backend's own 3xx response) targets an origin - scheme, host, port -
+    other than the operator-configured backend's. Like
+    MetadataEndpointBlockedError, never retried - the hop is refused before
+    the wrapped transport sees it.
     """
+
+
+# scheme -> port a URL without an explicit port means, so that
+# http://backend.test and http://backend.test:80 are one origin.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_of(url: httpx.URL) -> tuple[str, str, int | None]:
+    """(scheme, host, port) of a URL - lower-cased, default port filled in,
+    userinfo/path/query dropped - the triple the origin pin compares."""
+    scheme = url.scheme.lower()
+    port = url.port if url.port is not None else _DEFAULT_PORTS.get(scheme)
+    return scheme, (url.host or "").lower(), port
+
+
+def _format_origin(origin: tuple[str, str, int | None]) -> str:
+    scheme, host, port = origin
+    return f"{scheme}://{host}" if port is None else f"{scheme}://{host}:{port}"
 
 
 # Ceiling on the DECODED (post-Content-Encoding) size of any single backend
@@ -574,6 +593,7 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         allowed_host: str | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         total_deadline_seconds: float | None = None,
+        allowed_origin: str | None = None,
     ) -> None:
         """Wrap an underlying transport (defaults to a fresh AsyncHTTPTransport).
 
@@ -584,10 +604,18 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
                 log level
             allowed_host: If set, refuse (RedirectTargetBlockedError) any
                 request whose host differs from this one, case-insensitively.
-                Every backend's `client` sets it to the configured backend
-                host, so a 3xx Location chosen by the backend can never steer
-                the shared client elsewhere. Host-only on purpose: a same-host
-                scheme/port change (an http->https upgrade) stays allowed.
+                The host-only pin, kept for callers that have a host name but
+                no URL (test modules build the transport this way);
+                production clients pin the origin instead, see below.
+            allowed_origin: If set, a URL whose scheme, host and port
+                (default port filled in; userinfo and path ignored) are the
+                only origin this transport will send to - any other is
+                refused with RedirectTargetBlockedError. Every backend's
+                `client` sets it to the configured backend URL, so a 3xx
+                Location chosen by the backend can never steer the shared
+                client elsewhere: not to another host, and not to another
+                port or scheme on the same host either (the host-only pin
+                let a backend redirect into the MCP server's own listener).
             max_response_bytes: Ceiling on the DECODED size of any single
                 response (initial or redirect hop). A larger declared
                 Content-Length is refused before the body is read; a body
@@ -603,6 +631,9 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         self._wrapped = wrapped if wrapped is not None else httpx.AsyncHTTPTransport()
         self._slow_request_threshold_ms = slow_request_threshold_ms
         self._allowed_host = allowed_host.lower() if allowed_host is not None else None
+        self._allowed_origin = (
+            _origin_of(httpx.URL(allowed_origin)) if allowed_origin is not None else None
+        )
         self._max_response_bytes = max_response_bytes
         self._total_deadline_seconds = total_deadline_seconds
 
@@ -654,11 +685,14 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         # its own follow_redirects setting. Two layers: the metadata
         # denylist (canonicalising encoded IPv4 spellings, see security.py)
         # refuses the one class of host that is never legitimate even for
-        # the operator's own URL, and the host pin refuses any host the
-        # operator did not configure - which also covers DNS aliases of a
-        # metadata address and arbitrary internal hosts that no denylist
-        # could enumerate. A 307/308 is refused here before its body is
-        # re-sent anywhere.
+        # the operator's own URL, and the origin pin refuses any scheme,
+        # host or port the operator did not configure - which also covers
+        # DNS aliases of a metadata address, arbitrary internal hosts that
+        # no denylist could enumerate, and every other service on the
+        # backend's own host (the runtime probe had a backend redirect
+        # GET /health into this MCP server's listener under a host-only
+        # pin). A 307/308 is refused here before its body is re-sent
+        # anywhere.
         if is_cloud_metadata_host(request.url.host):
             raise MetadataEndpointBlockedError(
                 f"Refusing to connect to cloud metadata endpoint: {request.url.host}"
@@ -671,6 +705,16 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
                 f"Refusing request to {request.url.host!r}: the configured backend host is "
                 f"{self._allowed_host!r} and a backend response may not redirect elsewhere"
             )
+        if self._allowed_origin is not None:
+            origin = _origin_of(request.url)
+            if origin != self._allowed_origin:
+                # Origins only: no userinfo, path or query from the request
+                # URL reaches the tool-error channel or the log.
+                raise RedirectTargetBlockedError(
+                    f"Refusing request to {_format_origin(origin)!r}: the configured backend "
+                    f"origin is {_format_origin(self._allowed_origin)!r} and a backend response "
+                    "may not redirect elsewhere"
+                )
         # Offer the backend only the codecs the response path can decode
         # within the byte budget. httpx's default offer grows with the
         # optional brotli/zstd extras; a backend honouring such an offer
@@ -892,12 +936,12 @@ class BaseBackend(ABC):
         """The one _RetryingTransport construction every backend shares -
         the Datadog/New Relic/Honeycomb `client` overrides (which differ
         from the base one only in follow_redirects) call this too, so a
-        transport-level control added here (host pin, response size cap,
-        slow-request logging) can never be missed by one backend's own
-        client."""
+        transport-level control added here (origin pin, response size cap,
+        total deadline, slow-request logging) can never be missed by one
+        backend's own client."""
         return _RetryingTransport(
             slow_request_threshold_ms=self.slow_request_threshold_ms,
-            allowed_host=httpx.URL(self.url).host,
+            allowed_origin=self.url,
             max_response_bytes=self.max_response_bytes,
             total_deadline_seconds=request_deadline_seconds(self.timeout),
         )

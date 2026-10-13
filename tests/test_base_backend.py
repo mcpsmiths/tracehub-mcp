@@ -419,7 +419,7 @@ class TestRedirectHostPin:
             raise AssertionError("the redirect hop must never reach the wrapped transport")
 
         transport = _RetryingTransport(
-            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
         )
 
         async with httpx.AsyncClient(
@@ -430,20 +430,62 @@ class TestRedirectHostPin:
 
         assert handler_calls == 1
 
-    async def test_same_host_redirect_is_still_followed(self) -> None:
-        """Host-only pin: a same-host scheme/port change (e.g. an http->https
-        upgrade) is the operator's own backend talking, so it stays allowed."""
+    @pytest.mark.parametrize(
+        "location",
+        [
+            "http://backend.test:18170/health",  # the MCP server's own listener (probe T)
+            "http://backend.test:18174/api/services",  # any other port on the host (probe R)
+            "//backend.test:18174/api/services",  # scheme-relative, same host, other port (X)
+            "https://backend.test/other",  # same host, other scheme (and so port)
+        ],
+    )
+    async def test_same_host_other_port_or_scheme_is_refused(self, location: str) -> None:
+        """8739463 pinned the HOST only, so a backend could redirect the
+        shared client to ANY port on that host - the runtime probe recorded
+        GET /health arriving at the MCP server's own listener (probe-2
+        redirects R/T/X/Y). The pin is now the origin: scheme, host and
+        port. Refused with the existing refusal text."""
         handler_calls = 0
 
         async def handler(request: httpx.Request) -> httpx.Response:
             nonlocal handler_calls
             handler_calls += 1
-            if str(request.url) == "http://backend.test/search":
-                return httpx.Response(302, headers={"Location": "https://backend.test/other"})
+            if request.url.port is None and request.url.scheme == "http":
+                return httpx.Response(302, headers={"Location": location})
+            raise AssertionError("the redirect hop must never reach the wrapped transport")
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            with pytest.raises(RedirectTargetBlockedError, match="may not redirect elsewhere"):
+                await client.get("/search")
+
+        assert handler_calls == 1
+
+    @pytest.mark.parametrize(
+        "location",
+        [
+            "http://backend.test/other",  # same origin, other path
+            "http://backend.test:80/other",  # the default port spelled out is the same origin
+            "/relative/other",  # relative Location resolves to the same origin
+        ],
+    )
+    async def test_same_origin_redirect_is_followed(self, location: str) -> None:
+        handler_calls = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal handler_calls
+            handler_calls += 1
+            if request.url.path == "/search":
+                return httpx.Response(302, headers={"Location": location})
             return httpx.Response(200, json={"ok": True})
 
         transport = _RetryingTransport(
-            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
         )
 
         async with httpx.AsyncClient(
@@ -455,6 +497,75 @@ class TestRedirectHostPin:
         assert response.json() == {"ok": True}
         assert handler_calls == 2
 
+    async def test_307_same_host_other_port_is_refused_before_body_resend(self) -> None:
+        """Probe Y: a 307 to another port on the same host re-sent the
+        request body there under the host-only pin."""
+        bodies_seen: list[tuple[int | None, bytes]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            bodies_seen.append((request.url.port, request.content))
+            if request.url.port is None:
+                return httpx.Response(
+                    307, headers={"Location": "http://backend.test:18174/api/services"}
+                )
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            with pytest.raises(RedirectTargetBlockedError):
+                await client.post("/search", content=b'{"q": "secret-query"}')
+
+        assert bodies_seen == [(None, b'{"q": "secret-query"}')]
+
+    async def test_refusal_names_both_origins_without_path_or_userinfo(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_origin="https://backend.test:8443/base"
+        )
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(RedirectTargetBlockedError) as exc_info:
+                await client.get("http://u:VFY-PW-pin@backend.test:18170/health?token=x")
+
+        message = str(exc_info.value)
+        assert "Refusing request to 'http://backend.test:18170'" in message
+        assert "configured backend origin is 'https://backend.test:8443'" in message
+        assert "VFY-PW-pin" not in message
+        assert "/health" not in message
+        assert "/base" not in message
+
+    async def test_legacy_host_only_pin_still_pins_the_host(self) -> None:
+        """allowed_host stays for callers that have only a host name (other
+        test modules build the transport that way); production clients use
+        allowed_origin via BaseBackend._create_transport."""
+        hosts_seen: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            hosts_seen.append(request.url.host or "")
+            if request.url.scheme == "http":
+                return httpx.Response(302, headers={"Location": "https://backend.test/other"})
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            assert (await client.get("/search")).status_code == 200
+            with pytest.raises(RedirectTargetBlockedError):
+                await client.get("http://other.test/x")
+
+        assert hosts_seen == ["backend.test", "backend.test"]
+
     async def test_host_comparison_is_case_insensitive(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/search":
@@ -462,7 +573,7 @@ class TestRedirectHostPin:
             return httpx.Response(200)
 
         transport = _RetryingTransport(
-            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
         )
 
         async with httpx.AsyncClient(
@@ -485,7 +596,7 @@ class TestRedirectHostPin:
             return httpx.Response(200)
 
         transport = _RetryingTransport(
-            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
         )
 
         async with httpx.AsyncClient(
@@ -507,7 +618,7 @@ class TestRedirectHostPin:
             return httpx.Response(200)
 
         transport = _RetryingTransport(
-            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
         )
 
         async with httpx.AsyncClient(transport=transport) as client:
@@ -579,14 +690,18 @@ class TestRedirectHostPin:
     ],
     ids=["base", "datadog", "newrelic", "honeycomb"],
 )
-def test_backend_clients_pin_the_configured_host(backend: BaseBackend) -> None:
+def test_backend_clients_pin_the_configured_origin(backend: BaseBackend) -> None:
     """BaseBackend.client and the three vendor overrides (which only differ
-    in follow_redirects) must all hand the configured host to the transport,
-    lower-cased, so the pin is never bypassed by one backend's own client."""
+    in follow_redirects) must all hand the configured ORIGIN - scheme, host
+    (lower-cased) and port, the default port filled in - to the transport,
+    so the pin is never bypassed by one backend's own client and a backend
+    cannot redirect to another port on its own host."""
     client = backend.client
 
     assert isinstance(client._transport, _RetryingTransport)
-    assert client._transport._allowed_host == "backend.example"
+    expected_port = 16686 if "16686" in backend.url else 443
+    assert client._transport._allowed_origin == ("https", "backend.example", expected_port)
+    assert client._transport._allowed_host is None
 
 
 _ONE_MIB = 1024 * 1024
@@ -739,7 +854,7 @@ class TestBoundedResponse:
         transport = _RetryingTransport(
             wrapped=httpx.MockTransport(handler),
             max_response_bytes=_ONE_MIB,
-            allowed_host="backend.test",
+            allowed_origin="http://backend.test",
         )
 
         async with httpx.AsyncClient(
@@ -1253,7 +1368,7 @@ class TestRequestDeadline:
 
         transport = _RetryingTransport(
             wrapped=httpx.MockTransport(handler),
-            allowed_host="backend.test",
+            allowed_origin="http://backend.test",
             total_deadline_seconds=1.0,
         )
 
@@ -1365,7 +1480,7 @@ class TestRetryBudgetPerLogicalRequest:
         two retries hop1 consumed: hop2's first 429 is returned as is."""
         handler, requests = self._probe_chain_handler(retry_after="1")
         transport = _RetryingTransport(
-            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
         )
 
         start = time.monotonic()
@@ -1403,7 +1518,7 @@ class TestRetryBudgetPerLogicalRequest:
             return httpx.Response(200, json={"data": []})
 
         transport = _RetryingTransport(
-            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
         )
 
         start = time.monotonic()
@@ -1455,7 +1570,7 @@ class TestRetryBudgetPerLogicalRequest:
             return httpx.Response(302, headers={"Location": "http://backend.test/loop"})
 
         transport = _RetryingTransport(
-            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
         )
 
         start = time.monotonic()
@@ -1486,7 +1601,7 @@ class TestRetryBudgetPerLogicalRequest:
             return httpx.Response(200, json={"ok": True})
 
         transport = _RetryingTransport(
-            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
         )
 
         async with httpx.AsyncClient(
