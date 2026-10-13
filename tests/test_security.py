@@ -386,7 +386,7 @@ class TestEscapeLogControlCharacters:
             "",
             "plain ascii 100% done",
             "Host: 'evil.example:8000'",
-            "caf\u00e9 \u00ff \u2603 \U0001f600",
+            "na\u00efve \u00ff \u2603 \U0001f600",
         ],
     )
     def test_printable_text_is_unchanged(self, text: str) -> None:

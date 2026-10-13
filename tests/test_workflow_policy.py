@@ -677,9 +677,9 @@ def test_mcp_registry_asserts_identity_and_tag_before_publishing() -> None:
 def _embedded_python(run: str) -> str:
     """The body of the one `python3 - ... <<'PY' ... PY` heredoc in a run script."""
     lines = run.splitlines()
-    start = _step_index(lines, lambda line: "<<'PY'" in line) + 1
-    end = _step_index(lines, lambda line: line.strip() == "PY")
-    return textwrap.dedent("\n".join(lines[start:end]))
+    (start,) = [i for i, line in enumerate(lines) if "<<'PY'" in line]
+    (end,) = [i for i, line in enumerate(lines) if line.strip() == "PY"]
+    return textwrap.dedent("\n".join(lines[start + 1 : end]))
 
 
 def _replay_version_guard(tmp_path: Path, run: str, declared: str, version: str) -> tuple[int, str]:
