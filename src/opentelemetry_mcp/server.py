@@ -2868,9 +2868,14 @@ def doctor(
     Unlike the server's own lazy backend initialization (which deliberately
     swallows a failed health check and keeps running so requests may still
     work later), doctor surfaces every failure explicitly.
+
+    The resolved LOG_LEVEL is applied exactly as main() applies it (doctor
+    has no --log-level flag), so httpx's per-request INFO line - which
+    prints the full backend URL - is emitted by doctor only at DEBUG too.
     """
     try:
         config = ServerConfig.from_env()
+        _apply_log_level(config.log_level)
         if (
             backend
             or url
