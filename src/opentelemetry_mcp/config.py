@@ -3,6 +3,7 @@
 import logging
 import math
 import os
+import re
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -51,6 +52,22 @@ def _reject_url_userinfo(raw_url: str, *, source: str) -> None:
             "Use BACKEND_API_KEY (Bearer) or BACKEND_TEMPO_INSTANCE_ID + BACKEND_API_KEY "
             "(Basic) so the secret is never stringified"
         )
+
+
+_PRIMARY_BACKEND_PREFIX = "BACKEND_"
+# pydantic prefixes some messages with its validator wrapper names ("function-wrap[wrap_val()]: ");
+# they carry no information for an operator.
+_PYDANTIC_WRAPPER_PREFIX_RE = re.compile(r"^(?:function-[a-z]+\[[^\]]*\]:\s*)+")
+
+
+def _describe_validation_error(exc: ValidationError, prefix: str) -> str:
+    """'<PREFIX><FIELD>: <message>' per error, joined by '; ' - the env var the operator set,
+    pydantic's message with its wrapper names dropped, and never the input value."""
+    return "; ".join(
+        f"{prefix}{'_'.join(str(part) for part in err['loc']).upper()}: "
+        f"{_PYDANTIC_WRAPPER_PREFIX_RE.sub('', err['msg'])}"
+        for err in exc.errors(include_url=False, include_input=False)
+    )
 
 
 class BackendConfig(BaseModel):
@@ -227,21 +244,31 @@ class BackendConfig(BaseModel):
                     f"Using default: {DEFAULT_MAX_RESPONSE_BYTES}"
                 )
 
-        return cls(
-            type=backend_type,  # type: ignore
-            url=backend_url,  # type: ignore
-            api_key=os.getenv(f"{prefix}API_KEY"),
-            app_key=os.getenv(f"{prefix}APP_KEY"),
-            sentry_org=os.getenv(f"{prefix}SENTRY_ORG"),
-            sentry_project=os.getenv(f"{prefix}SENTRY_PROJECT"),
-            tempo_instance_id=os.getenv(f"{prefix}TEMPO_INSTANCE_ID"),
-            aws_region=os.getenv(f"{prefix}AWS_REGION"),
-            newrelic_account_id=os.getenv(f"{prefix}NEWRELIC_ACCOUNT_ID"),
-            honeycomb_dataset=os.getenv(f"{prefix}HONEYCOMB_DATASET"),
-            timeout=timeout,
-            max_response_bytes=max_response_bytes,
-            environments=environments,
-        )
+        try:
+            return cls(
+                type=backend_type,  # type: ignore
+                url=backend_url,  # type: ignore
+                api_key=os.getenv(f"{prefix}API_KEY"),
+                app_key=os.getenv(f"{prefix}APP_KEY"),
+                sentry_org=os.getenv(f"{prefix}SENTRY_ORG"),
+                sentry_project=os.getenv(f"{prefix}SENTRY_PROJECT"),
+                tempo_instance_id=os.getenv(f"{prefix}TEMPO_INSTANCE_ID"),
+                aws_region=os.getenv(f"{prefix}AWS_REGION"),
+                newrelic_account_id=os.getenv(f"{prefix}NEWRELIC_ACCOUNT_ID"),
+                honeycomb_dataset=os.getenv(f"{prefix}HONEYCOMB_DATASET"),
+                timeout=timeout,
+                max_response_bytes=max_response_bytes,
+                environments=environments,
+            )
+        except ValidationError as exc:
+            if prefix == _PRIMARY_BACKEND_PREFIX:
+                raise
+            # The secondary backend is configured by env vars only, yet pydantic titles the
+            # standalone model 'BackendConfig' and the server rendered its errors as the
+            # PRIMARY backend's variables ('BACKEND_TIMEOUT: ...' for SECONDARY_BACKEND_TIMEOUT=-5
+            # - runtime verification of PR #41, delta round). Name the variables the operator
+            # actually set; location and message only, never input_value.
+            raise ValueError(_describe_validation_error(exc, prefix)) from None
 
 
 # Ceilings for the opt-in query cache. One day mirrors BACKEND_TIMEOUT's own

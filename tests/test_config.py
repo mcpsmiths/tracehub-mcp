@@ -366,3 +366,26 @@ class TestUserinfoIsRefusedBeforePydanticParsesTheUrl:
         monkeypatch.setenv("BACKEND_URL", "not a url at all")
         with pytest.raises(ValidationError):
             BackendConfig.from_env()
+
+
+def test_secondary_backend_field_errors_name_the_secondary_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Delta verification (TA, I_extras): with only SECONDARY_BACKEND_TIMEOUT=-5 set the error
+    # read "BackendConfig: BACKEND_TIMEOUT: ..." - the PRIMARY backend's variable, because the
+    # secondary BackendConfig is validated standalone and pydantic titles it "BackendConfig".
+    for var in ("BACKEND_TYPE", "BACKEND_URL", "SECONDARY_BACKEND_TYPE", "SECONDARY_BACKEND_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+    monkeypatch.setenv("BACKEND_URL", "http://127.0.0.1:18299")
+    monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "jaeger")
+    monkeypatch.setenv("SECONDARY_BACKEND_URL", "http://127.0.0.1:18298")
+    monkeypatch.setenv("SECONDARY_BACKEND_TIMEOUT", "-5")
+
+    with pytest.raises(ValueError, match="SECONDARY_BACKEND_TIMEOUT") as excinfo:
+        ServerConfig.from_env()
+
+    text = str(excinfo.value)
+    assert "SECONDARY_BACKEND_TIMEOUT: Input should be greater than 0" in text
+    assert "(--" not in text  # the secondary backend has env vars only, no flags
+    assert "BackendConfig" not in text and "input_value" not in text
