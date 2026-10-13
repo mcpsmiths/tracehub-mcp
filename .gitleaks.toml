@@ -16,3 +16,20 @@ id = "traceloop-api-key"
 description = "Traceloop API key (tl_ followed by 32 lowercase alphanumerics)"
 regex = '''tl_[a-z0-9]{32}'''
 keywords = ["tl_"]
+
+# The default generic-api-key rule reports one line of this repository's own
+# test suite: the TEST_TOKEN fixture in tests/test_http_bearer_auth.py, a
+# 46-character dummy assembled from words (keyword "credential", separator
+# ",", 16-character value). With it, `gitleaks git --pre-commit --staged`
+# exits 7 and a maintainer with the hook installed cannot stage that file,
+# while TruffleHog in CI does not report it (runtime verification of PR #41,
+# T7 fix9/03). The exception is as narrow as the finding: that one rule
+# (targetRules), that one literal line (an anchored regex against the whole
+# line), and deliberately no path grant - a path entry would blind the hook
+# to a real secret pasted into the file. tests/test_secret_scan_workflow.py
+# asserts the shape and replays the staged scan against this file.
+[[allowlists]]
+description = "the TEST_TOKEN fixture line of tests/test_http_bearer_auth.py"
+targetRules = ["generic-api-key"]
+regexTarget = "line"
+regexes = ['''^TEST_TOKEN = "-"\.join\(\["unit", "test", "operator", "credential", "0123456789abcdef"\]\)$''']
