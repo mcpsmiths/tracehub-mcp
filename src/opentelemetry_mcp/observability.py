@@ -128,7 +128,10 @@ def _bounded_status_description(error: Exception) -> str:
     The same bound applies to every failure, backend errors included, so no
     exception text can size the exported span. Redaction runs first so a
     credential near the cut cannot be half-exposed; the escape runs before
-    the cut so it never splits an escape sequence.
+    the cut so that no raw control character can survive it - the cut may
+    still fall inside an escape's TEXT (leaving a trailing "\\x1" before
+    the "..."), which is cosmetic and accepted: cutting on an escape
+    boundary would buy nothing the collector can act on.
     """
     text = escape_log_control_characters(_redact_secrets(str(error)))
     if len(text) > _MAX_STATUS_DESCRIPTION_CHARS:

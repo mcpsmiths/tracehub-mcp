@@ -56,6 +56,7 @@ from opentelemetry_mcp.observability import (
     _MAX_STATUS_DESCRIPTION_CHARS,
     McpServerTracingMiddleware,
     TraceContextLogFilter,
+    _bounded_status_description,
     _redact_secrets,
     configure_metrics,
     configure_tracing,
@@ -754,6 +755,22 @@ class TestMcpServerTracingMiddlewareCardinality:
         assert description.startswith("Unknown tool: 'zzz"), description[:40]
         assert len(description) <= _MAX_STATUS_DESCRIPTION_CHARS, len(description)
         assert description.endswith("..."), description[-10:]
+
+    def test_the_cut_may_split_an_escape_but_never_leaves_a_raw_control_character(
+        self,
+    ) -> None:
+        """Characterisation of the real guarantee (round-2 review of this
+        helper): the escape runs before the cut, so what the cut can split
+        is an escape's text, never the control character it stands for.
+        ESC lands exactly across the cut here."""
+        error = LookupError("a" * (_MAX_STATUS_DESCRIPTION_CHARS - 4) + "\x1b[31m tail")
+
+        description = _bounded_status_description(error)
+
+        assert len(description) == _MAX_STATUS_DESCRIPTION_CHARS
+        assert description.endswith("\\..."), description[-8:]  # cut inside "\\x1b"
+        assert "\x1b" not in description
+        assert description.isprintable()
 
     async def test_control_characters_in_the_status_description_are_escaped(self) -> None:
         """P5b's second probe: a name carrying NUL, a newline and an ANSI
