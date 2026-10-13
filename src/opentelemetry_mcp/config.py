@@ -44,11 +44,25 @@ def _reject_url_userinfo(raw_url: str, *, source: str) -> None:
     except ValueError:
         # Malformed authority (an unbalanced IPv6 bracket): pydantic would
         # echo it too, so fall through to the textual shape check alone.
+        parts = None
         has_userinfo = False
     redacted = redact_userinfo_in_text(raw_url)
     if has_userinfo or redacted != raw_url:
+        if has_userinfo and parts is not None:
+            # Rebuilt from the parsed parts, never from the text: the textual redactor
+            # keys on a whitespace-free userinfo run, so a password containing a space
+            # left the raw URL unchanged and the full credential was echoed on every
+            # surface (runtime verification of PR #41, delta probe P1b). Only the scheme,
+            # the host:port after the last '@', the path, query and fragment are shown.
+            shown = (
+                f"{parts.scheme}://[REDACTED]@{parts.netloc.rsplit('@', 1)[-1]}{parts.path}"
+                f"{'?' + parts.query if parts.query else ''}"
+                f"{'#' + parts.fragment if parts.fragment else ''}"
+            )
+        else:
+            shown = redacted
         raise ValueError(
-            f"{source} must not embed credentials (user:password@host); got {redacted!r}. "
+            f"{source} must not embed credentials (user:password@host); got {shown!r}. "
             "Use BACKEND_API_KEY (Bearer) or BACKEND_TEMPO_INSTANCE_ID + BACKEND_API_KEY "
             "(Basic) so the secret is never stringified"
         )

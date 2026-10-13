@@ -6,7 +6,7 @@ import pytest
 from pydantic import HttpUrl, ValidationError
 
 from opentelemetry_mcp.backends.base import DEFAULT_MAX_RESPONSE_BYTES
-from opentelemetry_mcp.config import BackendConfig, ServerConfig
+from opentelemetry_mcp.config import BackendConfig, ServerConfig, _reject_url_userinfo
 
 
 def test_non_local_http_url_logs_a_warning(caplog: pytest.LogCaptureFixture) -> None:
@@ -389,3 +389,23 @@ def test_secondary_backend_field_errors_name_the_secondary_variables(
     assert "SECONDARY_BACKEND_TIMEOUT: Input should be greater than 0" in text
     assert "(--" not in text  # the secondary backend has env vars only, no flags
     assert "BackendConfig" not in text and "input_value" not in text
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "http://dummyuser:Zq7v Xk9pLm2tR@127.0.0.1:18299/a/longer/base/path",
+        "http://dummyuser: Zq7vXk9pLm2tR@127.0.0.1:18299/a/longer/base/path",
+        "http://dummyuser:Zq7vXk9pLm2tR@127.0.0.1:18299/a/longer/base/path?x=1#f",
+    ],
+)
+def test_reject_url_userinfo_never_echoes_the_credential(raw: str) -> None:
+    # Delta verification probe P1b: a password containing whitespace stopped the textual
+    # redactor (its userinfo run is whitespace-free) and the FULL credential was echoed on
+    # every surface. The shown URL is now rebuilt from the parsed parts.
+    with pytest.raises(ValueError, match="BACKEND_URL must not embed credentials") as excinfo:
+        _reject_url_userinfo(raw, source="BACKEND_URL")
+    text = str(excinfo.value)
+    for secret in ("dummyuser", "Zq7v", "Xk9pLm2tR"):
+        assert secret not in text
+    assert "[REDACTED]@127.0.0.1:18299/a/longer/base/path" in text
