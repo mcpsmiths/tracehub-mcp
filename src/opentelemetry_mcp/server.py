@@ -1668,13 +1668,24 @@ def _hostname_from_host_header(value: str) -> str:
     header value: ``[v6]:port`` -> ``v6``, ``name:port`` -> ``name``, a
     missing/blank header -> ``""``. Used for the allowlist entries and the
     bound address as well as for every request, so both sides of the
-    comparison take the same path."""
+    comparison take the same path. A malformed bracketed value - an unclosed
+    ``[``, or anything after the ``]`` other than ``:<port>`` or the end of
+    the value (``[::1]evil.example``, runtime verification prober-1 F7, which
+    used to pass as ``::1`` because the tail was ignored) - is returned
+    whole: it is then no loopback spelling and equals no allowlist entry
+    (the startup validator refuses the shape), so the request answers 421
+    like every other refused Host."""
     value = value.strip().lower()
     if not value:
         return ""
     if value.startswith("["):
         end = value.find("]")
-        return _canonical_hostname(value[1:end] if end != -1 else value[1:])
+        if end == -1:
+            return value
+        tail = value[end + 1 :]
+        if tail and not (tail.startswith(":") and tail[1:].isascii() and tail[1:].isdigit()):
+            return value
+        return _canonical_hostname(value[1:end])
     if value.count(":") > 1:
         # Bare IPv6 literal (not valid in a Host header, but never a port).
         return _canonical_hostname(value)

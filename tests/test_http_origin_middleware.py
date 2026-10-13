@@ -163,6 +163,41 @@ class TestHostValidation:
         assert reached == ["attacker.example:8000"]
 
 
+class TestBracketedHostTrailingText:
+    """Runtime verification prober-1 F7: '[::1]evil.example' was accepted
+    because everything after the closing ']' was ignored. After a ']' only
+    ':<port>' or the end of the value is a Host header; anything else - and
+    an unclosed '[' - is malformed and answers 421 like every other refused
+    Host."""
+
+    def test_text_after_the_closing_bracket_is_refused_on_a_loopback_bind(self) -> None:
+        client = _build_client(bind_host="127.0.0.1")
+
+        assert client.get("/", headers={"host": "[::1]evil.example"}).status_code == 421
+        assert client.get("/", headers={"host": "[::1]:8000"}).status_code == 200
+        assert client.get("/", headers={"host": "[::1]"}).status_code == 200
+
+    def test_malformed_bracketed_values_never_match_an_allowlist_entry(self) -> None:
+        client = _build_client(bind_host=ALL_INTERFACES, allowed_hosts=["[2001:db8::1]"])
+
+        for host in (
+            "[2001:db8::1]evil.example",
+            "[2001:db8::1]:abc",
+            "[2001:db8::1]:",
+            "[2001:db8::1",
+        ):
+            assert client.get("/", headers={"host": host}).status_code == 421, host
+        assert client.get("/", headers={"host": "[2001:db8::1]:8443"}).status_code == 200
+
+    def test_hostname_from_host_header_keeps_a_malformed_bracketed_value_whole(self) -> None:
+        assert _hostname_from_host_header("[::1]evil.example") == "[::1]evil.example"
+        assert _hostname_from_host_header("[::1]:abc") == "[::1]:abc"
+        assert _hostname_from_host_header("[::1]:") == "[::1]:"
+        assert _hostname_from_host_header("[::1") == "[::1"
+        assert _hostname_from_host_header("[::1]:8000") == "::1"
+        assert _hostname_from_host_header("[::1]") == "::1"
+
+
 class TestHostnameFromHostHeader:
     def test_strips_port_and_lowercases(self) -> None:
         assert _hostname_from_host_header("TraceHub.Example:8000") == "tracehub.example"
