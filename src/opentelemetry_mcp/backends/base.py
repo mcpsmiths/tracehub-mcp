@@ -19,7 +19,6 @@ from tenacity import (
     retry_any,
     retry_if_exception_type,
     retry_if_result,
-    stop_after_attempt,
     wait_exponential,
 )
 
@@ -222,12 +221,35 @@ class _RequestBudget:
     """What one LOGICAL backend request has left, shared by every attempt
     and redirect hop of that request via request.extensions (see
     _REQUEST_BUDGET_EXTENSION). `deadline` is a time.monotonic() instant,
-    or None for a transport built without a total deadline."""
+    or None for a transport built without a total deadline; the retry
+    budget (_MAX_ATTEMPTS - 1 retries, _MAX_RETRY_AFTER_SECONDS of
+    cumulative sleep) and the redirect hop count are spent across the
+    whole chain, never re-armed per hop."""
 
-    __slots__ = ("deadline",)
+    __slots__ = ("deadline", "hops", "retries_used", "retry_sleep_used")
 
     def __init__(self, deadline: float | None) -> None:
         self.deadline = deadline
+        self.hops = 0
+        self.retries_used = 0
+        self.retry_sleep_used = 0.0
+
+    def can_afford_retry(self, sleep_seconds: float) -> bool:
+        """Whether one more retry, preceded by `sleep_seconds` of sleep,
+        fits what the logical request has left: a retry still unspent, the
+        cumulative sleep still under the ceiling, and the deadline not
+        reached by the end of the sleep. A sleep that cannot fit is not
+        taken at all - the backend's real last outcome reaches the caller
+        now rather than after an idle wait up to the deadline."""
+        if self.retries_used >= _MAX_ATTEMPTS - 1:
+            return False
+        if self.retry_sleep_used + sleep_seconds > _MAX_RETRY_AFTER_SECONDS:
+            return False
+        return self.deadline is None or time.monotonic() + sleep_seconds < self.deadline
+
+    def spend_retry(self, sleep_seconds: float) -> None:
+        self.retries_used += 1
+        self.retry_sleep_used += sleep_seconds
 
     def remaining_seconds(self) -> float | None:
         """Seconds left before the deadline (None = unbounded). Raises
@@ -326,11 +348,26 @@ class _BoundedResponse(httpx.Response):
 # backend-chosen Retry-After is honoured only up to _MAX_RETRY_AFTER_SECONDS
 # (the same ceiling as the exponential fallback): a 429 asking for more is
 # not retried at all and reaches the caller after the current attempt.
+# Both budgets - the attempts and the sleep - belong to the LOGICAL request
+# (_RequestBudget), not to one redirect hop: httpx re-enters
+# handle_async_request for every hop, and a backend that answered each hop
+# with two in-budget 429s before redirecting on re-armed both budgets per
+# hop (3 hops x 2 x 5 s = 30.3 s over 10 backend requests in the runtime
+# probe; ~400 s at httpx's default 20 hops), so the ceiling was per
+# response in name only. Now at most _MAX_ATTEMPTS - 1 retries and
+# _MAX_RETRY_AFTER_SECONDS of sleep are spent across the whole chain, and
+# the chain itself is at most _MAX_REDIRECT_HOPS redirects long.
 _RETRYABLE_TRANSPORT_EXCEPTIONS = (httpx.ConnectError, httpx.TimeoutException)
 
 _MAX_ATTEMPTS = 3
 _MAX_RETRY_AFTER_SECONDS = 10.0
 _DEFAULT_RETRY_WAIT = wait_exponential(multiplier=1, max=_MAX_RETRY_AFTER_SECONDS)
+# Redirects followed per logical request, enforced by the transport (so no
+# backend's own client construction can miss it) and mirrored as
+# max_redirects on BaseBackend.client. httpx's default is 20; the backends
+# this server talks to redirect at most once (an http->https upgrade or a
+# trailing-slash canonicalisation), so five is already generous.
+_MAX_REDIRECT_HOPS = 5
 
 
 def _is_rate_limited(response: Any) -> bool:
@@ -449,18 +486,30 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         return budget
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        """Delegate to the wrapped transport, retrying up to 3 total attempts
-        (with exponential backoff capped at 10 s, or a 429's own Retry-After
-        header when present and no larger than that same 10 s ceiling) on
-        connect/timeout failures or a 429 rate-limit response. A 429 whose
-        Retry-After exceeds the ceiling is returned after the current attempt
-        with no retry sleep - the backend may not park this process. The
-        whole logical request - this hop's attempts and sleeps, the hops
-        before and after it, and the body read - shares one total deadline
-        (total_deadline_seconds), after which BackendDeadlineExceededError
-        is raised instead of waiting on the backend any longer.
+        """Delegate to the wrapped transport, retrying connect/timeout
+        failures and 429 rate-limit responses - with exponential backoff
+        capped at 10 s, or a 429's own Retry-After header when present and
+        no larger than that same 10 s ceiling - within ONE budget for the
+        whole logical request: at most 3 attempts and 10 s of cumulative
+        sleep across every redirect hop, at most 5 redirect hops, and one
+        total deadline (total_deadline_seconds) covering the attempts, the
+        sleeps, the hops and the body read. A 429 whose Retry-After exceeds
+        the ceiling, or that the remaining budget cannot afford, is returned
+        after the current attempt with no retry sleep - the backend may not
+        park this process; past the deadline BackendDeadlineExceededError is
+        raised instead of waiting on the backend any longer.
         """
         budget = self._budget_for(request)
+        budget.hops += 1
+        if budget.hops > _MAX_REDIRECT_HOPS + 1:
+            # The client's own max_redirects (set to the same cap on
+            # BaseBackend.client) normally fires first; this is the backstop
+            # for a client built elsewhere with httpx's default of 20.
+            raise httpx.TooManyRedirects(
+                f"Refusing redirect hop {budget.hops - 1}: at most {_MAX_REDIRECT_HOPS} "
+                "redirects are followed per backend request",
+                request=request,
+            )
         # httpx re-invokes handle_async_request on every redirect hop when
         # follow_redirects=True, so these checks - run before every attempt,
         # including redirect targets - apply to every backend regardless of
@@ -492,20 +541,29 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         # integration tests) expose handle_async_request as a *sync* function
         # that returns a coroutine, which tenacity's coroutine-callable
         # detection can miss, silently returning an unawaited coroutine.
-        attempt = 0
-
         async def _send() -> httpx.Response:
-            nonlocal attempt
-            attempt += 1
-            response = await self._wrapped.handle_async_request(request)
-            if attempt < _MAX_ATTEMPTS and _is_rate_limited(response):
-                # tenacity is about to discard this response and retry:
-                # release its pooled connection now rather than leaving the
-                # unread body to garbage collection. Only when a retry WILL
-                # happen - the final attempt's response, and an over-cap 429,
-                # go back to the caller unread and must stay open.
-                await response.aclose()
-            return response
+            return await self._wrapped.handle_async_request(request)
+
+        # tenacity evaluates `wait` (retry_state.upcoming_sleep) before
+        # `stop`, so the stop decision can weigh the very sleep about to be
+        # taken against the logical request's remaining budget; a retry the
+        # budget cannot afford ends the loop with the real last outcome
+        # (reraise=True) instead of a sleep. `before_sleep` runs only when a
+        # retry WILL happen: it books the retry and its sleep against the
+        # budget and releases the 429 response tenacity is about to discard
+        # (its pooled connection would otherwise wait for garbage
+        # collection). The final response, and a 429 that is not retried, go
+        # back to the caller unread and stay open.
+        def _stop_when_budget_exhausted(retry_state: RetryCallState) -> bool:
+            return not budget.can_afford_retry(retry_state.upcoming_sleep)
+
+        async def _spend_budget_before_sleep(retry_state: RetryCallState) -> None:
+            budget.spend_retry(retry_state.upcoming_sleep)
+            outcome = retry_state.outcome
+            if outcome is not None and not outcome.failed:
+                discarded = outcome.result()
+                if isinstance(discarded, httpx.Response):
+                    await discarded.aclose()
 
         retrying = AsyncRetrying(
             retry=retry_any(
@@ -513,7 +571,8 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
                 retry_if_result(_is_rate_limited),
             ),
             wait=_wait_for_retry,
-            stop=stop_after_attempt(_MAX_ATTEMPTS),
+            stop=_stop_when_budget_exhausted,
+            before_sleep=_spend_budget_before_sleep,
             reraise=True,
         )
         start = time.perf_counter()
@@ -669,6 +728,7 @@ class BaseBackend(ABC):
                 headers=self._create_headers(),
                 timeout=self.timeout,
                 follow_redirects=True,
+                max_redirects=_MAX_REDIRECT_HOPS,
                 transport=self._create_transport(),
             )
         return self._client

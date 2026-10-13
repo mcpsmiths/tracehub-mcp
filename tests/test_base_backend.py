@@ -14,12 +14,15 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 import pytest
 from tenacity import AsyncRetrying, RetryCallState
 
+from opentelemetry_mcp.backends import base as base_module
 from opentelemetry_mcp.backends.base import (
+    _MAX_REDIRECT_HOPS,
     _REQUEST_BUDGET_EXTENSION,
     DEFAULT_MAX_RESPONSE_BYTES,
     BackendDeadlineExceededError,
@@ -28,6 +31,7 @@ from opentelemetry_mcp.backends.base import (
     RedirectTargetBlockedError,
     ResponseTooLargeError,
     _is_rate_limited,
+    _RequestBudget,
     _retry_after_seconds,
     _RetryingTransport,
     _wait_for_retry,
@@ -1197,7 +1201,11 @@ class TestRequestDeadline:
 
     async def test_retry_sleeps_count_against_the_same_deadline(self) -> None:
         """Three connect failures would otherwise cost 1 s + 2 s of backoff
-        on top of the attempts; the deadline cuts the retry loop itself."""
+        on top of the attempts. The 1 s backoff fits the 1.5 s deadline and
+        is taken; the 2 s one cannot fit, so instead of sleeping up to the
+        deadline only to fail with the deadline error, the retry is not
+        attempted and the backend's real last outcome - the ConnectError -
+        reaches the caller at ~1 s."""
         call_count = 0
 
         async def handler(request: httpx.Request) -> httpx.Response:
@@ -1211,12 +1219,12 @@ class TestRequestDeadline:
 
         start = time.monotonic()
         async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
-            with pytest.raises(BackendDeadlineExceededError):
+            with pytest.raises(httpx.ConnectError):
                 await asyncio.wait_for(client.get("/health"), timeout=10.0)
         elapsed = time.monotonic() - start
 
-        assert 1.3 <= elapsed < 2.5
-        assert call_count == 2  # attempt 1, 1 s backoff, attempt 2, then the 2 s backoff is cut
+        assert 0.9 <= elapsed < 1.4
+        assert call_count == 2  # attempt 1, 1 s backoff, attempt 2; the 2 s backoff is refused
 
     async def test_redirect_hops_share_one_deadline_carried_in_request_extensions(
         self,
@@ -1311,3 +1319,208 @@ class TestRequestDeadline:
 
         assert isinstance(client._transport, _RetryingTransport)
         assert client._transport._total_deadline_seconds == 30.0
+
+
+class TestRetryBudgetPerLogicalRequest:
+    """858b67b capped a single Retry-After at 10 s, but the cap and the
+    3-attempt budget were re-armed on every redirect hop: the runtime probe
+    (probe-2 chain/01) answered /api/traces/X with 302 -> (429 x2, 302) ->
+    (429 x2, 302) -> (429 x2, 200) and parked one get_trace for 30.3 s over
+    10 backend requests; with httpx's default max_redirects=20 that shape
+    allows ~400 s of backend-chosen sleep. One retry budget - at most 2
+    retries and 10 s of cumulative sleep - now spans the whole chain, and
+    the transport itself follows at most _MAX_REDIRECT_HOPS redirects."""
+
+    @staticmethod
+    def _probe_chain_handler(retry_after: str) -> tuple[Any, list[str]]:
+        """The probe's exact shape: every hop answers 429 twice, then
+        redirects on; the last hop answers 200."""
+        requests: list[str] = []
+        per_path_429s: dict[str, int] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            requests.append(path)
+            if path == "/api/traces/x":
+                return httpx.Response(302, headers={"Location": "http://backend.test/hop1"})
+            if per_path_429s.get(path, 0) < 2:
+                per_path_429s[path] = per_path_429s.get(path, 0) + 1
+                return httpx.Response(429, headers={"Retry-After": retry_after})
+            if path == "/hop1":
+                return httpx.Response(302, headers={"Location": "http://backend.test/hop2"})
+            if path == "/hop2":
+                return httpx.Response(302, headers={"Location": "http://backend.test/hop3"})
+            return httpx.Response(200, json={"data": []})
+
+        return handler, requests
+
+    async def test_probe_chain_shares_one_retry_budget_across_hops(self) -> None:
+        """Retry-After scaled from the probe's 5 s to 1 s so the suite stays
+        fast; the shape is otherwise identical. Per-hop budgets would make
+        this 6 s and 10 requests; one budget for the chain stops after the
+        two retries hop1 consumed: hop2's first 429 is returned as is."""
+        handler, requests = self._probe_chain_handler(retry_after="1")
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+        )
+
+        start = time.monotonic()
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            response = await asyncio.wait_for(client.get("/api/traces/x"), timeout=30.0)
+        elapsed = time.monotonic() - start
+
+        assert response.status_code == 429
+        assert requests == ["/api/traces/x", "/hop1", "/hop1", "/hop1", "/hop2"]
+        assert len(requests) <= 5
+        assert 1.8 <= elapsed < 3.5
+
+    async def test_cumulative_retry_sleep_is_capped_across_hops(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The sleep budget binds independently of the retry count: with the
+        ceiling at 1.5 s and Retry-After 1, hop1's one retry (1 s slept)
+        leaves hop2's 429 unable to afford a second second, after only ONE
+        retry of the two the count would still allow."""
+        monkeypatch.setattr(base_module, "_MAX_RETRY_AFTER_SECONDS", 1.5)
+        requests: list[str] = []
+        seen_429: set[str] = set()
+        budgets: list[_RequestBudget] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request.url.path)
+            budgets.append(request.extensions[_REQUEST_BUDGET_EXTENSION])
+            if request.url.path not in seen_429:
+                seen_429.add(request.url.path)
+                return httpx.Response(429, headers={"Retry-After": "1"})
+            if request.url.path == "/hop1":
+                return httpx.Response(302, headers={"Location": "http://backend.test/hop2"})
+            return httpx.Response(200, json={"data": []})
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+        )
+
+        start = time.monotonic()
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            response = await asyncio.wait_for(client.get("/hop1"), timeout=30.0)
+        elapsed = time.monotonic() - start
+
+        assert response.status_code == 429
+        assert requests == ["/hop1", "/hop1", "/hop2"]
+        assert 0.9 <= elapsed < 2.0
+        assert budgets[-1].retries_used == 1
+        assert budgets[-1].retry_sleep_used == 1.0
+
+    async def test_retry_budget_is_fresh_for_every_logical_request(self) -> None:
+        """A client reused across tool calls must not carry one request's
+        spent budget into the next: each client.get() starts at zero."""
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count % 3 != 0:
+                return httpx.Response(429, headers={"Retry-After": "0"})
+            return httpx.Response(200, json={"ok": True})
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            first = await client.get("/search")
+            second = await client.get("/search")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert call_count == 6
+
+    async def test_redirect_loop_is_cut_by_the_transport_whatever_the_client_allows(
+        self,
+    ) -> None:
+        """The hop cap lives in the transport every backend client shares,
+        so a client built with httpx's default max_redirects=20 (the probe's
+        21-request loop) still stops after _MAX_REDIRECT_HOPS redirects."""
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(302, headers={"Location": "http://backend.test/loop"})
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+        )
+
+        start = time.monotonic()
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://backend.test",
+            follow_redirects=True,
+            max_redirects=20,
+        ) as client:
+            with pytest.raises(httpx.TooManyRedirects, match="redirect"):
+                await client.get("/loop")
+        elapsed = time.monotonic() - start
+
+        assert _MAX_REDIRECT_HOPS == 5
+        assert call_count == _MAX_REDIRECT_HOPS + 1
+        assert elapsed < 1.0
+
+    async def test_five_redirects_are_still_followed(self) -> None:
+        """Positive control for the hop cap: exactly _MAX_REDIRECT_HOPS
+        redirects (six requests) complete."""
+        hops = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal hops
+            if hops < _MAX_REDIRECT_HOPS:
+                hops += 1
+                return httpx.Response(302, headers={"Location": f"http://backend.test/h{hops}"})
+            return httpx.Response(200, json={"ok": True})
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            response = await client.get("/h0")
+
+        assert response.status_code == 200
+        assert hops == _MAX_REDIRECT_HOPS
+
+    def test_base_client_lowers_httpx_max_redirects_to_the_hop_cap(self) -> None:
+        """Belt and braces with the transport cap: the shared client itself
+        no longer allows httpx's default 20 hops."""
+        client = JaegerBackend(url="http://backend.test").client
+
+        assert client.max_redirects == _MAX_REDIRECT_HOPS
+
+    @pytest.mark.parametrize(
+        ("retries_used", "slept", "sleep", "affordable"),
+        [
+            (0, 0.0, 10.0, True),
+            (1, 5.0, 5.0, True),
+            (2, 0.0, 0.0, False),  # two retries already taken
+            (0, 5.0, 5.5, False),  # would pass the 10 s cumulative sleep
+            (1, 10.0, 0.0, True),  # a zero sleep still fits an exhausted sleep budget
+        ],
+    )
+    def test_can_afford_retry_counts_retries_and_sleep_together(
+        self, retries_used: int, slept: float, sleep: float, affordable: bool
+    ) -> None:
+        budget = _RequestBudget(deadline=None)
+        budget.retries_used = retries_used
+        budget.retry_sleep_used = slept
+
+        assert budget.can_afford_retry(sleep) is affordable
+
+    def test_can_afford_retry_refuses_a_sleep_that_would_cross_the_deadline(self) -> None:
+        budget = _RequestBudget(deadline=time.monotonic() + 1.0)
+
+        assert budget.can_afford_retry(0.5) is True
+        assert budget.can_afford_retry(1.5) is False
