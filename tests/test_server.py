@@ -1307,6 +1307,18 @@ class TestFixedWindowRateLimiterEviction:
         assert await limiter.hit("a") is True
 
 
+def _forward_uncached_list_services(fake_backend: AsyncMock) -> None:
+    """_run_backend_checks probes through list_services_uncached (never the
+    cache-wrapped list_services); the fake forwards to whatever
+    list_services the test installed, so tests keep stubbing and counting
+    list_services as before."""
+
+    async def _forward() -> Any:
+        return await fake_backend.list_services()
+
+    fake_backend.list_services_uncached = AsyncMock(side_effect=_forward)
+
+
 class TestMainCli:
     """main() is the click CLI entrypoint. mcp.run is mocked so it never
     blocks; ServerConfig.from_env/apply_cli_overrides are exercised for
@@ -1945,6 +1957,7 @@ class TestDoctorCli:
             return_value=HealthCheckResponse(status="healthy", backend="jaeger", url="http://x")
         )
         fake_backend.list_services = AsyncMock(return_value=["svc-a", "svc-b"])
+        _forward_uncached_list_services(fake_backend)
         fake_backend.close = AsyncMock()
         return fake_backend
 
@@ -2309,6 +2322,7 @@ class TestConfigErrorsNeverEchoUserinfo:
                 f"Client error '401' for url 'https://u:{self.MARKER}@h.test/api'"
             )
         )
+        _forward_uncached_list_services(fake_backend)
         fake_backend.close = AsyncMock()
         unvalidated = ServerConfig(
             backend=BackendConfig(type="jaeger", url=HttpUrl("http://localhost"))

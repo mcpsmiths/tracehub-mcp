@@ -9,9 +9,18 @@ import asyncio
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
+from opentelemetry_mcp.backends.base import BaseBackend
+from opentelemetry_mcp.backends.datadog import DatadogBackend
+from opentelemetry_mcp.backends.honeycomb import HoneycombBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
+from opentelemetry_mcp.backends.newrelic import NewRelicBackend
+from opentelemetry_mcp.backends.sentry import SentryBackend
+from opentelemetry_mcp.backends.tempo import TempoBackend
+from opentelemetry_mcp.backends.traceloop import TraceloopBackend
+from opentelemetry_mcp.backends.xray import XRayBackend
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, TraceQuery
 
 
@@ -81,12 +90,87 @@ def test_health_check_is_excluded_from_query_caching() -> None:
     """health_check() is deliberately excluded from _CACHEABLE_METHODS -
     /ready and doctor both depend on it reflecting live state. Checked
     directly against the wrapping mechanism (functools.wraps sets
-    __wrapped__ on a cached method), since JaegerBackend's own
-    health_check() happens to delegate to the separately-cached
-    list_services() internally, which would otherwise mask this exclusion
-    at a call-count level."""
+    __wrapped__ on a cached method); the live-probe behaviour itself is
+    covered by the two tests below."""
     assert not hasattr(JaegerBackend.health_check, "__wrapped__")
     assert hasattr(JaegerBackend.list_services, "__wrapped__")
+    assert not hasattr(JaegerBackend._list_services_uncached, "__wrapped__")
+
+
+def _unauthorized_response() -> AsyncMock:
+    request = httpx.Request("GET", "http://localhost:16686/api/services")
+    response = httpx.Response(401, request=request)
+    fake_response = AsyncMock()
+    fake_response.raise_for_status = response.raise_for_status
+    fake_response.json = lambda: {}
+    return fake_response
+
+
+async def test_jaeger_health_check_bypasses_query_cache() -> None:
+    """Regression: JaegerBackend.health_check awaited the public, cache-
+    wrapped list_services(), so with QUERY_CACHE_TTL_SECONDS set a warmed
+    entry answered /ready and the Docker HEALTHCHECK "healthy" for up to a
+    TTL after the backend failed or the credential was revoked."""
+    backend, mock_get = _mocked_backend({"data": ["svc-a"]})
+    backend.configure_query_cache(60.0)
+    assert await backend.list_services() == ["svc-a"]  # warms the cache key
+
+    mock_get.return_value = _unauthorized_response()
+    health = await backend.health_check()
+
+    assert health.status == "unhealthy"
+    assert health.error is not None and "401" in health.error
+    assert mock_get.call_count == 2
+
+
+async def test_list_services_uncached_bypasses_cache() -> None:
+    """The generic BaseBackend.list_services_uncached (what /ready and
+    doctor probe with) invokes the pre-wrap original, so a cached entry
+    never answers a readiness probe for any backend."""
+    backend, mock_get = _mocked_backend({"data": ["svc-a"]})
+    backend.configure_query_cache(60.0)
+    await backend.list_services()
+    await backend.list_services()
+    assert mock_get.call_count == 1
+
+    mock_get.return_value = _fake_response({"data": ["svc-a", "svc-live"]})
+    live = await backend.list_services_uncached()
+
+    assert live == ["svc-a", "svc-live"]
+    assert mock_get.call_count == 2
+    # The cached entry is untouched: the public method still serves it.
+    assert await backend.list_services() == ["svc-a"]
+    assert mock_get.call_count == 2
+
+
+async def test_list_services_uncached_works_without_a_cache() -> None:
+    backend, mock_get = _mocked_backend({"data": ["svc-a"]})
+
+    assert await backend.list_services_uncached() == ["svc-a"]
+    assert mock_get.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "backend_cls",
+    [
+        JaegerBackend,
+        TempoBackend,
+        TraceloopBackend,
+        DatadogBackend,
+        SentryBackend,
+        XRayBackend,
+        NewRelicBackend,
+        HoneycombBackend,
+    ],
+)
+def test_every_backend_probes_through_the_uncached_base_method(
+    backend_cls: type[BaseBackend],
+) -> None:
+    """No backend may shadow list_services_uncached with a cache-wrapped
+    method: it is the one entry point _run_backend_checks trusts to be live."""
+    assert backend_cls.list_services_uncached is BaseBackend.list_services_uncached
+    assert not hasattr(backend_cls.list_services_uncached, "__wrapped__")
+    assert hasattr(backend_cls.list_services, "__wrapped__")
 
 
 async def test_cancelling_a_follower_does_not_fail_the_leader_end_to_end() -> None:

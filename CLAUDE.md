@@ -281,6 +281,13 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
    unconditionally from `BackendConfig` regardless of `type` - there is no per-backend-type
    *validation* at the config layer; "required for this backend" is enforced inside the
    concrete backend's own `__init__` via a `ValueError`, not in config.py
+4a. `health_check()` must never call one of the cache-wrapped public `_CACHEABLE_METHODS`
+   (`list_services`, `search_spans`, ...) - with `QUERY_CACHE_TTL_SECONDS` set it would be
+   answered from the cache for a whole TTL after the backend failed. Probe through a private
+   uncached helper (`_list_services_uncached` in jaeger.py/xray.py, `_search_spans_raw` in
+   datadog.py); `server._run_backend_checks` itself probes via the generic
+   `BaseBackend.list_services_uncached`, which no backend may override or re-wrap
+   (`tests/test_backend_caching.py` pins both)
 4b. If the backend needs its own `client` property (e.g. `follow_redirects=False` because it
    sends a non-standard credential header httpx would not strip on a cross-origin hop), build
    the transport with `self._create_transport()` rather than constructing `_RetryingTransport`

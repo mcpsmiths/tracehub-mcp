@@ -254,12 +254,26 @@ class JaegerBackend(BaseBackend):
     async def list_services(self) -> list[str]:
         """List all services from Jaeger.
 
+        Cache-wrapped by BaseBackend.__init_subclass__ once a query cache is
+        configured; the body lives in _list_services_uncached so
+        health_check() can probe live.
+
         Returns:
             List of service names
 
         Raises:
             httpx.HTTPError: If API request fails
         """
+        return await self._list_services_uncached()
+
+    async def _list_services_uncached(self) -> list[str]:
+        """The actual GET /api/services, never cache-wrapped (not a
+        _CACHEABLE_METHODS name). health_check() calls this rather than the
+        public list_services(): /ready and the Docker HEALTHCHECK depend on
+        health_check reflecting live state, and a warmed cache entry would
+        otherwise answer "healthy" for a whole TTL after the backend failed
+        or the credential was revoked - same pattern as
+        XRayBackend._list_services_uncached."""
         logger.debug("Listing services")
 
         response = await self.client.get("/api/services")
@@ -309,8 +323,9 @@ class JaegerBackend(BaseBackend):
         logger.debug("Checking backend health")
 
         try:
-            # Try to list services as a health check
-            services = await self.list_services()
+            # Try to list services as a health check - the private, never-
+            # cached body, so a configured query cache cannot answer this.
+            services = await self._list_services_uncached()
             return HealthCheckResponse(
                 status="healthy",
                 backend="jaeger",

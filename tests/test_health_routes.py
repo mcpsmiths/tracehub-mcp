@@ -13,6 +13,7 @@ pattern for mocking _get_backend.
 import asyncio
 import time
 from collections.abc import Iterator
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -22,6 +23,8 @@ from starlette.testclient import TestClient
 
 from opentelemetry_mcp import server
 from opentelemetry_mcp.attributes import HealthCheckResponse
+from opentelemetry_mcp.backends.base import _RetryingTransport
+from opentelemetry_mcp.backends.jaeger import JaegerBackend
 from opentelemetry_mcp.server import OriginValidationMiddleware
 from tests.streamable_http_client import post_initialize
 
@@ -38,12 +41,25 @@ def _fresh_readiness_memo(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     server._reset_readiness_memo()
 
 
+def _forward_uncached_list_services(fake_backend: AsyncMock) -> None:
+    """_run_backend_checks probes through list_services_uncached (never the
+    cache-wrapped list_services); the fake forwards to whatever
+    list_services the test installed, so tests keep stubbing and counting
+    list_services as before."""
+
+    async def _forward() -> Any:
+        return await fake_backend.list_services()
+
+    fake_backend.list_services_uncached = AsyncMock(side_effect=_forward)
+
+
 def _healthy_backend() -> AsyncMock:
     fake_backend = AsyncMock()
     fake_backend.health_check = AsyncMock(
         return_value=HealthCheckResponse(status="healthy", backend="jaeger", url="http://x")
     )
     fake_backend.list_services = AsyncMock(return_value=["svc-a", "svc-b"])
+    _forward_uncached_list_services(fake_backend)
     fake_backend.close = AsyncMock()
     return fake_backend
 
@@ -470,3 +486,52 @@ class TestReadinessMemo:
         assert marker not in second.text
         assert first.json() == second.json()
         assert fake_backend.list_services.await_count == 1
+
+
+class TestReadyNeverAnsweredFromTheQueryCache:
+    """With QUERY_CACHE_TTL_SECONDS set, a warmed list_services entry used to
+    answer both halves of /ready (JaegerBackend.health_check awaited the
+    cache-wrapped list_services, and _run_backend_checks did too), so the
+    route and the Docker HEALTHCHECK reported ready with zero backend
+    requests after the backend failed. Both halves now probe live; the
+    readiness memo is disabled here so only the query cache is under test."""
+
+    def _jaeger_over(self, status_code: list[int], *, cache: bool) -> JaegerBackend:
+        backend = JaegerBackend(url="http://localhost:16686")
+        if cache:
+            backend.configure_query_cache(60.0)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if status_code[0] == 200:
+                return httpx.Response(200, json={"data": ["svc-a"]})
+            return httpx.Response(status_code[0], text="unauthorized")
+
+        backend._client = httpx.AsyncClient(
+            base_url=backend.url,
+            transport=_RetryingTransport(
+                wrapped=httpx.MockTransport(handler), allowed_host="localhost"
+            ),
+        )
+        return backend
+
+    @pytest.mark.parametrize("cache", [True, False], ids=["query-cache-on", "query-cache-off"])
+    def test_ready_returns_503_after_backend_failure(self, cache: bool) -> None:
+        server._configure_readiness_cache(0.0)
+        status_code = [200]
+        backend = self._jaeger_over(status_code, cache=cache)
+        with patch.object(server, "_get_backend", AsyncMock(return_value=backend)):
+            with _build_client() as client:
+                first = client.get("/ready")
+                status_code[0] = 401
+                second = client.get("/ready")
+
+        assert first.status_code == 200
+        assert first.json()["status"] == "ready"
+        assert first.json()["list_services"]["count"] == 1
+
+        assert second.status_code == 503
+        body = second.json()
+        assert body["status"] == "not_ready"
+        assert body["health_check"]["status"] == "unhealthy"
+        assert "401" in body["health_check"]["error"]
+        assert "401" in body["list_services"]["error"]

@@ -30,7 +30,14 @@ from opentelemetry_mcp.security import is_cloud_metadata_host
 logger = logging.getLogger(__name__)
 
 # health_check() is deliberately excluded: /ready and doctor both depend on
-# it reflecting live backend state, and caching it would defeat that.
+# it reflecting live backend state, and caching it would defeat that. The
+# rule that follows from it: health_check() and every readiness-probe helper
+# must never call a cache-wrapped PUBLIC method listed here (a backend's own
+# health_check that awaited self.list_services() would be answered from the
+# cache for a whole TTL after the backend failed). Call a private uncached
+# helper instead (XRayBackend._list_services_uncached,
+# JaegerBackend._list_services_uncached, DatadogBackend._search_spans_raw);
+# server._run_backend_checks probes through list_services_uncached() below.
 _CACHEABLE_METHODS = (
     "search_traces",
     "search_spans",
@@ -615,6 +622,29 @@ class BaseBackend(ABC):
             Exception: If query fails
         """
         pass
+
+    async def list_services_uncached(self) -> list[str]:
+        """list_services() with the query cache bypassed - a live request,
+        whatever QUERY_CACHE_TTL_SECONDS is.
+
+        The readiness probe (/ready, the Docker HEALTHCHECK) and doctor call
+        this: a cached result must never make readiness report healthy
+        after the backend has failed or rejected the credential. Invokes the
+        concrete class's pre-wrap original through the ``__wrapped__``
+        functools.wraps leaves on the cache wrapper, so no per-backend edit
+        is needed and no backend can accidentally re-wrap it (not a
+        _CACHEABLE_METHODS entry).
+
+        Returns:
+            List of service names, straight from the backend
+
+        Raises:
+            Exception: If the query fails
+        """
+        method = type(self).list_services
+        original = getattr(method, "__wrapped__", method)
+        services: list[str] = await original(self)
+        return services
 
     @abstractmethod
     async def get_service_operations(self, service_name: str) -> list[str]:

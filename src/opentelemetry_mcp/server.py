@@ -505,6 +505,11 @@ async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any
     Every error string is redacted HERE, not by the callers: /ready hands
     the details to unauthenticated peers and doctor prints them, and httpx
     error text embeds the request URL (userinfo included) verbatim.
+
+    The list_services half goes through BaseBackend.list_services_uncached,
+    never the cache-wrapped public method: with QUERY_CACHE_TTL_SECONDS set
+    a warmed entry would otherwise report "ready" with zero backend requests
+    for a whole TTL after the backend failed.
     """
     all_ok = True
     details: dict[str, Any] = {}
@@ -522,7 +527,7 @@ async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any
         all_ok = False
 
     try:
-        services_found = await backend.list_services()
+        services_found = await backend.list_services_uncached()
         details["list_services"] = {"count": len(services_found)}
     except Exception as e:
         details["list_services"] = {"error": redact_userinfo_in_text(str(e))}

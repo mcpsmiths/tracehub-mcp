@@ -92,6 +92,8 @@ def _healthy_backend() -> AsyncMock:
         return_value=HealthCheckResponse(status="healthy", backend="jaeger", url="http://x")
     )
     fake_backend.list_services = AsyncMock(return_value=["svc-a"])
+    # _run_backend_checks probes through the never-cached list_services_uncached.
+    fake_backend.list_services_uncached = fake_backend.list_services
     return fake_backend
 
 
