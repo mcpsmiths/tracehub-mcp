@@ -57,11 +57,18 @@ _CLOUD_METADATA_HOSTNAMES = frozenset({"metadata.google.internal"})
 
 def _normalize_host(host: str) -> str:
     """Strip the enclosing brackets pydantic's HttpUrl.host keeps on IPv6
-    literals (e.g. "[fd00:ec2::254]") - ipaddress.ip_address rejects them."""
-    host = host.strip().rstrip(".")
+    literals (e.g. "[fd00:ec2::254]") - ipaddress.ip_address rejects them -
+    and one trailing dot from a name ("localhost." is localhost).
+
+    The brackets are unwrapped only when they enclose the WHOLE value: a
+    bracketed literal with a tail ("[::1].", "[::1]evil.example") is left as
+    it is, so it parses as no address and matches no name. Stripping the dots
+    first turned "[::1]." into "::1" and let a Host the header parser had
+    refused pass the loopback test (round-2 review)."""
+    host = host.strip()
     if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
-    return host
+        return host[1:-1]
+    return host.rstrip(".")
 
 
 def _canonical_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:

@@ -507,3 +507,12 @@ class TestUserinfoRedactingFilterControlCharacters:
         assert len(rejected) == 1, lines
         assert rejected[0].endswith("session ID: evil\\x01\\tsess"), rejected[0]
         assert rejected[0].isprintable()
+
+
+def test_a_bracketed_literal_with_a_tail_is_not_loopback() -> None:
+    # "[::1]." used to normalise to "::1" (dots stripped, then brackets) and so passed the
+    # middleware's loopback test for a Host the header parser had refused (round-2 review).
+    for host in ("[::1].", "[::1]..", "[::1]evil.example", "[::1"):
+        assert is_loopback_host(host) is False, host
+    assert is_loopback_host("[::1]") is True
+    assert is_loopback_host("localhost.") is True

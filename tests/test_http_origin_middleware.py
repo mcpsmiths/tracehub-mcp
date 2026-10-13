@@ -174,6 +174,10 @@ class TestBracketedHostTrailingText:
         client = _build_client(bind_host="127.0.0.1")
 
         assert client.get("/", headers={"host": "[::1]evil.example"}).status_code == 421
+        # A trailing dot after the bracket used to be stripped by the loopback
+        # normaliser, so "[::1]." passed as ::1 (round-2 review).
+        assert client.get("/", headers={"host": "[::1]."}).status_code == 421
+        assert client.get("/", headers={"host": "[::1].."}).status_code == 421
         assert client.get("/", headers={"host": "[::1]:8000"}).status_code == 200
         assert client.get("/", headers={"host": "[::1]"}).status_code == 200
 
@@ -194,6 +198,7 @@ class TestBracketedHostTrailingText:
         assert _hostname_from_host_header("[::1]:abc") == "[::1]:abc"
         assert _hostname_from_host_header("[::1]:") == "[::1]:"
         assert _hostname_from_host_header("[::1") == "[::1"
+        assert _hostname_from_host_header("[::1].") == "[::1]."
         assert _hostname_from_host_header("[::1]:8000") == "::1"
         assert _hostname_from_host_header("[::1]") == "::1"
 
