@@ -27,6 +27,7 @@ WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 RELEASE_YML = WORKFLOWS_DIR / "release.yml"
 DOCKER_PUBLISH_YML = WORKFLOWS_DIR / "docker-publish.yml"
 MCP_REGISTRY_YML = WORKFLOWS_DIR / "mcp-registry-publish.yml"
+CI_YML = WORKFLOWS_DIR / "ci.yml"
 DEPENDABOT_YML = REPO_ROOT / ".github" / "dependabot.yml"
 REQUIREMENTS_RELEASE = REPO_ROOT / ".github" / "requirements-release.txt"
 SECURITY_MD = REPO_ROOT / "SECURITY.md"
@@ -708,3 +709,98 @@ def test_mcp_registry_pypi_poll_targets_the_asserted_identifier() -> None:
     assert "pypi.org/pypi/tracehub-mcp/" not in poll_run, "poll URL must not be hardcoded"
     assert "jq -r '.packages[0].identifier' server.json" in poll_run, poll_run
     assert "pypi.org/pypi/${identifier}/${NEW_VERSION}/json" in poll_run, poll_run
+
+
+# --- ci.yml smoke test: never vacuously green, token off the docker argv ----------------
+
+
+def _smoke_test_step() -> Step:
+    steps = [
+        step
+        for job in _jobs(_load_yaml(CI_YML)).values()
+        for step in _steps(job)
+        if str(step.get("name", "")).startswith("Smoke-test the built image")
+    ]
+    assert len(steps) == 1, [s.get("name") for s in steps]
+    return steps[0]
+
+
+def _replay_smoke_step(
+    tmp_path: Path, *, target_platform: str, docker_arch: str | None
+) -> tuple[int, str, list[str]]:
+    """Run the smoke step's script with a stub `docker` on PATH (or none) and
+    return (exit code, stdout, the docker sub-commands the stub saw)."""
+    script = tmp_path / "smoke.sh"
+    script.write_text(_run(_smoke_test_step()), encoding="utf-8")
+    calls = tmp_path / "docker-calls.log"
+    calls.write_text("", encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    if docker_arch is not None:
+        stub = bin_dir / "docker"
+        stub.write_text(
+            f'#!/bin/sh\necho "$1" >> "{calls}"\n[ "$1" = info ] && echo "{docker_arch}"\nexit 0\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+    bash = shutil.which("bash")
+    assert bash is not None
+    proc = subprocess.run(  # noqa: S603 - replaying our own workflow step under test
+        [bash, "-eo", "pipefail", str(script)],
+        env={
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "TARGET_PLATFORM": target_platform,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode, proc.stdout, calls.read_text(encoding="utf-8").split()
+
+
+def test_smoke_step_fails_closed_when_the_platform_mapping_is_missing(tmp_path: Path) -> None:
+    """With TARGET_PLATFORM empty the old case statement printed
+    "::warning::Skipping smoke-test execution ... cannot execute a  image" and
+    exited 0 (runtime verification, T1): drop the `env:` mapping and the step
+    passes without ever starting the container. An empty platform is a
+    workflow bug, not an infrastructure limitation, and must fail the job
+    before docker is consulted."""
+    step = _smoke_test_step()
+    assert step.get("env", {}).get("TARGET_PLATFORM") == "${{ matrix.platform }}", step.get("env")
+
+    code, out, docker_calls = _replay_smoke_step(tmp_path, target_platform="", docker_arch=None)
+    assert code == 1, (code, out)
+    assert "::error::" in out and "TARGET_PLATFORM" in out, out
+    assert "::warning::" not in out, out
+    assert docker_calls == [], docker_calls
+
+
+def test_smoke_step_still_skips_loudly_on_a_runner_that_cannot_execute_the_image(
+    tmp_path: Path,
+) -> None:
+    """The legitimate skip (arm64 image on an x86_64 host with no QEMU) keeps
+    its warning and exit 0, and never reaches `docker run`."""
+    code, out, docker_calls = _replay_smoke_step(
+        tmp_path, target_platform="arm64", docker_arch="x86_64"
+    )
+    assert code == 0, (code, out)
+    assert "::warning::Skipping smoke-test execution" in out and "arm64" in out, out
+    assert docker_calls == ["info"], docker_calls
+
+
+def test_smoke_step_hands_docker_the_token_by_name_not_on_the_argv() -> None:
+    """Passing the generated value inline in the `-e NAME=VALUE` form put it on
+    the docker CLI's argv, visible to every process on the runner via ps.
+    Generate it into the step's own environment instead and let docker read
+    it by name (`-e MCP_HTTP_BEARER_TOKEN`), the form README's own docker
+    example uses."""
+    run = _run(_smoke_test_step())
+    assert re.search(r"^\s*export MCP_HTTP_BEARER_TOKEN\b", run, re.MULTILINE), run
+    flag_lines = [
+        line
+        for line in run.splitlines()
+        if "-e MCP_HTTP_BEARER_TOKEN" in line and not line.lstrip().startswith("#")
+    ]
+    assert flag_lines, run
+    for line in flag_lines:
+        assert line.rstrip(" \\").endswith("MCP_HTTP_BEARER_TOKEN"), line

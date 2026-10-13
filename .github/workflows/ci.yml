@@ -181,6 +181,18 @@ jobs:
               env:
                   TARGET_PLATFORM: ${{ matrix.platform }}
               run: |
+                  # An empty TARGET_PLATFORM is a workflow bug (the env mapping
+                  # above was dropped or renamed), not an infrastructure
+                  # limitation: the case statement below would otherwise match
+                  # nothing, print "cannot execute a  image" and exit 0, and
+                  # this step would stay green without ever starting the
+                  # container (observed replaying the step with the variable
+                  # unset). Fail before docker is even consulted.
+                  if [ -z "${TARGET_PLATFORM}" ]; then
+                    echo "::error::TARGET_PLATFORM is empty - the matrix.platform env mapping on this step is missing, so the smoke test cannot know which image it would be checking"
+                    exit 1
+                  fi
+
                   # Confirmed live: on this org's ubuntu-24.04-arm runner,
                   # `docker info`/buildx both report the underlying host as
                   # linux/amd64 (Architecture: x86_64, buildx's own native
@@ -218,12 +230,20 @@ jobs:
                   # generated the way README tells operators to, so this step
                   # also proves the image honours it (401 challenge on /mcp,
                   # open /health) - not merely that uvicorn bound the port.
+                  # The token lives in this step's environment and docker reads
+                  # it by NAME (`-e MCP_HTTP_BEARER_TOKEN`, README's own form):
+                  # an inline `-e NAME=VALUE` put the value on the docker CLI's
+                  # argv, readable by every process on the runner via ps. It
+                  # still reaches the container's config (that is what -e does)
+                  # and dies with the container a few lines below.
+                  MCP_HTTP_BEARER_TOKEN="$(openssl rand -hex 32)"
+                  export MCP_HTTP_BEARER_TOKEN
                   docker run -d --name smoke-test \
                     --platform "${{ matrix.docker-platform }}" \
                     -p 18000:8000 \
                     -e BACKEND_TYPE=jaeger \
                     -e BACKEND_URL=http://localhost:16686 \
-                    -e MCP_HTTP_BEARER_TOKEN="$(openssl rand -hex 32)" \
+                    -e MCP_HTTP_BEARER_TOKEN \
                     "tracehub-mcp-server:${{ github.sha }}-${{ matrix.platform }}"
 
                   transport_up=false
