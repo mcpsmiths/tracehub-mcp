@@ -1697,9 +1697,15 @@ def _is_unspecified_address(hostname: str) -> bool:
 # echoes back: enough to recognise a typo, never a whole pasted document.
 _MAX_OPTION_VALUE_REPR_CHARS = 64
 
-# One RFC 1123 hostname label: letters, digits and hyphens, no leading or
-# trailing hyphen, 1-63 characters.
-_HOSTNAME_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+# One hostname label as the Host allowlist accepts it: RFC 1123's letters,
+# digits and hyphens (no leading or trailing hyphen, 1-63 characters) plus
+# "_" anywhere in the label - a deliberate superset, because Docker Compose
+# service names and other internal resolvers accept underscores (trace_hub,
+# _svc._tcp.example) and browsers send them in Host unchanged; refusing
+# them at startup only locked operators out of names that resolve (round-2
+# review of the validator). Whitespace, "!" and every other character stay
+# refused, as do empty labels.
+_HOSTNAME_LABEL_RE = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?")
 
 
 def _bounded_repr(value: str) -> str:
@@ -1717,9 +1723,9 @@ def _is_ip_literal(value: str) -> bool:
     return True
 
 
-def _is_rfc1123_hostname(name: str) -> bool:
-    """Dot-separated RFC 1123 labels, at most 253 characters, one optional
-    trailing dot (the FQDN spelling)."""
+def _is_allowlist_hostname(name: str) -> bool:
+    """Dot-separated labels per _HOSTNAME_LABEL_RE (RFC 1123 plus "_"), at
+    most 253 characters, one optional trailing dot (the FQDN spelling)."""
     if name.endswith("."):
         name = name[:-1]
     if not name or len(name) > 253:
@@ -1734,8 +1740,9 @@ def _validate_allowed_hosts_option(
     to accept '*,example.test' (the listed name silently ignored, because
     '*' disables Host validation) and 'bad host!' (an entry no Host header
     can ever equal, so a 421 for every request). Each entry must parse as
-    an IP literal or an RFC 1123 hostname after the port is stripped, and
-    '*' may only stand alone."""
+    an IP literal or a hostname (RFC 1123 labels, underscores allowed - see
+    _HOSTNAME_LABEL_RE) after the port is stripped, and '*' may only stand
+    alone."""
     if value is None:
         return None
     entries = _parse_csv_option(value) or []
@@ -1748,7 +1755,7 @@ def _validate_allowed_hosts_option(
         if entry == "*":
             continue
         hostname = _hostname_from_host_header(entry)
-        if not (_is_ip_literal(hostname) or _is_rfc1123_hostname(hostname)):
+        if not (_is_ip_literal(hostname) or _is_allowlist_hostname(hostname)):
             raise click.BadParameter(
                 f"{_bounded_repr(entry)} is not a hostname or IP literal; entries are "
                 "comma-separated names, IPv4 literals or [IPv6] literals, each with an "

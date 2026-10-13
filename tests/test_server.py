@@ -2685,6 +2685,38 @@ class TestNetworkOptionsAreValidatedAtStartup:
         assert repr(entry) in result.output
         serve.assert_not_awaited()
 
+    def test_underscores_in_hostname_labels_are_accepted(self) -> None:
+        """Round-2 review of this validator: Docker Compose service names and
+        other internal resolvers accept '_' in a name and browsers send it
+        in Host, so 'trace_hub' must start the listener - a deliberate
+        superset of RFC 1123's letter-digit-hyphen labels; spaces, '!' and
+        empty labels stay refused (the parametrized test above)."""
+        result, serve = _invoke_http_listener(
+            ["--allowed-hosts", "trace_hub,_svc._tcp.example:8443"]
+        )
+
+        assert result.exit_code == 0, result.output
+        serve.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("name", "accepted"),
+        [
+            ("trace_hub", True),
+            ("_svc._tcp.example", True),
+            ("tracehub.example.", True),
+            ("a" * 63, True),
+            ("bad host!", False),
+            ("-leading.example", False),
+            ("trailing-.example", False),
+            ("a..b", False),
+            ("", False),
+            ("a" * 64, False),
+            (".".join(["abcdefgh"] * 29), False),  # 260 characters
+        ],
+    )
+    def test_allowlist_hostname_predicate(self, name: str, accepted: bool) -> None:
+        assert server._is_allowlist_hostname(name) is accepted
+
     def test_allowed_hosts_env_var_is_validated_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("MCP_ALLOWED_HOSTS", "bad host!")
 
