@@ -248,6 +248,24 @@ def test_cz_bump_runs_on_the_runner_from_the_hashed_install() -> None:
     assert identity_idx < cz_idx, "git identity must be configured before the bump commit"
 
 
+def test_cz_bump_treats_no_new_commits_as_the_documented_no_op() -> None:
+    """Re-dispatching Release at the tag tip (zero commits since v<current>)
+    makes `cz bump` exit 3 ([NO_COMMITS_FOUND]) - not 21 (NO_INCREMENT), the
+    only code `--no-raise 21` forgave - so the step failed although both
+    comments promised a no-op (runtime verification T7 fix2/02, case P2).
+    Both codes must be forgiven and both comments must say so; the
+    already-released check then makes the rest of the run a no-op."""
+    steps = _bump_version_steps()
+    cz_run = _run(steps[_step_index(steps, lambda s: s.get("id") == "cz")])
+    assert "cz --no-raise 21,3 " in cz_run, cz_run
+    lines = RELEASE_YML.read_text(encoding="utf-8").splitlines()
+    mentions = [line for line in lines if "NO_COMMITS_FOUND" in line]
+    assert len(mentions) >= 2, mentions
+    assert not any("--no-raise 21`" in line or "--no-raise 21 " in line for line in lines), [
+        line for line in lines if "--no-raise 21" in line and "21,3" not in line
+    ]
+
+
 def test_bump_commit_and_tag_are_pushed_with_a_per_step_header() -> None:
     steps = _bump_version_steps()
     cz_idx = _step_index(steps, lambda s: s.get("id") == "cz")

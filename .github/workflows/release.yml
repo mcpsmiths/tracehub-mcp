@@ -91,11 +91,15 @@ jobs:
         # here is the hash-pinned one installed above; the pre_bump_hook from
         # .cz.toml runs on this runner under setup-python 3.13.
         #
-        # `--no-raise 21`: exit 21 (NO_INCREMENT) means a run with no
-        # bump-worthy commits (e.g. docs-only) - treat it as success and leave
-        # steps.cz.outputs.version pointing at the CURRENT (unchanged) version,
-        # exactly like the action's `no_raise: 21`, so the already-released
-        # check below turns the rest of the workflow into a no-op.
+        # `--no-raise 21,3`: exit 21 (NO_INCREMENT) means a run with no
+        # bump-worthy commits (e.g. docs-only) and exit 3 (NO_COMMITS_FOUND)
+        # means a run with no commits at all since the current tag (a
+        # re-dispatch at the tag tip). Treat both as success and leave
+        # steps.cz.outputs.version pointing at the CURRENT (unchanged)
+        # version - the action's `no_raise: 21` covered only the first, so a
+        # re-dispatch used to fail this step although the comments promised
+        # a no-op - and the already-released check below turns the rest of
+        # the workflow into a no-op.
         env:
           INCREMENT: ${{ github.event.inputs.increment }}
         run: |
@@ -103,7 +107,7 @@ jobs:
           if [[ -n "$INCREMENT" ]]; then
             args+=(--increment "$INCREMENT")
           fi
-          cz --no-raise 21 "${args[@]}"
+          cz --no-raise 21,3 "${args[@]}"
           echo "version=$(cz version --project)" >> "$GITHUB_OUTPUT"
 
       - name: Record bump commit
@@ -146,12 +150,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # `cz --no-raise 21` above means a run with no bump-worthy
-          # commits (e.g. docs-only) exits 0 rather than failing, but leaves
-          # steps.cz.outputs.version pointing at the CURRENT (unchanged)
-          # version, not a new one. Without this check, the next two steps
-          # tried to recreate and republish an already-existing release and
-          # crashed with a 422 instead of just doing nothing.
+          # `cz --no-raise 21,3` above means a run with no bump-worthy
+          # commits (e.g. docs-only; NO_INCREMENT) or with no commits at all
+          # since the tag (a re-dispatch; NO_COMMITS_FOUND) exits 0 rather
+          # than failing, but leaves steps.cz.outputs.version pointing at the
+          # CURRENT (unchanged) version, not a new one. Without this check,
+          # the next two steps tried to recreate and republish an
+          # already-existing release and crashed with a 422 instead of just
+          # doing nothing.
           if gh release view "v${{ steps.cz.outputs.version }}" >/dev/null 2>&1; then
             echo "No new version to release (already released as v${{ steps.cz.outputs.version }})."
             echo "exists=true" >> "$GITHUB_OUTPUT"
