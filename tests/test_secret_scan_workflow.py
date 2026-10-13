@@ -214,7 +214,8 @@ def test_gitleaks_allowlists_exactly_the_bearer_auth_fixture_line() -> None:
     assert entry["regexTarget"] == "line", entry
     assert "paths" not in entry, entry
     (pattern,) = entry["regexes"]
-    assert pattern.startswith("^") and pattern.endswith("$"), pattern
+    # (?m): gitleaks hands the line text with a leading newline for every line but the first.
+    assert pattern.startswith("(?m)^") and pattern.endswith("$"), pattern
     assert "tl_" not in pattern
     rx = re.compile(pattern)
     fixture = _bearer_auth_fixture_line()
@@ -262,13 +263,22 @@ def test_gitleaks_pre_commit_stages_the_bearer_auth_fixture_but_still_catches_se
             check=False,
         ).returncode
 
-    assert staged_scan("fixture", fixture + "\n") == 0, "the fixture line must stage"
+    # The fixture must NOT sit on line 1: gitleaks hands a regexTarget=line regex the line
+    # text with a leading newline for every line but the first, so an unanchored-to-
+    # multiline "^" only ever matched a one-line file - the shape this test first staged,
+    # which made it pass while the real file still exited 7 (delta verification, T7).
+    preamble = '"""Bearer-auth tests."""\n\nimport pytest\n\n'
+    assert staged_scan("fixture", preamble + fixture + "\n") == 0, "the fixture line must stage"
+    real_file = (REPO_ROOT / "tests" / "test_http_bearer_auth.py").read_text(encoding="utf-8")
+    assert staged_scan("real-file", real_file) == 0, "the real test module must stage"
     variant = fixture.replace("0123456789abcdef", "fedcba9876543210")
-    assert staged_scan("variant", variant + "\n") == 7, (
+    assert staged_scan("variant", preamble + variant + "\n") == 7, (
         "another value in the same path is a finding"
     )
     fake_traceloop_key = "tl_" + "a1" * 16
-    with_traceloop = fixture + "\nexport BACKEND_API_" + "KEY" + "=" + fake_traceloop_key + "\n"
+    with_traceloop = (
+        preamble + fixture + "\nexport BACKEND_API_" + "KEY" + "=" + fake_traceloop_key + "\n"
+    )
     assert staged_scan("traceloop", with_traceloop) == 7, "the Traceloop rule is untouched"
 
 

@@ -24,12 +24,15 @@ keywords = ["tl_"]
 # exits 7 and a maintainer with the hook installed cannot stage that file,
 # while TruffleHog in CI does not report it (runtime verification of PR #41,
 # T7 fix9/03). The exception is as narrow as the finding: that one rule
-# (targetRules), that one literal line (an anchored regex against the whole
-# line), and deliberately no path grant - a path entry would blind the hook
+# (targetRules), that one literal line (a multiline-anchored regex against the
+# whole line), and deliberately no path grant - a path entry would blind the hook
 # to a real secret pasted into the file. tests/test_secret_scan_workflow.py
 # asserts the shape and replays the staged scan against this file.
 [[allowlists]]
 description = "the TEST_TOKEN fixture line of tests/test_http_bearer_auth.py"
 targetRules = ["generic-api-key"]
 regexTarget = "line"
-regexes = ['''^TEST_TOKEN = "-"\.join\(\["unit", "test", "operator", "credential", "0123456789abcdef"\]\)$''']
+# (?m): gitleaks hands a regexTarget=line regex the line text WITH a leading newline for
+# every line but the file's first, so a plain ^ anchor exempted the fixture only when it
+# sat on line 1 (runtime verification of the allowlist, T7 fix9 re-run at 7a85535).
+regexes = ['''(?m)^TEST_TOKEN = "-"\.join\(\["unit", "test", "operator", "credential", "0123456789abcdef"\]\)$''']
