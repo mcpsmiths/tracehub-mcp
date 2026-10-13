@@ -2,6 +2,8 @@
 
 ### Fix
 
+- **`--access-log` / `MCP_ACCESS_LOG` (HTTP transport, default off).** uvicorn's per-request access line was switched off in this round because it logs the full request target, token-in-query-string included; operators who want request lines can opt back in, and the query string is stripped from every access line either way.
+
 - **security**: refuse credentialed URLs before pydantic can echo them <!-- TA1 -->
 - **security**: keep query-string tokens out of uvicorn's access log <!-- TA2 -->
 - **security**: refuse an empty or non-presentable HTTP bearer token <!-- TA3 -->
