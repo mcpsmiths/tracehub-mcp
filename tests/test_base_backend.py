@@ -20,7 +20,9 @@ import pytest
 from tenacity import AsyncRetrying, RetryCallState
 
 from opentelemetry_mcp.backends.base import (
+    _REQUEST_BUDGET_EXTENSION,
     DEFAULT_MAX_RESPONSE_BYTES,
+    BackendDeadlineExceededError,
     BaseBackend,
     MetadataEndpointBlockedError,
     RedirectTargetBlockedError,
@@ -29,6 +31,7 @@ from opentelemetry_mcp.backends.base import (
     _retry_after_seconds,
     _RetryingTransport,
     _wait_for_retry,
+    request_deadline_seconds,
 )
 from opentelemetry_mcp.backends.datadog import DatadogBackend
 from opentelemetry_mcp.backends.honeycomb import HoneycombBackend
@@ -1088,3 +1091,223 @@ class TestRetryAfterCeiling:
         # i.e. the transport did not close it before handing it back.
         assert final_stream.reads == 1
         assert response.text == "still rate limited"
+
+
+class _TrickleStream(httpx.AsyncByteStream):
+    """A body that never ends: one byte, a pause shorter than any read
+    timeout, another byte, forever - the shape the runtime probe used to
+    park get_trace for 302 s (each socket read completes well inside
+    BACKEND_TIMEOUT, so httpx's per-operation timeouts never fire and the
+    decoded-size cap is never reached)."""
+
+    def __init__(self, interval_seconds: float) -> None:
+        self._interval_seconds = interval_seconds
+        self.bytes_sent = 0
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while True:
+            self.bytes_sent += 1
+            yield b"x"
+            await asyncio.sleep(self._interval_seconds)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class TestRequestDeadline:
+    """One wall-clock deadline per LOGICAL backend request - connect, every
+    retry attempt and its sleep, every redirect hop and the whole body read.
+    httpx's timeouts are per socket operation, so without it a backend
+    that keeps each operation just under BACKEND_TIMEOUT holds a tool call
+    (and, with the query cache, every coalesced caller) for as long as it
+    likes; the probe measured 302.5 s until the backend was killed."""
+
+    async def test_trickling_body_fails_at_the_deadline_not_after_minutes(self) -> None:
+        stream = _TrickleStream(interval_seconds=0.2)
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(200, stream=stream)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), total_deadline_seconds=1.0
+        )
+
+        start = time.monotonic()
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", timeout=5.0
+        ) as client:
+            with pytest.raises(BackendDeadlineExceededError, match="deadline"):
+                # wait_for: on the unfixed code this never returns, so bound
+                # the test itself rather than hanging the suite.
+                await asyncio.wait_for(client.get("/api/traces/x"), timeout=10.0)
+        elapsed = time.monotonic() - start
+
+        assert 0.9 <= elapsed < 2.0
+        # Not retryable: the deadline is for the whole logical request, so
+        # a second attempt could never fit inside it.
+        assert call_count == 1
+        assert stream.closed is True
+        assert 4 <= stream.bytes_sent <= 7
+
+    async def test_deadline_error_is_not_a_retryable_timeout(self) -> None:
+        """A subclass of httpx.TimeoutException would be matched by the
+        connect/timeout retry predicate and re-sent; the deadline error must
+        be a sibling, like ResponseTooLargeError."""
+        error = BackendDeadlineExceededError("x")
+
+        assert isinstance(error, httpx.TransportError)
+        assert not isinstance(error, httpx.TimeoutException)
+
+    async def test_normal_response_under_the_deadline_is_unaffected(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"ok": True})
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), total_deadline_seconds=5.0
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True}
+
+    async def test_slow_connect_phase_is_cut_at_the_deadline(self) -> None:
+        """The deadline also covers the time before any header arrives."""
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            await asyncio.sleep(10.0)
+            return httpx.Response(200)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), total_deadline_seconds=0.5
+        )
+
+        start = time.monotonic()
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            with pytest.raises(BackendDeadlineExceededError):
+                await asyncio.wait_for(client.get("/health"), timeout=10.0)
+        elapsed = time.monotonic() - start
+
+        assert 0.4 <= elapsed < 1.5
+
+    async def test_retry_sleeps_count_against_the_same_deadline(self) -> None:
+        """Three connect failures would otherwise cost 1 s + 2 s of backoff
+        on top of the attempts; the deadline cuts the retry loop itself."""
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            raise httpx.ConnectError("connection refused")
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), total_deadline_seconds=1.5
+        )
+
+        start = time.monotonic()
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            with pytest.raises(BackendDeadlineExceededError):
+                await asyncio.wait_for(client.get("/health"), timeout=10.0)
+        elapsed = time.monotonic() - start
+
+        assert 1.3 <= elapsed < 2.5
+        assert call_count == 2  # attempt 1, 1 s backoff, attempt 2, then the 2 s backoff is cut
+
+    async def test_redirect_hops_share_one_deadline_carried_in_request_extensions(
+        self,
+    ) -> None:
+        """httpx builds a fresh Request per redirect hop, so the deadline
+        cannot live on the Request object itself. It travels in
+        request.extensions, which _build_redirect_request hands to every
+        hop; this test proves BOTH that httpx (the pinned version) does so -
+        every hop sees the very same budget object - and that the chain as
+        a whole is cut at the deadline rather than each hop getting a fresh
+        one (three 0.4 s hops under a 1.0 s deadline fail on the third)."""
+        budgets_seen: list[object] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            budgets_seen.append(request.extensions.get(_REQUEST_BUDGET_EXTENSION))
+            await asyncio.sleep(0.4)
+            if request.url.path == "/a":
+                return httpx.Response(302, headers={"Location": "http://backend.test/b"})
+            if request.url.path == "/b":
+                return httpx.Response(302, headers={"Location": "http://backend.test/c"})
+            return httpx.Response(200, json={"ok": True})
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler),
+            allowed_host="backend.test",
+            total_deadline_seconds=1.0,
+        )
+
+        start = time.monotonic()
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            with pytest.raises(BackendDeadlineExceededError):
+                await asyncio.wait_for(client.get("/a"), timeout=10.0)
+        elapsed = time.monotonic() - start
+
+        assert 0.9 <= elapsed < 1.3
+        assert len(budgets_seen) == 3
+        assert budgets_seen[0] is not None
+        assert all(budget is budgets_seen[0] for budget in budgets_seen)
+
+    async def test_transport_without_a_deadline_behaves_as_before(self) -> None:
+        """Test-convenience shape, same as allowed_host: no deadline unless
+        one is configured; BaseBackend._create_transport always configures
+        one (see test_backend_clients_derive_the_deadline_from_the_timeout)."""
+        stream = _TrickleStream(interval_seconds=0.05)
+        served = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal served
+            served += 1
+            if served == 1:
+                return httpx.Response(200, json={"ok": True})
+            return httpx.Response(200, stream=stream)
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+        assert transport._total_deadline_seconds is None
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            assert (await client.get("/health")).json() == {"ok": True}
+            with pytest.raises(asyncio.TimeoutError):
+                # Unbounded by the transport: only the test's own guard ends it.
+                await asyncio.wait_for(client.get("/trickle"), timeout=0.5)
+
+    @pytest.mark.parametrize(
+        ("timeout", "expected"),
+        [(5.0, 30.0), (7.5, 30.0), (30.0, 120.0), (100.0, 400.0), (None, 30.0)],
+    )
+    def test_request_deadline_is_four_timeouts_with_a_30_s_floor(
+        self, timeout: float | None, expected: float
+    ) -> None:
+        assert request_deadline_seconds(timeout) == expected
+
+    @pytest.mark.parametrize(
+        "backend",
+        [
+            JaegerBackend(url="https://backend.example:16686", timeout=5.0),
+            DatadogBackend(url="https://backend.example", api_key="k", app_key="a", timeout=5.0),
+            NewRelicBackend(
+                url="https://backend.example/graphql", api_key="k", account_id="1", timeout=5.0
+            ),
+            HoneycombBackend(url="https://backend.example", api_key="k", dataset="d", timeout=5.0),
+        ],
+        ids=["base", "datadog", "newrelic", "honeycomb"],
+    )
+    def test_backend_clients_derive_the_deadline_from_the_timeout(
+        self, backend: BaseBackend
+    ) -> None:
+        """BACKEND_TIMEOUT is the only knob: every backend's client, vendor
+        overrides included, hands the derived deadline to the transport."""
+        client = backend.client
+
+        assert isinstance(client._transport, _RetryingTransport)
+        assert client._transport._total_deadline_seconds == 30.0

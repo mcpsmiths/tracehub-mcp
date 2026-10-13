@@ -1,5 +1,6 @@
 """Abstract base backend for OpenTelemetry trace storage systems."""
 
+import asyncio
 import functools
 import logging
 import time
@@ -175,11 +176,87 @@ class ResponseTooLargeError(httpx.TransportError):
     """
 
 
+# The wall-clock deadline for one LOGICAL backend request - connect, every
+# retry attempt and the sleep before it, every redirect hop and the whole
+# body read - derived from the operator's BACKEND_TIMEOUT as
+# max(_MIN_REQUEST_DEADLINE_SECONDS, _REQUEST_DEADLINE_TIMEOUT_MULTIPLIER x
+# timeout). httpx's timeout is per SOCKET OPERATION (connect, one read, one
+# write), so without this a backend that completes every operation just
+# inside BACKEND_TIMEOUT - one body byte every 2 s under a 5 s timeout, far
+# below the decoded-size cap - holds a tool call, and with the query cache
+# every coalesced caller, indefinitely (302.5 s in the runtime probe, ended
+# only by killing the backend). Four timeouts cover the worst legitimate
+# shape the retry policy allows (three attempts plus the 10 s retry budget)
+# with room for a slow body; the floor keeps a small BACKEND_TIMEOUT from
+# cutting a large but healthy response. No separate knob: raising
+# BACKEND_TIMEOUT raises this proportionally.
+_REQUEST_DEADLINE_TIMEOUT_MULTIPLIER = 4
+_MIN_REQUEST_DEADLINE_SECONDS = 30.0
+# request.extensions key under which _RetryingTransport keeps the per-logical-
+# request _RequestBudget. httpx builds a fresh Request for every redirect hop
+# but passes `extensions=request.extensions` to it (_build_redirect_request,
+# pinned by tests/test_base_backend.py), so the budget object - not a copy -
+# reaches every hop; a retried attempt reuses the same Request outright.
+_REQUEST_BUDGET_EXTENSION = "tracehub_request_budget"
+
+
+def request_deadline_seconds(timeout: float | None) -> float:
+    """The total deadline for one logical backend request, derived from the
+    backend's per-operation `timeout` (BACKEND_TIMEOUT): four timeouts, and
+    never below 30 s. See _REQUEST_DEADLINE_TIMEOUT_MULTIPLIER."""
+    if timeout is None:
+        return _MIN_REQUEST_DEADLINE_SECONDS
+    return max(_MIN_REQUEST_DEADLINE_SECONDS, _REQUEST_DEADLINE_TIMEOUT_MULTIPLIER * float(timeout))
+
+
+class BackendDeadlineExceededError(httpx.TransportError):
+    """Raised when one logical backend request (all attempts, redirect hops
+    and the body read together) has not completed within the transport's
+    total deadline. A sibling of httpx.TimeoutException on purpose, not a
+    subclass: the retry predicate re-sends TimeoutExceptions, and no second
+    attempt can fit inside a deadline that has already passed.
+    """
+
+
+class _RequestBudget:
+    """What one LOGICAL backend request has left, shared by every attempt
+    and redirect hop of that request via request.extensions (see
+    _REQUEST_BUDGET_EXTENSION). `deadline` is a time.monotonic() instant,
+    or None for a transport built without a total deadline."""
+
+    __slots__ = ("deadline",)
+
+    def __init__(self, deadline: float | None) -> None:
+        self.deadline = deadline
+
+    def remaining_seconds(self) -> float | None:
+        """Seconds left before the deadline (None = unbounded). Raises
+        BackendDeadlineExceededError once the deadline has passed, so a
+        caller about to start another await never does so with no budget."""
+        if self.deadline is None:
+            return None
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise _deadline_exceeded()
+        return remaining
+
+
+def _deadline_exceeded() -> BackendDeadlineExceededError:
+    return BackendDeadlineExceededError(
+        "Backend request did not complete within its total deadline "
+        f"({_REQUEST_DEADLINE_TIMEOUT_MULTIPLIER} x BACKEND_TIMEOUT, at least "
+        f"{_MIN_REQUEST_DEADLINE_SECONDS:.0f} s, covering every retry, redirect hop "
+        "and the body read); giving up"
+    )
+
+
 class _BoundedResponse(httpx.Response):
     """The response _RetryingTransport hands back to httpx: the wrapped
     transport's status, headers, body stream and extensions, with an
     aiter_bytes() that counts DECODED bytes and raises ResponseTooLargeError
-    once the running total passes the cap.
+    once the running total passes the cap, and that gives up with
+    BackendDeadlineExceededError when the logical request's deadline passes
+    between two chunks (a body trickling in below the read timeout).
 
     httpx (~=0.28) reads every non-stream response - and every redirect hop
     it follows - through Response.aread(), which is implemented over
@@ -188,7 +265,9 @@ class _BoundedResponse(httpx.Response):
     the expansion of a single raw chunk, never by the whole body.
     """
 
-    def __init__(self, inner: httpx.Response, max_response_bytes: int) -> None:
+    def __init__(
+        self, inner: httpx.Response, max_response_bytes: int, budget: _RequestBudget
+    ) -> None:
         super().__init__(
             inner.status_code,
             headers=inner.headers,
@@ -196,14 +275,37 @@ class _BoundedResponse(httpx.Response):
             extensions=inner.extensions,
         )
         self._max_response_bytes = max_response_bytes
+        self._budget = budget
 
     async def aiter_bytes(self, chunk_size: int | None = None) -> AsyncIterator[bytes]:
         decoded_total = 0
-        async for chunk in super().aiter_bytes(chunk_size):
-            decoded_total += len(chunk)
-            if decoded_total > self._max_response_bytes:
+        chunks = super().aiter_bytes(chunk_size)
+        while True:
+            # Each wait for the next chunk is capped at the time left on the
+            # logical request, not at httpx's per-read timeout: a backend
+            # pacing its bytes just inside the read timeout keeps every
+            # individual read "healthy" while the request as a whole never
+            # ends. The expired scope is the only TimeoutError converted
+            # here; any other one is somebody else's and propagates as is.
+            try:
+                remaining = self._budget.remaining_seconds()
+            except BackendDeadlineExceededError:
+                await self.aclose()
+                raise
+            try:
+                async with asyncio.timeout(remaining) as scope:
+                    chunk = await anext(chunks)
+            except StopAsyncIteration:
+                break
+            except TimeoutError:
+                if not scope.expired():
+                    raise
                 # Release the pooled connection now rather than leaving the
                 # half-read body to the client's own exception handling.
+                await self.aclose()
+                raise _deadline_exceeded() from None
+            decoded_total += len(chunk)
+            if decoded_total > self._max_response_bytes:
                 await self.aclose()
                 raise ResponseTooLargeError(
                     f"Backend response exceeded {self._max_response_bytes} decoded bytes "
@@ -296,6 +398,7 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         slow_request_threshold_ms: float | None = None,
         allowed_host: str | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        total_deadline_seconds: float | None = None,
     ) -> None:
         """Wrap an underlying transport (defaults to a fresh AsyncHTTPTransport).
 
@@ -315,11 +418,35 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
                 Content-Length is refused before the body is read; a body
                 that decodes past the cap raises ResponseTooLargeError
                 mid-read (see _BoundedResponse).
+            total_deadline_seconds: If set, the wall-clock budget for one
+                LOGICAL request - connect, every retry attempt and sleep,
+                every redirect hop and the whole body read - after which
+                BackendDeadlineExceededError is raised wherever the request
+                happens to be. Every backend's `client` sets it from
+                request_deadline_seconds(timeout).
         """
         self._wrapped = wrapped if wrapped is not None else httpx.AsyncHTTPTransport()
         self._slow_request_threshold_ms = slow_request_threshold_ms
         self._allowed_host = allowed_host.lower() if allowed_host is not None else None
         self._max_response_bytes = max_response_bytes
+        self._total_deadline_seconds = total_deadline_seconds
+
+    def _budget_for(self, request: httpx.Request) -> _RequestBudget:
+        """The logical request's budget: created on the first hop of a
+        request (the clock starts here), found again on every retry (same
+        Request) and redirect hop (same extensions, see
+        _REQUEST_BUDGET_EXTENSION). No backend reuses a Request object
+        across logical requests, so a stale budget is never inherited."""
+        budget = request.extensions.get(_REQUEST_BUDGET_EXTENSION)
+        if not isinstance(budget, _RequestBudget):
+            deadline = (
+                None
+                if self._total_deadline_seconds is None
+                else time.monotonic() + self._total_deadline_seconds
+            )
+            budget = _RequestBudget(deadline)
+            request.extensions[_REQUEST_BUDGET_EXTENSION] = budget
+        return budget
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         """Delegate to the wrapped transport, retrying up to 3 total attempts
@@ -327,8 +454,13 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         header when present and no larger than that same 10 s ceiling) on
         connect/timeout failures or a 429 rate-limit response. A 429 whose
         Retry-After exceeds the ceiling is returned after the current attempt
-        with no retry sleep - the backend may not park this process.
+        with no retry sleep - the backend may not park this process. The
+        whole logical request - this hop's attempts and sleeps, the hops
+        before and after it, and the body read - shares one total deadline
+        (total_deadline_seconds), after which BackendDeadlineExceededError
+        is raised instead of waiting on the backend any longer.
         """
+        budget = self._budget_for(request)
         # httpx re-invokes handle_async_request on every redirect hop when
         # follow_redirects=True, so these checks - run before every attempt,
         # including redirect targets - apply to every backend regardless of
@@ -386,7 +518,15 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         )
         start = time.perf_counter()
         try:
-            response: httpx.Response = await retrying(_send)
+            # The deadline scope wraps the attempts AND tenacity's sleeps
+            # between them: the retry sleep runs here in the transport,
+            # outside every httpx timeout, so this is the only bound on it.
+            async with asyncio.timeout(budget.remaining_seconds()) as deadline_scope:
+                response: httpx.Response = await retrying(_send)
+        except TimeoutError:
+            if not deadline_scope.expired():
+                raise
+            raise _deadline_exceeded() from None
         except RetryError as exc:
             # reraise=True only converts RetryError into the *original*
             # exception when the last attempt failed with one. A 429 is a
@@ -423,7 +563,7 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
                 f"Backend response declared Content-Length {shown}, above the "
                 f"{self._max_response_bytes}-byte BACKEND_MAX_RESPONSE_BYTES cap"
             )
-        response = _BoundedResponse(response, self._max_response_bytes)
+        response = _BoundedResponse(response, self._max_response_bytes, budget)
         if self._slow_request_threshold_ms is not None:
             duration_ms = (time.perf_counter() - start) * 1000
             if duration_ms > self._slow_request_threshold_ms:
@@ -544,6 +684,7 @@ class BaseBackend(ABC):
             slow_request_threshold_ms=self.slow_request_threshold_ms,
             allowed_host=httpx.URL(self.url).host,
             max_response_bytes=self.max_response_bytes,
+            total_deadline_seconds=request_deadline_seconds(self.timeout),
         )
 
     @abstractmethod
