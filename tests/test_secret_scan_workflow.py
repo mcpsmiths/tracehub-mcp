@@ -104,11 +104,18 @@ def test_whole_history_job_scans_every_commit_with_the_custom_detector() -> None
     assert version == _uses_line_annotation(str(step["uses"])), (version, step["uses"])
 
 
-def test_diff_job_keeps_verified_unknown_and_loads_the_custom_detector() -> None:
+def test_diff_job_reports_unverified_excludes_uri_and_loads_the_custom_detector() -> None:
     diff_job, _ = _jobs_by_role()
     assert _checkout_step(diff_job)["with"]["fetch-depth"] == 0
     extra = str(_trufflehog_step(diff_job)["with"]["extra_args"])
-    assert "--results=verified,unknown" in extra and "unverified" not in extra, extra
+    # `unverified` must be present: a custom detector without a verify block
+    # only ever yields unverified results, so without it the Traceloop
+    # detector could never fail a pull request (checked empirically with
+    # trufflehog 3.97.9 against a fake tl_ key). The generic URI detector is
+    # excluded because dummy `user:pass@host.test` fixtures in tests and
+    # commit bodies are unverifiable and would fail every PR.
+    assert "--results=verified,unknown,unverified" in extra, extra
+    assert "--exclude-detectors=URI" in extra, extra
     assert "--config .trufflehog.yaml" in extra, extra
 
 

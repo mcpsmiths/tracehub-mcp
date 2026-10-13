@@ -7,8 +7,9 @@
 # uses for the pre-commit hook; tests/test_secret_scan_workflow.py asserts both.
 #
 # No `verify` block: Traceloop's API must never be presented with a candidate
-# key from CI, so every hit is reported as UNVERIFIED - the scheduled job
-# therefore runs with `--results=verified,unknown,unverified`.
+# key from CI, so every hit is reported as UNVERIFIED - both workflow jobs
+# therefore run with `--results=verified,unknown,unverified` (and exclude the
+# generic URI detector, see secret-scan.yml).
 #
 # Local control (needs docker + network, never run in tests):
 #   docker run --rm -v "$PWD:/repo" trufflesecurity/trufflehog:3.97.9 \
