@@ -294,6 +294,20 @@ def _uvicorn_access_record(target: str, status: int = 401) -> logging.LogRecord:
     )
 
 
+def _rendered_access_record(line: str) -> logging.LogRecord:
+    """An access record whose line is already formatted (args consumed), as a
+    differently configured access logger may hand it over."""
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg=line,
+        args=None,
+        exc_info=None,
+    )
+
+
 class TestAccessLogQueryStringFilter:
     """uvicorn's access log writes the full request target, so a bearer token
     a client put in the query string (?access_token=...) landed verbatim in
@@ -359,6 +373,66 @@ class TestAccessLogQueryStringFilter:
         )
 
         assert AccessLogQueryStringFilter().filter(record) is True
+
+    def test_a_64_kib_adversarial_pre_rendered_line_is_dropped_in_linear_time(self) -> None:
+        """Round-2 review of this filter: the regex fallback was quadratic -
+        16 KiB of "?" with no " HTTP/" took 2.2 s, in the logging caller.
+        The fallback is a linear scan, and a line longer than 8 KiB is not a
+        request line any HTTP parser accepted, so it is dropped outright and
+        nothing in it - this dummy included - can reach a handler."""
+        record = _rendered_access_record("?" * (64 * 1024) + f"?token={QUERY_DUMMY}")
+
+        start = time.perf_counter()
+        kept = AccessLogQueryStringFilter().filter(record)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.05, elapsed
+        assert kept is False
+
+    def test_a_pre_rendered_line_over_the_bound_is_dropped_with_its_query_string(self) -> None:
+        line = f'127.0.0.1:1 - "GET /mcp?token={QUERY_DUMMY}&pad={"a" * 9000} HTTP/1.1" 401'
+        record = _rendered_access_record(line)
+
+        assert AccessLogQueryStringFilter().filter(record) is False
+
+    def test_a_pre_rendered_line_at_the_bound_is_still_rewritten(self) -> None:
+        prefix = f'127.0.0.1:1 - "GET /mcp?token={QUERY_DUMMY}&pad='
+        suffix = ' HTTP/1.1" 401'
+        line = prefix + "a" * (8 * 1024 - len(prefix) - len(suffix)) + suffix
+        assert len(line) == 8 * 1024
+        record = _rendered_access_record(line)
+
+        assert AccessLogQueryStringFilter().filter(record) is True
+        assert record.getMessage() == '127.0.0.1:1 - "GET /mcp HTTP/1.1" 401'
+
+    def test_many_question_marks_under_the_bound_are_scanned_once(self) -> None:
+        """8 KiB of "?" with no " HTTP/" after it: nothing to cut, kept as is,
+        and still fast - the old regex re-scanned the line from every "?"."""
+        record = _rendered_access_record("?" * (8 * 1024))
+
+        start = time.perf_counter()
+        kept = AccessLogQueryStringFilter().filter(record)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 0.05, elapsed
+        assert kept is True
+        assert record.getMessage() == "?" * (8 * 1024)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            '127.0.0.1:1 - "GET /mcp HTTP/1.1" 200',  # no "?" at all
+            '127.0.0.1:1 - "GET /mcp HTTP/1.1" 401 ?trailing',  # no whitespace after the "?"
+            '127.0.0.1:1 - "GET /mcp?x=1 y" 401',  # whitespace, but no "HTTP/" after it
+            "127.0.0.1:1 - ?x=1   ",  # whitespace to the end of the line
+        ],
+        ids=["no-query", "no-whitespace", "no-http-after", "whitespace-to-end"],
+    )
+    def test_a_question_mark_outside_the_request_line_is_left_alone(self, line: str) -> None:
+        record = _rendered_access_record(line)
+
+        assert AccessLogQueryStringFilter().filter(record) is True
+        assert record.getMessage() == line
 
 
 class TestUvicornConfigAccessLog:

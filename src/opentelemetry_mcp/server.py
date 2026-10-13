@@ -2072,11 +2072,37 @@ def _build_http_app(
     )
 
 
-# A request target's query string inside the quoted request line of an
-# already-rendered access-log message ('... "POST /mcp?x=1 HTTP/1.1" 401'):
-# the target can contain no whitespace, so the first whitespace followed by
-# "HTTP/" ends it.
-_ACCESS_LOG_TARGET_QUERY_RE = re.compile(r"\?\S*(?=\s+HTTP/)")
+# Longest already-rendered access line AccessLogQueryStringFilter rewrites.
+# uvicorn's own five-tuple records never reach this path (and their target is
+# bounded by h11's request-line limit); a differently configured access
+# logger that hands over a longer pre-rendered line is not logging a request
+# line any HTTP parser accepted, so the record is dropped rather than scanned.
+_MAX_ACCESS_LOG_LINE_CHARS = 8 * 1024
+_WHITESPACE_RE = re.compile(r"\s")
+_NON_WHITESPACE_RE = re.compile(r"\S")
+
+
+def _cut_rendered_target_query(message: str) -> str:
+    """`message` with the query string of its quoted request line removed
+    ('... "POST /mcp?x=1 HTTP/1.1" 401' -> '... "POST /mcp HTTP/1.1" 401'):
+    the first "?" that is followed, with no whitespace in between, by
+    whitespace and "HTTP/" - a target contains no whitespace, so that is
+    where it ends. Only the first "?" is considered (in an access line it
+    can only sit in the target), and every step - find the "?", find the
+    next whitespace, skip it - advances, so the cost is linear in the line.
+    The regex this replaces, r"\\?\\S*(?=\\s+HTTP/)", re-scanned the rest of
+    the line from every "?" and took 2.2 s on 16 KiB of "?" with no " HTTP/"
+    (round-2 review of the filter). Anything else is returned unchanged."""
+    query_start = message.find("?")
+    if query_start == -1:
+        return message
+    whitespace = _WHITESPACE_RE.search(message, query_start)
+    if whitespace is None:
+        return message
+    after_whitespace = _NON_WHITESPACE_RE.search(message, whitespace.start())
+    if after_whitespace is None or not message.startswith("HTTP/", after_whitespace.start()):
+        return message
+    return message[:query_start] + message[whitespace.start() :]
 
 
 class AccessLogQueryStringFilter(logging.Filter):
@@ -2098,29 +2124,39 @@ class AccessLogQueryStringFilter(logging.Filter):
     (client_addr, method, target, http_version, status); its
     AccessFormatter unpacks ``record.args`` positionally, so the target is
     replaced inside a same-shaped tuple rather than by pre-rendering the
-    message. Any other record shape is stripped on the rendered text.
-    Never raises: a logger-level filter runs inside the logging caller
-    (uvicorn's protocol code), where an exception would abort the request.
+    message. Any other record shape is stripped on the rendered text by a
+    linear scan (_cut_rendered_target_query), and a rendered line longer
+    than _MAX_ACCESS_LOG_LINE_CHARS is dropped instead - no request line
+    that long was ever accepted by an HTTP parser, and the filter runs in
+    the logging caller, so it spends neither time nor output on one. Never
+    raises: a logger-level filter runs inside the logging caller (uvicorn's
+    protocol code), where an exception would abort the request; a record
+    the filter cannot read passes through unmodified.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        with suppress(Exception):
-            self._strip_query_string(record)
-        return True
+        try:
+            return self._strip_query_string(record)
+        except Exception:
+            return True
 
     @staticmethod
-    def _strip_query_string(record: logging.LogRecord) -> None:
+    def _strip_query_string(record: logging.LogRecord) -> bool:
+        """True to keep the (possibly rewritten) record, False to drop it."""
         args = record.args
         if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
             target = args[2]
             if "?" in target:
                 record.args = (*args[:2], target.partition("?")[0], *args[3:])
-            return
+            return True
         message = record.getMessage()
-        stripped = _ACCESS_LOG_TARGET_QUERY_RE.sub("", message)
+        if len(message) > _MAX_ACCESS_LOG_LINE_CHARS:
+            return False
+        stripped = _cut_rendered_target_query(message)
         if stripped != message:
             record.msg = stripped
             record.args = None
+        return True
 
 
 _ACCESS_LOG_QUERY_FILTER = AccessLogQueryStringFilter()
