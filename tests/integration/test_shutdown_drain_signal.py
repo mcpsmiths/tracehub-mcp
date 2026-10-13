@@ -141,13 +141,20 @@ class TestShutdownDrainSignal:
             client = Client(transport)
             await client.__aenter__()  # type: ignore[no-untyped-call]
             try:
-                # Fire the call and hand control back immediately (no
-                # await here) so SIGTERM below is provably sent while the
-                # 1.5s-delayed backend call is genuinely in flight, not
-                # after it already returned.
+                # Fire the call without awaiting it, then wait until the stub is
+                # inside its 1.5 s-delayed /api/traces handler before sending
+                # SIGTERM, so the backend call is provably in flight at the signal.
+                # Signalling right after ensure_future() only *scheduled* the call:
+                # the POST left when this coroutine next yielded, and on a slow CI
+                # runner that was after uvicorn had already closed the idle
+                # keep-alive connection, so the call never reached the backend and
+                # "/api/traces" never appeared (reproduced locally by blocking this
+                # task for 0.5 s after the signal).
                 call_task = asyncio.ensure_future(
                     client.call_tool("search_traces", {"service_name": "stub-service", "limit": 5})
                 )
+                in_flight = await asyncio.to_thread(slow_backend.traces_started.wait, 5.0)
+                assert in_flight, "the backend never received /api/traces within 5 s"
                 proc.send_signal(signal.SIGTERM)
                 sigterm_sent_at = time.monotonic()
                 # See module docstring: the connection-closure interaction
