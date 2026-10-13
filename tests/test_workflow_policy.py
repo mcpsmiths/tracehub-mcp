@@ -15,6 +15,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -651,6 +653,53 @@ def test_mcp_registry_asserts_identity_and_tag_before_publishing() -> None:
         assert_run
     )
     assert steps[assert_idx].get("env", {}).get("NEW_VERSION") == "${{ inputs.version }}"
+
+
+def _embedded_python(run: str) -> str:
+    """The body of the one `python3 - ... <<'PY' ... PY` heredoc in a run script."""
+    lines = run.splitlines()
+    start = _step_index(lines, lambda line: "<<'PY'" in line) + 1
+    end = _step_index(lines, lambda line: line.strip() == "PY")
+    return textwrap.dedent("\n".join(lines[start:end]))
+
+
+def _replay_version_guard(tmp_path: Path, run: str, declared: str, version: str) -> tuple[int, str]:
+    (tmp_path / "pyproject.toml").write_text(
+        f'[project]\nname = "tracehub-mcp"\nversion = "{declared}"\n', encoding="utf-8"
+    )
+    proc = subprocess.run(  # noqa: S603 - replaying our own workflow step under test
+        [sys.executable, "-I", "-", version],
+        input=_embedded_python(run),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode, proc.stdout
+
+
+def test_mcp_registry_guard_cross_checks_the_tree_version_before_the_sync(
+    tmp_path: Path,
+) -> None:
+    """The tag guard alone accepts a tag v0.12.8 that points at the 0.12.3
+    tree (runtime verification T7 fix7-8/02, case R5 exit 0, where
+    docker-publish's D5 failed), and because the jq sync rewrites both
+    server.json version fields to the input before check_server_json runs,
+    the version clause there is self-fulfilling. The guard must therefore
+    compare pyproject.toml's version with the tag BEFORE the sync, exactly
+    like docker-publish.yml's guard, and fail with a ::error:: annotation."""
+    steps = _publish_mcp_steps()
+    guard_idx = _step_index(steps, lambda s: "refs/tags/v${NEW_VERSION}^{commit}" in _run(s))
+    sync_idx = _step_index(steps, lambda s: ".packages[0].version = $v" in _run(s))
+    assert guard_idx < sync_idx
+    guard = _run(steps[guard_idx])
+    assert "pyproject.toml" in guard and "::error::" in guard, guard
+    assert steps[guard_idx].get("env", {}).get("NEW_VERSION") == "${{ inputs.version }}"
+
+    code, out = _replay_version_guard(tmp_path, guard, declared="0.12.3", version="0.12.8")
+    assert code == 1 and "::error::pyproject.toml declares 0.12.3" in out, (code, out)
+    code, out = _replay_version_guard(tmp_path, guard, declared="0.12.8", version="0.12.8")
+    assert code == 0 and out == "", (code, out)
 
 
 def test_mcp_registry_pypi_poll_targets_the_asserted_identifier() -> None:

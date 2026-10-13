@@ -7,7 +7,8 @@ name: Publish to MCP Registry
 # that may publish under the namespace. The job therefore (1) runs under the
 # `release` environment (deployment-branch policy: main; evaluated against
 # the caller's ref on the workflow_call path), (2) checks out exactly
-# refs/tags/v<version> and verifies HEAD is that tag's commit, and
+# refs/tags/v<version>, verifies HEAD is that tag's commit and that the
+# tree's own pyproject.toml version is <version>, and
 # (3) asserts server.json's identity (name, single pypi package named
 # tracehub-mcp, both version fields) with scripts/check_server_json.py
 # before anything is published - so the entry for version X is always tag
@@ -77,6 +78,14 @@ jobs:
           fi
 
       - name: Verify checkout is the release tag
+        # Fails closed if HEAD is not the commit behind refs/tags/v<version>,
+        # and if the tree's own version string disagrees with the tag it was
+        # named by - the same guard docker-publish.yml applies. The second
+        # check has to live HERE, before the jq sync below: the sync rewrites
+        # both server.json version fields to the input, so check_server_json's
+        # version clause can only ever agree with it, and a tag v0.12.8
+        # pointing at the 0.12.3 tree would otherwise reach the publish step
+        # with only the PyPI poll left to notice.
         env:
           NEW_VERSION: ${{ inputs.version }}
         run: |
@@ -84,6 +93,14 @@ jobs:
             echo "::error::HEAD is not tag v${NEW_VERSION}"
             exit 1
           fi
+          python3 - "$NEW_VERSION" <<'PY'
+          import sys, tomllib
+          with open("pyproject.toml", "rb") as f:
+              declared = tomllib.load(f)["project"]["version"]
+          if declared != sys.argv[1]:
+              print(f"::error::pyproject.toml declares {declared}, release tag is v{sys.argv[1]}")
+              sys.exit(1)
+          PY
 
       - name: Sync server.json version (in-workspace only, not committed)
         env:
