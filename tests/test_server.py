@@ -276,7 +276,7 @@ class TestBackendUrlNeverLoggedWithUserinfo:
 
         (line,) = [r.message for r in caplog.records if r.message.startswith("Initializing")]
         assert self.MARKER not in line
-        assert "https://h.test/" in line
+        assert line.rpartition(": ")[2] == "https://h.test/"
 
     async def test_secondary_health_log_is_redacted(self, caplog: pytest.LogCaptureFixture) -> None:
         server._config = _config()
@@ -2409,5 +2409,5 @@ class TestConfigErrorsNeverEchoUserinfo:
 
         assert result.exit_code == 0, result.output
         (line,) = [r.message for r in caplog.records if "connected to:" in r.message]
-        assert "https://h.test/" in line
+        assert line.rpartition("connected to: ")[2] == "https://h.test/"
         assert self.MARKER not in line

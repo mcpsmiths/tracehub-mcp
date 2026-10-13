@@ -230,7 +230,9 @@ class TestUserinfoInBackendUrl:
             BackendConfig(type="jaeger", url=HttpUrl("http://example.com:16686/some/path?k=v"))
 
         (record,) = [r for r in caplog.records if "plain HTTP" in r.message]
-        assert "example.com" in record.message
+        assert record.message.startswith(
+            "BACKEND_URL host 'example.com' is reached over plain HTTP"
+        )
         assert "/some/path" not in record.message
         assert "k=v" not in record.message
 
