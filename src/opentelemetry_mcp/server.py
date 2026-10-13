@@ -1646,22 +1646,42 @@ def _parse_csv_option(value: str | None) -> list[str] | None:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _canonical_hostname(host: str) -> str:
+    """One normal form per name so the allowlist and the Host header compare
+    equal however each was spelled: one trailing dot (the FQDN spelling)
+    removed, and an IPv6 literal in its RFC 5952 compressed form. Before
+    this, is_loopback_host accepted ``localhost.`` while an allowlisted
+    ``verify.local`` rejected ``verify.local.``, and an allowlisted IPv6
+    literal was compared as text, so its expanded spelling answered 421
+    (runtime verification prober-1 F7). IPv4 spellings are deliberately
+    not canonicalised: ``127.1`` / ``0x7f000001`` stay refused."""
+    if host.endswith("."):
+        host = host[:-1]
+    if ":" in host:
+        with suppress(ValueError):
+            return str(ipaddress.IPv6Address(host))
+    return host
+
+
 def _hostname_from_host_header(value: str) -> str:
-    """Lower-cased host part of a Host header value: ``[v6]:port`` -> ``v6``,
-    ``name:port`` -> ``name``, a missing/blank header -> ``""``."""
+    """Lower-cased, canonical (see _canonical_hostname) host part of a Host
+    header value: ``[v6]:port`` -> ``v6``, ``name:port`` -> ``name``, a
+    missing/blank header -> ``""``. Used for the allowlist entries and the
+    bound address as well as for every request, so both sides of the
+    comparison take the same path."""
     value = value.strip().lower()
     if not value:
         return ""
     if value.startswith("["):
         end = value.find("]")
-        return value[1:end] if end != -1 else value[1:]
+        return _canonical_hostname(value[1:end] if end != -1 else value[1:])
     if value.count(":") > 1:
         # Bare IPv6 literal (not valid in a Host header, but never a port).
-        return value
+        return _canonical_hostname(value)
     host, _, port = value.rpartition(":")
     if host and port.isdigit():
-        return host
-    return value
+        return _canonical_hostname(host)
+    return _canonical_hostname(value)
 
 
 def _is_unspecified_address(hostname: str) -> bool:

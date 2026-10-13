@@ -224,3 +224,57 @@ class TestRejectionLogging:
             client.get("/", headers={"host": "attacker.example:8000"})
 
         assert "Unexpected Host header: 'attacker.example:8000'" in caplog.text
+
+
+class TestHostAllowlistNormalisation:
+    """Prober-1 F7: a trailing dot was stripped for loopback names
+    ('localhost.' -> 200, via is_loopback_host) but not for allowlisted
+    names ('verify.local.' -> 421), and an allowlisted IPv6 literal was
+    compared as a string, so its expanded spelling answered 421. Both sides
+    now go through the same normalisation: one trailing dot removed and
+    IPv6 literals in their RFC 5952 compressed form."""
+
+    def test_trailing_dot_fqdn_spelling_matches_an_allowlisted_name(self) -> None:
+        client = _build_client(bind_host=ALL_INTERFACES, allowed_hosts=["verify.local"])
+
+        assert client.get("/", headers={"host": "verify.local.:8000"}).status_code == 200
+        assert client.get("/", headers={"host": "Verify.Local."}).status_code == 200
+        # Only one trailing dot is the FQDN spelling; more is not a name.
+        assert client.get("/", headers={"host": "verify.local.."}).status_code == 421
+
+    def test_allowlist_entry_with_a_trailing_dot_matches_the_bare_name(self) -> None:
+        client = _build_client(bind_host=ALL_INTERFACES, allowed_hosts=["verify.local."])
+
+        assert client.get("/", headers={"host": "verify.local:8000"}).status_code == 200
+
+    def test_loopback_trailing_dot_still_passes(self) -> None:
+        client = _build_client(bind_host="127.0.0.1")
+
+        assert client.get("/", headers={"host": "localhost.:8000"}).status_code == 200
+
+    def test_every_spelling_of_an_allowlisted_ipv6_literal_matches(self) -> None:
+        client = _build_client(bind_host=ALL_INTERFACES, allowed_hosts=["[2001:db8::1]:8443"])
+
+        for host in (
+            "[2001:db8::1]:8000",
+            "[2001:0db8:0000:0000:0000:0000:0000:0001]:8000",
+            "[2001:DB8:0:0:0:0:0:1]",
+            "[2001:db8:0:0::1]",
+        ):
+            assert client.get("/", headers={"host": host}).status_code == 200, host
+        assert client.get("/", headers={"host": "[2001:db8::2]:8000"}).status_code == 421
+
+    def test_expanded_allowlist_entry_matches_the_compressed_header(self) -> None:
+        client = _build_client(
+            bind_host=ALL_INTERFACES, allowed_hosts=["[2001:0db8:0000:0000:0000:0000:0000:0001]"]
+        )
+
+        assert client.get("/", headers={"host": "[2001:db8::1]:8000"}).status_code == 200
+
+    def test_hostname_from_host_header_normalises_both_shapes(self) -> None:
+        assert _hostname_from_host_header("Verify.Local.:8000") == "verify.local"
+        assert _hostname_from_host_header("verify.local..") == "verify.local."
+        assert _hostname_from_host_header("[2001:0DB8::0001]:80") == "2001:db8::1"
+        assert _hostname_from_host_header("2001:0db8:0:0:0:0:0:1") == "2001:db8::1"
+        # Not an address: left alone (and so never equal to a real literal).
+        assert _hostname_from_host_header("[not:an:address]") == "not:an:address"
