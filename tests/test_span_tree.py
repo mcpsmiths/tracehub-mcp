@@ -568,9 +568,9 @@ class TestParentCycleSpanIds:
         assert span_tree.parent_cycle_span_ids(tail, spans) == ["a", "b"]
 
     def test_self_parent_is_a_cycle_of_one(self) -> None:
-        loner = _span("loner", parent_span_id="loner")
+        solo = _span("solo", parent_span_id="solo")
 
-        assert span_tree.parent_cycle_span_ids(loner, [loner]) == ["loner"]
+        assert span_tree.parent_cycle_span_ids(solo, [solo]) == ["solo"]
 
     def test_walk_ending_at_a_root_or_missing_parent_is_not_a_cycle(self) -> None:
         root = _span("root")

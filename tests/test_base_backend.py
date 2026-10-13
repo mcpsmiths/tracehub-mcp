@@ -1896,7 +1896,7 @@ class TestIncrementalDecoding:
         """httpx.Response keeps the text charset in `_encoding`; the bounded
         response records the Content-Encoding under a different name so
         .text still decodes with the declared charset, not 'gzip'."""
-        body = json.dumps({"service": "caf\u00e9"}, ensure_ascii=False).encode("utf-8")
+        body = json.dumps({"service": "Z\u00fcrich"}, ensure_ascii=False).encode("utf-8")
 
         async def handler(request: httpx.Request) -> httpx.Response:
             response = _encoded_response("gzip", gzip.compress(body))
@@ -1910,7 +1910,7 @@ class TestIncrementalDecoding:
 
         assert response.encoding == "utf-8"
         assert response.text == body.decode("utf-8")
-        assert response.json() == {"service": "caf\u00e9"}
+        assert response.json() == {"service": "Z\u00fcrich"}
 
     async def test_reiterating_a_read_body_serves_the_decoded_content(self) -> None:
         """httpx callers may iterate aiter_bytes() after aread(); the bounded
