@@ -25,6 +25,17 @@
 - **security**: ship the image with FastMCP's PyPI update check off <!-- TC8 -->
 - **security**: bound and escape the exported span status description <!-- TC9 -->
 - **docs**: document the round-2 hardening and the operator-facing gaps <!-- TC10 -->
+- **security**: release a cancelled leader's slot before the finisher can be joined <!-- IF2 -->
+- **security**: scan a pre-rendered access line linearly and bound its length <!-- IF3 -->
+- **security**: accept underscores in Host allowlist hostname labels <!-- IF4 -->
+- **security**: name the option, not pydantic's validator, in configuration errors <!-- IF5 -->
+- **security**: bound the backend-chosen host in the origin-refusal text <!-- IF6 -->
+- **security**: redact a truncated authority only when its visible head carries a colon <!-- IF7 -->
+- **security**: refuse a Host header with text after an IPv6 literal's bracket <!-- IF9 -->
+
+### Refactor
+
+- **security**: remove the host-only redirect pin from _RetryingTransport <!-- IF1 -->
 
 ## v0.12.3 (2026-10-10)
 
