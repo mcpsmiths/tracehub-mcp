@@ -607,6 +607,29 @@ class TestReadyBodyCarriesOnlyAGenericErrorClass:
         assert body["list_services"] == {"error": "backend unreachable"}
         assert self.FAKE_HOST_PORT not in response.text
 
+    def test_an_empty_exception_text_falls_back_to_the_class_name(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Final verification pass: httpx.ReadTimeout("") raised inside list_services logged
+        # "list_services=error ''" and doctor printed nothing after its colon - f7864f8 had
+        # added the class-name fallback only inside the backends' health_check.
+        fake_backend = _healthy_backend()
+        fake_backend.health_check = AsyncMock(side_effect=httpx.ReadTimeout(""))
+        fake_backend.list_services = AsyncMock(side_effect=httpx.ReadTimeout(""))
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.server"):
+            response = self._ready(fake_backend)
+
+        assert response.status_code == 503
+        body = response.json()
+        assert body["health_check"] == {"status": "error", "error": "backend timeout"}
+        assert body["list_services"] == {"error": "backend timeout"}
+        [message] = [
+            r.getMessage() for r in caplog.records if "Readiness probe failed" in r.getMessage()
+        ]
+        assert "health_check=error 'ReadTimeout'" in message
+        assert "list_services=error 'ReadTimeout'" in message
+        assert "''" not in message
+
     def test_http_status_exception_names_the_status_only(self) -> None:
         fake_backend = _healthy_backend()
         request = httpx.Request("GET", f"http://{self.FAKE_HOST_PORT}/api/services")

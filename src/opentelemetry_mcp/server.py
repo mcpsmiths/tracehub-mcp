@@ -387,7 +387,9 @@ async def _get_backend() -> BaseBackend:
             if health.status != "healthy":
                 logger.warning("Backend is not healthy, but continuing...")
         except Exception as e:
-            logger.error(f"Backend health check failed: {redact_userinfo_in_text(str(e))}")
+            logger.error(
+                f"Backend health check failed: {redact_userinfo_in_text(str(e) or type(e).__name__)}"
+            )
             logger.warning("Continuing anyway, requests may fail...")
 
     return _backend
@@ -436,7 +438,7 @@ async def _get_secondary_backend() -> BaseBackend:
                 logger.warning("Secondary backend is not healthy, but continuing...")
         except Exception as e:
             logger.error(
-                f"Secondary backend health check failed: {redact_userinfo_in_text(str(e))}"
+                f"Secondary backend health check failed: {redact_userinfo_in_text(str(e) or type(e).__name__)}"
             )
             logger.warning("Continuing anyway, requests may fail...")
 
@@ -554,7 +556,10 @@ async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any
 
     Every error string is redacted HERE, not by the callers: doctor prints
     them and /ready logs them, and httpx error text embeds the request URL
-    (userinfo included) verbatim. Each failing half also carries an
+    (userinfo included) verbatim. An exception whose text is empty
+    (httpx.ReadTimeout("")) is presented by its class name, so neither half
+    can report '' - the final verification pass saw `list_services=error ''`
+    in the log and doctor print nothing after its colon. Each failing half also carries an
     "error_class" - the only error text _readiness_body copies into the
     unauthenticated /ready response.
 
@@ -578,7 +583,7 @@ async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any
     except Exception as e:
         details["health_check"] = {
             "status": "error",
-            "error": redact_userinfo_in_text(str(e)),
+            "error": redact_userinfo_in_text(str(e) or type(e).__name__),
             "error_class": _classify_backend_error(e),
         }
         all_ok = False
@@ -588,7 +593,7 @@ async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any
         details["list_services"] = {"count": len(services_found)}
     except Exception as e:
         details["list_services"] = {
-            "error": redact_userinfo_in_text(str(e)),
+            "error": redact_userinfo_in_text(str(e) or type(e).__name__),
             "error_class": _classify_backend_error(e),
         }
         all_ok = False
@@ -652,7 +657,7 @@ async def ready_route(request: Request) -> Response:
     try:
         backend = await _get_backend()
     except Exception as e:
-        detail = redact_userinfo_in_text(str(e))[:_MAX_LOGGED_PROBE_ERROR_CHARS]
+        detail = redact_userinfo_in_text(str(e) or type(e).__name__)[:_MAX_LOGGED_PROBE_ERROR_CHARS]
         logger.warning(f"Readiness probe could not obtain a backend: {detail!r}")
         return JSONResponse(
             {"status": "not_ready", "error": _classify_backend_error(e)}, status_code=503
@@ -3219,7 +3224,10 @@ def doctor(
             fg="green",
         )
     except Exception as e:
-        click.secho(f"[FAIL] Backend construction: {redact_userinfo_in_text(str(e))}", fg="red")
+        click.secho(
+            f"[FAIL] Backend construction: {redact_userinfo_in_text(str(e) or type(e).__name__)}",
+            fg="red",
+        )
         sys.exit(1)
 
     async def _run_checks() -> int:
@@ -3247,7 +3255,7 @@ def doctor(
                 )
             except Exception as e:
                 click.secho(
-                    f"[FAIL] Secondary backend construction: {redact_userinfo_in_text(str(e))}",
+                    f"[FAIL] Secondary backend construction: {redact_userinfo_in_text(str(e) or type(e).__name__)}",
                     fg="red",
                 )
                 return 1
