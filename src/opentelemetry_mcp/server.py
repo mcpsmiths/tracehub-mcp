@@ -395,6 +395,106 @@ async def _get_secondary_backend() -> BaseBackend:
     return _secondary_backend
 
 
+# GET /ready is unauthenticated and every probe costs the backend one
+# health_check plus one list_services - on Honeycomb a slot of the process-
+# wide 10/min Create Query Result budget that every session's tool calls
+# queue behind, on X-Ray up to 222 operator-paid API calls. The route
+# therefore memoizes the probe result for a window (success) or a shorter
+# one (failure, so recovery is noticed quickly), shares one in-flight check
+# between concurrent probes, and answers 503 instead of hanging on a parked
+# backend. The window matches the Dockerfile HEALTHCHECK interval;
+# READINESS_CACHE_SECONDS / --readiness-cache-seconds tunes it (0 disables
+# the memo but keeps the timeout and the single-flight).
+_READINESS_MEMO_TTL_SECONDS = 30.0
+_READINESS_FAILURE_MEMO_TTL_SECONDS = 5.0
+_READINESS_CHECK_TIMEOUT_SECONDS = 10.0
+
+_readiness_cache_seconds: float = _READINESS_MEMO_TTL_SECONDS
+_readiness_clock: Callable[[], float] = time.monotonic
+# (backend, expires_at, all_ok, details, generation). Keyed on the backend
+# object's identity so a recreated or test-patched backend invalidates it;
+# `generation` counts completed probes so a caller that queued on the lock
+# while a probe ran reuses that probe's result even when the memo window
+# is 0 (single-flight without a shared future to cancel).
+_readiness_memo: tuple[BaseBackend, float, bool, dict[str, Any], int] | None = None
+_readiness_generation = 0
+# Stored with the loop it was created in: a contended asyncio.Lock binds to
+# its loop and raises RuntimeError when re-acquired under another one (one
+# TestClient per test), so a lock from a previous loop is replaced.
+_readiness_lock: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
+
+
+def _configure_readiness_cache(
+    seconds: float, *, clock: Callable[[], float] = time.monotonic
+) -> None:
+    """Set the /ready memo window (0 disables the memo) and its clock; main()
+    applies the operator's value before the HTTP app is built."""
+    global _readiness_cache_seconds, _readiness_clock
+    _readiness_cache_seconds = seconds
+    _readiness_clock = clock
+    _reset_readiness_memo()
+
+
+def _reset_readiness_memo() -> None:
+    """Drop the memo AND the lazily created lock - tests drive /ready from a
+    fresh event loop each, and a lock contended under a previous loop
+    cannot be reused under the next one."""
+    global _readiness_memo, _readiness_lock, _readiness_generation
+    _readiness_memo = None
+    _readiness_lock = None
+    _readiness_generation = 0
+
+
+def _get_readiness_lock() -> asyncio.Lock:
+    global _readiness_lock
+    loop = asyncio.get_running_loop()
+    if _readiness_lock is None or _readiness_lock[0] is not loop:
+        _readiness_lock = (loop, asyncio.Lock())
+    return _readiness_lock[1]
+
+
+async def _run_backend_checks_memoized(backend: BaseBackend) -> tuple[bool, dict[str, Any]]:
+    """/ready's view of _run_backend_checks: at most one probe per memo
+    window per process, one in-flight probe shared by every concurrent
+    caller, and a hard deadline that turns a parked backend into a 503.
+
+    Stores and returns the details exactly as _run_backend_checks produced
+    them (already redacted there); `doctor` keeps calling the live helper.
+    """
+    global _readiness_memo, _readiness_generation
+    queued_at_generation = _readiness_generation
+    async with _get_readiness_lock():
+        memo = _readiness_memo
+        if memo is not None and memo[0] is backend:
+            _, expires_at, all_ok, details, generation = memo
+            if expires_at > _readiness_clock() or generation > queued_at_generation:
+                return all_ok, details
+
+        try:
+            async with asyncio.timeout(_READINESS_CHECK_TIMEOUT_SECONDS):
+                all_ok, details = await _run_backend_checks(backend)
+        except TimeoutError:
+            all_ok = False
+            details = {
+                "error": f"readiness check timed out after {_READINESS_CHECK_TIMEOUT_SECONDS:g} s"
+            }
+
+        ttl = (
+            _readiness_cache_seconds
+            if all_ok
+            else min(_readiness_cache_seconds, _READINESS_FAILURE_MEMO_TTL_SECONDS)
+        )
+        _readiness_generation += 1
+        _readiness_memo = (
+            backend,
+            _readiness_clock() + ttl,
+            all_ok,
+            details,
+            _readiness_generation,
+        )
+        return all_ok, details
+
+
 async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any]]:
     """Run health_check + list_services against an already-constructed
     backend. Returns (all_ok, details). The caller owns the backend's
@@ -444,7 +544,10 @@ async def health_route(request: Request) -> Response:
 async def ready_route(request: Request) -> Response:
     """Readiness - reuses the server's own cached _get_backend() instance
     (never constructs or closes a separate one, unlike `doctor`), so this
-    can never break a real tool call that shares the same backend."""
+    can never break a real tool call that shares the same backend. The
+    probe result is memoized and single-flighted by
+    _run_backend_checks_memoized because this route is unauthenticated and
+    each probe costs the backend real, budgeted work."""
     try:
         backend = await _get_backend()
     except Exception as e:
@@ -452,7 +555,7 @@ async def ready_route(request: Request) -> Response:
             {"status": "not_ready", "error": redact_userinfo_in_text(str(e))}, status_code=503
         )
 
-    all_ok, details = await _run_backend_checks(backend)
+    all_ok, details = await _run_backend_checks_memoized(backend)
     return JSONResponse(
         {"status": "ready" if all_ok else "not_ready", **details},
         status_code=200 if all_ok else 503,
@@ -1701,8 +1804,9 @@ _DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS = 1800.0
 
 
 def _require_finite_seconds(ctx: click.Context, param: click.Parameter, value: float) -> float:
-    """Option callback for --session-idle-timeout-seconds. click.FloatRange(
-    min=0, min_open=True) still admits ``inf`` (``inf > 0`` holds) and ``nan``
+    """Option callback for the duration options (--session-idle-timeout-seconds,
+    --readiness-cache-seconds). click.FloatRange(min=0, ...) still admits
+    ``inf`` (``inf > 0`` holds) and ``nan``
     (every comparison against it is False), and the mcp SDK's
     StreamableHTTPSessionManager raises ValueError for both only at lifespan
     start - the same late, cryptic 'Server error' / exit 1 the range check
@@ -2130,6 +2234,20 @@ def _backend_config_options(f: Any) -> Any:
     "RATE_LIMIT_WINDOW_SECONDS env var)",
 )
 @click.option(
+    "--readiness-cache-seconds",
+    type=click.FloatRange(min=0),
+    callback=_require_finite_seconds,
+    default=_READINESS_MEMO_TTL_SECONDS,
+    envvar="READINESS_CACHE_SECONDS",
+    help="Memoize GET /ready results for this many seconds (a failed probe "
+    f"for at most {_READINESS_FAILURE_MEMO_TTL_SECONDS:g} s) so any number "
+    "of unauthenticated probes cost the backend at most one health_check + "
+    "list_services per window; concurrent probes share one in-flight check "
+    f"and a check answers 503 after {_READINESS_CHECK_TIMEOUT_SECONDS:g} s "
+    f"(only for --transport http, default: {_READINESS_MEMO_TTL_SECONDS:g}, "
+    "set to 0 to disable the memo, overrides READINESS_CACHE_SECONDS env var)",
+)
+@click.option(
     "--session-idle-timeout-seconds",
     # min_open exists on click 8.x's FloatRange (verified at runtime); the
     # pinned types-click 7.1.8 stubs predate it, hence the targeted ignore.
@@ -2232,6 +2350,7 @@ def main(
     slow_request_threshold_ms: float | None,
     rate_limit_max_requests: int,
     rate_limit_window_seconds: float,
+    readiness_cache_seconds: float,
     session_idle_timeout_seconds: float,
     stateless_http: bool,
     query_cache_ttl_seconds: float | None,
@@ -2373,6 +2492,7 @@ def main(
                 "enabled_tools": enabled_tools,
                 "rate_limit_max_requests": rate_limit_max_requests,
                 "rate_limit_window_seconds": rate_limit_window_seconds,
+                "readiness_cache_seconds": readiness_cache_seconds,
                 "session_idle_timeout_seconds": session_idle_timeout_seconds,
                 "stateless_http": stateless_http,
                 "shutdown_drain_seconds": shutdown_drain_seconds,
@@ -2434,6 +2554,7 @@ def main(
                         window_seconds=rate_limit_window_seconds,
                     )
                 )
+            _configure_readiness_cache(readiness_cache_seconds)
             app = _build_http_app(
                 middleware,
                 session_idle_timeout_seconds=session_idle_timeout_seconds,

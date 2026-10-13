@@ -188,6 +188,14 @@ class HoneycombEnterpriseRequiredError(ValueError):
     this backend interprets as tier-gating (see module docstring point 1)."""
 
 
+class HoneycombRateLimitedError(RuntimeError):
+    """Raised by _RateLimiter.acquire(max_wait_seconds) when the next free
+    Create Query Result slot lies beyond the caller's wait budget - the
+    caller fails fast instead of parking toward a timeout it would hit
+    anyway (and instead of holding the limiter's lock for everyone behind
+    it while it does)."""
+
+
 class _RateLimiter:
     """Proactively spaces out calls to stay under a per-minute cap, rather
     than reactively retrying after a 429 - see the module-level constant's
@@ -201,6 +209,14 @@ class _RateLimiter:
     class exists to enforce. Holding the lock across the sleep means only
     one caller is ever waiting/appending at a time, so the cap is a true
     ceiling on throughput, not just a per-caller estimate.
+
+    One FIFO is shared by everything that runs a query under the same
+    Configuration Key: every MCP session's tool calls AND the readiness
+    probe (GET /ready -> list_services), which is unauthenticated. Because
+    the lock is held across the sleep, a caller's parking time is its
+    lock wait plus its own sleep, so ``acquire(max_wait_seconds)`` bounds
+    the whole acquire: the caller is released with
+    HoneycombRateLimitedError rather than parked past its budget.
     """
 
     def __init__(self, max_per_minute: int) -> None:
@@ -208,8 +224,35 @@ class _RateLimiter:
         self._call_times: collections.deque[float] = collections.deque()
         self._lock = asyncio.Lock()
 
-    async def acquire(self) -> None:
-        """Block until another call is safely under the per-minute cap."""
+    async def acquire(self, max_wait_seconds: float | None = None) -> None:
+        """Block until another call is safely under the per-minute cap.
+
+        Args:
+            max_wait_seconds: Upper bound on the time this caller may spend
+                inside acquire (lock wait plus sleep). None waits as long
+                as it takes.
+
+        Raises:
+            HoneycombRateLimitedError: The next slot is further away than
+                the remaining budget, or the budget elapsed while queued
+                behind other callers.
+        """
+        if max_wait_seconds is None:
+            await self._wait_for_slot(deadline=None)
+            return
+        try:
+            async with asyncio.timeout(max_wait_seconds) as budget:
+                await self._wait_for_slot(deadline=budget.when())
+        except TimeoutError:
+            raise HoneycombRateLimitedError(
+                f"Honeycomb Create Query Result budget ({self._max_per_minute}/min) is "
+                f"exhausted; gave up after waiting {max_wait_seconds:g} s for a slot"
+            ) from None
+
+    async def _wait_for_slot(self, *, deadline: float | None) -> None:
+        """The lock-holding wait loop. `deadline` is in the running loop's
+        time (asyncio.Timeout.when()); a wait that cannot finish before it
+        fails fast rather than parking the lock toward a known timeout."""
         async with self._lock:
             while True:
                 now = time.monotonic()
@@ -228,6 +271,21 @@ class _RateLimiter:
 
                 wait_seconds = 60.0 - (now - self._call_times[0])
                 if wait_seconds > 0:
+                    if deadline is not None:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if wait_seconds > remaining:
+                            raise HoneycombRateLimitedError(
+                                f"Honeycomb Create Query Result budget "
+                                f"({self._max_per_minute}/min) is exhausted; the next slot "
+                                f"frees in {wait_seconds:.1f} s, beyond the remaining "
+                                f"{max(remaining, 0.0):.1f} s wait budget"
+                            )
+                    logger.warning(
+                        "Honeycomb Create Query Result budget is full (%d calls in the last "
+                        "minute); parking this caller for %.1f s",
+                        len(self._call_times),
+                        wait_seconds,
+                    )
                     await asyncio.sleep(wait_seconds)
 
 
@@ -779,8 +837,11 @@ class HoneycombBackend(BaseBackend):
     async def _create_query_result(self, query_id: str) -> str:
         """POST /1/query_results/{dataset} - kicks off an async query run.
 
-        Proactively rate-limited (see _RateLimiter). A 402/403 is
-        interpreted as Enterprise-tier gating (module docstring point 1).
+        Proactively rate-limited (see _RateLimiter), with the caller's wait
+        bounded by this backend's own request timeout: the sleep precedes
+        the request, so without the bound a parked call outlives
+        BACKEND_TIMEOUT. A 402/403 is interpreted as Enterprise-tier gating
+        (module docstring point 1).
 
         Args:
             query_id: The query specification's ID to run
@@ -789,10 +850,12 @@ class HoneycombBackend(BaseBackend):
             The created query result's ID
 
         Raises:
+            HoneycombRateLimitedError: If no Create Query Result slot frees
+                within `timeout` seconds
             HoneycombEnterpriseRequiredError: On a 402/403 response
             ValueError: If the response shape is unexpected
         """
-        await self._query_result_rate_limiter.acquire()
+        await self._query_result_rate_limiter.acquire(max_wait_seconds=self.timeout)
 
         response = await self._post_checking_enterprise_gating(
             f"/1/query_results/{self.dataset}", {"query_id": query_id}

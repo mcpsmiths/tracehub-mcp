@@ -1614,6 +1614,74 @@ class TestMainCli:
         assert "finite" in result.output
         mock_mcp.http_app.assert_not_called()
 
+    def test_readiness_cache_defaults_to_30_seconds_in_http_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GET /ready is unauthenticated and each probe costs the backend a
+        health_check plus a list_services; main() must install the memo
+        window before the app is built so the first probe is already bounded."""
+        monkeypatch.setattr(server, "_readiness_cache_seconds", server._readiness_cache_seconds)
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp"),
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(server.main, ["--transport", "http"])
+
+        assert result.exit_code == 0, result.output
+        assert server._readiness_cache_seconds == 30.0
+
+    def test_readiness_cache_flag_zero_disables_the_memo(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(server, "_readiness_cache_seconds", server._readiness_cache_seconds)
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp"),
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(
+                server.main, ["--transport", "http", "--readiness-cache-seconds", "0"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert server._readiness_cache_seconds == 0.0
+
+    def test_readiness_cache_env_var_is_honoured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server, "_readiness_cache_seconds", server._readiness_cache_seconds)
+        monkeypatch.setenv("READINESS_CACHE_SECONDS", "7.5")
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp"),
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(server.main, ["--transport", "http"])
+
+        assert result.exit_code == 0, result.output
+        assert server._readiness_cache_seconds == 7.5
+
+    @pytest.mark.parametrize("value", ["-1", "inf", "nan"])
+    def test_invalid_readiness_cache_seconds_is_a_usage_error(
+        self, value: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(server, "_readiness_cache_seconds", server._readiness_cache_seconds)
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp"),
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(
+                server.main, ["--transport", "http", "--readiness-cache-seconds", value]
+            )
+
+        assert result.exit_code == 2, result.output
+        assert "--readiness-cache-seconds" in result.output
+        mock_server_cls.assert_not_called()
+
     def test_rate_limit_disabled_when_max_requests_is_zero(self) -> None:
         runner = CliRunner()
         with (
@@ -1745,6 +1813,18 @@ class TestPrintConfigFlag:
         resolved = json.loads(result.output)
         assert resolved["query_cache_ttl_seconds"] == 30.0
         assert resolved["query_cache_max_entries"] == 64
+
+    def test_includes_the_readiness_cache_window(self) -> None:
+        runner = CliRunner()
+        with patch.object(server, "mcp") as mock_mcp:
+            mock_mcp.run = MagicMock()
+            result = runner.invoke(
+                server.main, ["--print-config", "--readiness-cache-seconds", "12"]
+            )
+
+        assert result.exit_code == 0, result.output
+        resolved = json.loads(result.output)
+        assert resolved["readiness_cache_seconds"] == 12.0
 
     def test_default_query_cache_max_entries_is_1024(self) -> None:
         runner = CliRunner()

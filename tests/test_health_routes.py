@@ -10,8 +10,13 @@ TestClient pattern and test_server.py's TestDoctorCli AsyncMock-backend
 pattern for mocking _get_backend.
 """
 
+import asyncio
+import time
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, patch
 
+import httpx
+import pytest
 from starlette.middleware import Middleware
 from starlette.testclient import TestClient
 
@@ -19,6 +24,18 @@ from opentelemetry_mcp import server
 from opentelemetry_mcp.attributes import HealthCheckResponse
 from opentelemetry_mcp.server import OriginValidationMiddleware
 from tests.streamable_http_client import post_initialize
+
+
+@pytest.fixture(autouse=True)
+def _fresh_readiness_memo(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """The readiness memo and its lock are process-wide; every test starts
+    from an empty memo at the default window with the real clock, and leaves
+    nothing behind for the next test's event loop."""
+    server._reset_readiness_memo()
+    monkeypatch.setattr(server, "_readiness_cache_seconds", server._READINESS_MEMO_TTL_SECONDS)
+    monkeypatch.setattr(server, "_readiness_clock", time.monotonic)
+    yield
+    server._reset_readiness_memo()
 
 
 def _healthy_backend() -> AsyncMock:
@@ -205,3 +222,251 @@ def test_ready_never_closes_the_cached_backend() -> None:
 
     assert response.status_code == 200
     fake_backend.close.assert_not_called()
+
+
+class _FakeClock:
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TestReadinessMemo:
+    """GET /ready is unauthenticated and every probe costs the backend one
+    health_check plus one list_services - on Honeycomb a slot of the
+    process-wide 10/min Create Query Result budget, on X-Ray up to 222
+    operator-paid API calls. The route memoizes the result (30 s on
+    success, 5 s on failure), shares one in-flight check between concurrent
+    probes and answers 503 instead of hanging; `doctor` keeps calling the
+    live _run_backend_checks directly."""
+
+    def test_sequential_probes_within_the_window_share_one_backend_check(self) -> None:
+        fake_backend = _healthy_backend()
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                responses = [client.get("/ready") for _ in range(10)]
+
+        assert [r.status_code for r in responses] == [200] * 10
+        assert all(r.json() == responses[0].json() for r in responses)
+        assert fake_backend.health_check.await_count == 1
+        assert fake_backend.list_services.await_count == 1
+
+    def test_success_result_is_reprobed_once_the_success_ttl_elapses(self) -> None:
+        clock = _FakeClock()
+        server._configure_readiness_cache(server._READINESS_MEMO_TTL_SECONDS, clock=clock)
+        fake_backend = _healthy_backend()
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                client.get("/ready")
+                clock.advance(server._READINESS_MEMO_TTL_SECONDS - 0.1)
+                client.get("/ready")
+                assert fake_backend.health_check.await_count == 1
+                clock.advance(0.1)
+                client.get("/ready")
+
+        assert fake_backend.health_check.await_count == 2
+        assert fake_backend.list_services.await_count == 2
+
+    def test_failure_result_is_reprobed_after_the_shorter_failure_ttl(self) -> None:
+        clock = _FakeClock()
+        server._configure_readiness_cache(server._READINESS_MEMO_TTL_SECONDS, clock=clock)
+        fake_backend = _healthy_backend()
+        fake_backend.health_check = AsyncMock(
+            return_value=HealthCheckResponse(
+                status="unhealthy", backend="jaeger", url="http://x", error="connection refused"
+            )
+        )
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                assert client.get("/ready").status_code == 503
+
+                # The backend recovers, but the failure is memoized for 5 s...
+                fake_backend.health_check = AsyncMock(
+                    return_value=HealthCheckResponse(
+                        status="healthy", backend="jaeger", url="http://x"
+                    )
+                )
+                clock.advance(server._READINESS_FAILURE_MEMO_TTL_SECONDS - 0.1)
+                assert client.get("/ready").status_code == 503
+                fake_backend.health_check.assert_not_awaited()
+
+                # ...and not for the full 30 s success window.
+                clock.advance(0.1)
+                assert client.get("/ready").status_code == 200
+
+        assert fake_backend.health_check.await_count == 1
+
+    def test_concurrent_probes_coalesce_onto_one_in_flight_check(self) -> None:
+        asyncio.run(self._concurrent_probes_share_one_check(cache_seconds=30.0))
+
+    def test_zero_cache_seconds_still_coalesces_concurrent_probes(self) -> None:
+        """READINESS_CACHE_SECONDS=0 disables the memo, not single-flight: a
+        probe that arrives while a check is in flight waits for that check
+        instead of starting a second one."""
+        asyncio.run(self._concurrent_probes_share_one_check(cache_seconds=0.0))
+
+    async def _concurrent_probes_share_one_check(self, *, cache_seconds: float) -> None:
+        server._configure_readiness_cache(cache_seconds)
+        release = asyncio.Event()
+        fake_backend = _healthy_backend()
+
+        async def _blocking_list_services() -> list[str]:
+            await release.wait()
+            return ["svc-a", "svc-b"]
+
+        fake_backend.list_services = AsyncMock(side_effect=_blocking_list_services)
+
+        async def _release_once_everyone_is_parked() -> None:
+            await asyncio.sleep(0.05)
+            release.set()
+
+        app = server.mcp.http_app(transport="streamable-http")
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            ) as client:
+                results = await asyncio.gather(
+                    *(client.get("/ready") for _ in range(5)),
+                    _release_once_everyone_is_parked(),
+                )
+
+        responses = [r for r in results if isinstance(r, httpx.Response)]
+        assert len(responses) == 5
+        assert [r.status_code for r in responses] == [200] * 5
+        assert all(r.json() == responses[0].json() for r in responses)
+        assert fake_backend.health_check.await_count == 1
+        assert fake_backend.list_services.await_count == 1
+
+    def test_hung_backend_check_answers_503_within_the_readiness_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(server, "_READINESS_CHECK_TIMEOUT_SECONDS", 0.05)
+        fake_backend = _healthy_backend()
+        never = asyncio.Event()
+
+        async def _hang() -> list[str]:
+            await never.wait()
+            return []
+
+        fake_backend.list_services = AsyncMock(side_effect=_hang)
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                started = time.monotonic()
+                response = client.get("/ready")
+                elapsed = time.monotonic() - started
+
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "not_ready"
+        assert "timed out" in body["error"]
+        assert elapsed < 2.0
+
+    def test_timed_out_check_is_memoized_as_a_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(server, "_READINESS_CHECK_TIMEOUT_SECONDS", 0.05)
+        clock = _FakeClock()
+        server._configure_readiness_cache(server._READINESS_MEMO_TTL_SECONDS, clock=clock)
+        fake_backend = _healthy_backend()
+        never = asyncio.Event()
+
+        async def _hang() -> list[str]:
+            await never.wait()
+            return []
+
+        fake_backend.list_services = AsyncMock(side_effect=_hang)
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                assert client.get("/ready").status_code == 503
+                clock.advance(server._READINESS_FAILURE_MEMO_TTL_SECONDS - 0.1)
+                assert client.get("/ready").status_code == 503
+
+        assert fake_backend.health_check.await_count == 1
+
+    def test_swapping_the_backend_object_invalidates_the_memo(self) -> None:
+        first_backend = _healthy_backend()
+        second_backend = _healthy_backend()
+        with _build_client() as client:
+            with patch.object(server, "_get_backend", AsyncMock(return_value=first_backend)):
+                client.get("/ready")
+            with patch.object(server, "_get_backend", AsyncMock(return_value=second_backend)):
+                client.get("/ready")
+
+        assert first_backend.health_check.await_count == 1
+        assert second_backend.health_check.await_count == 1
+
+    def test_zero_cache_seconds_disables_the_memo(self) -> None:
+        server._configure_readiness_cache(0.0)
+        fake_backend = _healthy_backend()
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                for _ in range(3):
+                    assert client.get("/ready").status_code == 200
+
+        assert fake_backend.health_check.await_count == 3
+        assert fake_backend.list_services.await_count == 3
+
+    def test_zero_cache_seconds_keeps_the_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(server, "_READINESS_CHECK_TIMEOUT_SECONDS", 0.05)
+        server._configure_readiness_cache(0.0)
+        fake_backend = _healthy_backend()
+        never = asyncio.Event()
+
+        async def _hang() -> list[str]:
+            await never.wait()
+            return []
+
+        fake_backend.list_services = AsyncMock(side_effect=_hang)
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                response = client.get("/ready")
+
+        assert response.status_code == 503
+        assert "timed out" in response.json()["error"]
+
+    def test_reset_drops_the_memo(self) -> None:
+        fake_backend = _healthy_backend()
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                client.get("/ready")
+                server._reset_readiness_memo()
+                client.get("/ready")
+
+        assert fake_backend.health_check.await_count == 2
+
+    def test_doctor_path_stays_live(self) -> None:
+        """_run_backend_checks itself is never memoized - doctor calls it
+        directly and must report the current state on every run."""
+        fake_backend = _healthy_backend()
+
+        async def _twice() -> None:
+            await server._run_backend_checks(fake_backend)
+            await server._run_backend_checks(fake_backend)
+
+        asyncio.run(_twice())
+
+        assert fake_backend.health_check.await_count == 2
+        assert fake_backend.list_services.await_count == 2
+
+    def test_memo_stores_the_redacted_details_unchanged(self) -> None:
+        """The memo stores what _run_backend_checks returns - already
+        redacted - so a memoized body never carries more than a live one."""
+        marker = "VFY-PW-memo"
+        fake_backend = _healthy_backend()
+        fake_backend.list_services = AsyncMock(
+            side_effect=RuntimeError(f"Client error for url 'https://u:{marker}@h.test/api'")
+        )
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                first = client.get("/ready")
+                second = client.get("/ready")
+
+        assert first.status_code == second.status_code == 503
+        assert marker not in first.text
+        assert marker not in second.text
+        assert first.json() == second.json()
+        assert fake_backend.list_services.await_count == 1

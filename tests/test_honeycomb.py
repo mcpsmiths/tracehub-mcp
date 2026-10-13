@@ -10,6 +10,8 @@ raw-row-extraction technique, and the Query Result response shape) and how
 this implementation handles each.
 """
 
+import asyncio
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -18,10 +20,13 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from opentelemetry_mcp.backends.base import _RetryingTransport
 from opentelemetry_mcp.backends.honeycomb import (
     _MAX_QUERY_ROWS,
+    _QUERY_RESULT_RATE_LIMIT_PER_MINUTE,
     HoneycombBackend,
     HoneycombEnterpriseRequiredError,
+    HoneycombRateLimitedError,
     _RateLimiter,
 )
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, SpanQuery, TraceQuery
@@ -152,6 +157,210 @@ class TestRateLimiter:
             assert window[-1] - window[0] >= 60.0, (
                 f"{limiter._max_per_minute + 1} calls landed within a 60s window: {window}"
             )
+
+
+class TestRateLimiterParkingBound:
+    """Readiness probes (/ready -> list_services) and every session's tool
+    calls share one FIFO limiter that holds its lock across the sleep, so a
+    caller's parking time is lock-wait plus its own sleep. acquire(
+    max_wait_seconds) bounds the WHOLE acquire and fails fast with
+    HoneycombRateLimitedError instead of parking a caller toward a timeout
+    it is going to hit anyway."""
+
+    def _freeze(self, monkeypatch: pytest.MonkeyPatch) -> tuple[list[float], list[float]]:
+        fake_now = [1000.0]
+        sleep_calls: list[float] = []
+
+        def _fake_monotonic() -> float:
+            return fake_now[0]
+
+        async def _fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            fake_now[0] += seconds
+
+        monkeypatch.setattr("opentelemetry_mcp.backends.honeycomb.time.monotonic", _fake_monotonic)
+        monkeypatch.setattr("opentelemetry_mcp.backends.honeycomb.asyncio.sleep", _fake_sleep)
+        return fake_now, sleep_calls
+
+    async def test_fails_fast_when_the_next_slot_exceeds_the_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, sleep_calls = self._freeze(monkeypatch)
+        limiter = _RateLimiter(max_per_minute=2)
+        await limiter.acquire()
+        await limiter.acquire()
+
+        with pytest.raises(HoneycombRateLimitedError, match="60"):
+            await limiter.acquire(max_wait_seconds=0.0)
+
+        assert sleep_calls == []
+        assert len(limiter._call_times) == 2
+
+    async def test_fails_fast_when_the_wait_is_longer_than_a_positive_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, sleep_calls = self._freeze(monkeypatch)
+        limiter = _RateLimiter(max_per_minute=1)
+        await limiter.acquire()
+
+        with pytest.raises(HoneycombRateLimitedError):
+            await limiter.acquire(max_wait_seconds=30.0)
+
+        assert sleep_calls == []
+        assert len(limiter._call_times) == 1
+
+    async def test_waits_when_the_slot_fits_the_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, sleep_calls = self._freeze(monkeypatch)
+        limiter = _RateLimiter(max_per_minute=1)
+        await limiter.acquire()
+
+        await limiter.acquire(max_wait_seconds=120.0)
+
+        assert sleep_calls == [pytest.approx(60.0)]
+        assert len(limiter._call_times) == 1
+
+    async def test_unbounded_acquire_keeps_parking(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _, sleep_calls = self._freeze(monkeypatch)
+        limiter = _RateLimiter(max_per_minute=1)
+        await limiter.acquire()
+
+        await limiter.acquire()
+
+        assert sleep_calls == [pytest.approx(60.0)]
+
+    async def test_parked_caller_is_logged_at_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        self._freeze(monkeypatch)
+        limiter = _RateLimiter(max_per_minute=1)
+        await limiter.acquire()
+
+        with caplog.at_level("WARNING", logger="opentelemetry_mcp.backends.honeycomb"):
+            await limiter.acquire()
+
+        parked = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(parked) == 1
+        assert "60" in parked[0].getMessage()
+        assert "1" in parked[0].getMessage()
+
+    async def test_queued_callers_are_released_within_max_wait(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lock is held across the sleep, so without a whole-acquire bound
+        K queued callers each wait for every caller ahead of them. Real
+        clock, real sub-second budget: a leader parks (its sleep is stubbed
+        to really block) while five bounded followers queue on the lock -
+        every follower must be released within its own budget."""
+        real_sleep = asyncio.sleep
+        parked = asyncio.Event()
+
+        async def _really_park(seconds: float) -> None:
+            parked.set()
+            await real_sleep(seconds)
+
+        monkeypatch.setattr("opentelemetry_mcp.backends.honeycomb.asyncio.sleep", _really_park)
+
+        limiter = _RateLimiter(max_per_minute=1)
+        # A slot that only frees far in the future, so the leader parks.
+        limiter._call_times.append(time.monotonic() + 1000.0)
+
+        leader = asyncio.ensure_future(limiter.acquire())
+        await asyncio.wait_for(parked.wait(), timeout=1.0)
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        outcomes = await asyncio.gather(
+            *(limiter.acquire(max_wait_seconds=0.05) for _ in range(5)),
+            return_exceptions=True,
+        )
+        elapsed = loop.time() - started
+
+        assert all(isinstance(o, HoneycombRateLimitedError) for o in outcomes)
+        assert elapsed < 1.0
+        assert len(limiter._call_times) == 1  # nobody was admitted
+        leader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await leader
+
+
+class TestCreateQueryResultParkingBound:
+    """_create_query_result passes max_wait_seconds=self.timeout, so a tool
+    call or readiness probe never parks inside the limiter longer than
+    BACKEND_TIMEOUT - today a parked call outlives the backend timeout
+    because the sleep precedes the request."""
+
+    def _wire(
+        self, backend: HoneycombBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[list[httpx.Request], list[float]]:
+        requests: list[httpx.Request] = []
+        fake_now = [1000.0]
+        sleep_calls: list[float] = []
+
+        def _fake_monotonic() -> float:
+            return fake_now[0]
+
+        async def _fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            fake_now[0] += seconds
+
+        monkeypatch.setattr("opentelemetry_mcp.backends.honeycomb.time.monotonic", _fake_monotonic)
+        monkeypatch.setattr("opentelemetry_mcp.backends.honeycomb.asyncio.sleep", _fake_sleep)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"id": "result-1"})
+
+        backend._client = httpx.AsyncClient(
+            base_url=backend.url,
+            headers=backend._create_headers(),
+            transport=_RetryingTransport(
+                wrapped=httpx.MockTransport(handler), allowed_host="api.honeycomb.io"
+            ),
+        )
+        return requests, sleep_calls
+
+    async def _exhaust_budget(self, backend: HoneycombBackend) -> None:
+        for _ in range(_QUERY_RESULT_RATE_LIMIT_PER_MINUTE):
+            await backend._query_result_rate_limiter.acquire()
+
+    async def test_raises_instead_of_parking_past_backend_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = HoneycombBackend(
+            url="https://api.honeycomb.io",
+            api_key=FAKE_CONFIG_KEY,
+            dataset=FAKE_DATASET,
+            timeout=30.0,
+        )
+        requests, sleep_calls = self._wire(backend, monkeypatch)
+        await self._exhaust_budget(backend)
+
+        with pytest.raises(HoneycombRateLimitedError):
+            await backend._create_query_result("query-1")
+
+        assert requests == []
+        assert sleep_calls == []
+
+    async def test_parks_when_the_slot_fits_backend_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = HoneycombBackend(
+            url="https://api.honeycomb.io",
+            api_key=FAKE_CONFIG_KEY,
+            dataset=FAKE_DATASET,
+            timeout=120.0,
+        )
+        requests, sleep_calls = self._wire(backend, monkeypatch)
+        await self._exhaust_budget(backend)
+
+        result_id = await backend._create_query_result("query-1")
+
+        assert result_id == "result-1"
+        assert sleep_calls == [pytest.approx(60.0)]
+        assert len(requests) == 1
+        assert requests[0].url.path == f"/1/query_results/{FAKE_DATASET}"
 
 
 class TestFilterToHoneycombFilter:
