@@ -7,7 +7,9 @@ catching a wrong param name/shape at test time - and there is no cassette
 engineering needed for SigV4 traffic the way there would be for VCR.
 """
 
+import asyncio
 import json
+import threading
 from datetime import UTC, datetime
 from typing import Any
 
@@ -17,6 +19,7 @@ from botocore.stub import Stubber
 from opentelemetry_mcp.backends.xray import (
     _BATCH_GET_TRACES_MAX_IDS,
     _MAX_BATCH_PAGES,
+    _MAX_CONCURRENT_XRAY_CALLS,
     _MAX_SEARCH_PAGES,
     XRayBackend,
 )
@@ -808,7 +811,98 @@ class TestHealthCheck:
         assert result.error is not None
 
 
+class TestCallConcurrencyBound:
+    """boto3 is synchronous, so every X-Ray call runs on a thread. Unbounded
+    asyncio.to_thread put all of them on the event loop's shared default
+    executor: W concurrent unauthenticated GET /ready probes (each a
+    GetServiceGraph, or up to 222 calls via the sampling fallback) could
+    fill that executor and starve every other session's X-Ray call - and
+    any other to_thread user in the process. _call now owns a dedicated,
+    fixed-size executor behind a semaphore of the same size."""
+
+    async def test_blocking_calls_never_exceed_the_bound_or_touch_the_default_executor(
+        self,
+    ) -> None:
+        backend = _backend()
+        gate = threading.Event()
+        bookkeeping = threading.Lock()
+        thread_names: list[str] = []
+
+        def fake_get_service_graph(**kwargs: Any) -> dict[str, Any]:
+            with bookkeeping:
+                thread_names.append(threading.current_thread().name)
+            gate.wait(timeout=5.0)
+            return {"Services": []}
+
+        backend._xray_client.get_service_graph = fake_get_service_graph  # type: ignore[assignment]
+        loop = asyncio.get_running_loop()
+        try:
+            tasks = [
+                asyncio.ensure_future(backend._call("get_service_graph"))
+                for _ in range(2 * _MAX_CONCURRENT_XRAY_CALLS)
+            ]
+
+            deadline = loop.time() + 2.0
+            while loop.time() < deadline:
+                with bookkeeping:
+                    if len(thread_names) >= _MAX_CONCURRENT_XRAY_CALLS:
+                        break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)  # grace period: nobody else may enter
+            with bookkeeping:
+                entered_while_blocked = list(thread_names)
+
+            # Exactly the bound entered; the (N+1)th waits on the semaphore,
+            # not on a fresh thread.
+            assert len(entered_while_blocked) == _MAX_CONCURRENT_XRAY_CALLS
+            assert len(set(entered_while_blocked)) <= _MAX_CONCURRENT_XRAY_CALLS
+            assert all(name.startswith("xray-boto3") for name in entered_while_blocked)
+
+            # The loop's default executor is untouched by the parked calls.
+            probe = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: "probe-ok"), timeout=0.5
+            )
+            assert probe == "probe-ok"
+
+            gate.set()
+            results = await asyncio.gather(*tasks)
+        finally:
+            gate.set()
+            await backend.close()
+
+        assert len(results) == 2 * _MAX_CONCURRENT_XRAY_CALLS
+        assert all(r == {"Services": []} for r in results)
+        assert len(thread_names) == 2 * _MAX_CONCURRENT_XRAY_CALLS
+        assert all(name.startswith("xray-boto3") for name in thread_names)
+
+    async def test_call_result_passes_through_unchanged(self) -> None:
+        backend = _backend()
+        stubber = Stubber(backend._xray_client)
+        stubber.add_response("get_service_graph", {"Services": [{"ReferenceId": 0, "Name": "s"}]})
+
+        now = datetime.now(UTC)
+        with stubber:
+            response = await backend._call("get_service_graph", StartTime=now, EndTime=now)
+
+        assert [s["Name"] for s in response["Services"]] == ["s"]
+        await backend.close()
+
+
 class TestClose:
+    async def test_close_shuts_down_the_executor_and_still_closes_the_boto3_client(
+        self,
+    ) -> None:
+        backend = _backend()
+        closed: list[bool] = []
+        backend._xray_client.close = lambda: closed.append(True)  # type: ignore[method-assign]
+
+        await backend.close()
+
+        assert closed == [True]
+        now = datetime.now(UTC)
+        with pytest.raises(RuntimeError):
+            await backend._call("get_service_graph", StartTime=now, EndTime=now)
+
     async def test_close_calls_boto3_client_close_synchronously(self) -> None:
         backend = _backend()
         backend._xray_client.close = lambda: setattr(backend, "_closed", True)  # type: ignore[method-assign]

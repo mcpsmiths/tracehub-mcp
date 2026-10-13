@@ -1,7 +1,7 @@
 """AWS X-Ray backend implementation using GetTraceSummaries/BatchGetTraces.
 
-boto3 is fully synchronous; every call to the underlying client is wrapped in
-``asyncio.to_thread`` (see ``_call`` below) rather than pulling in
+boto3 is fully synchronous; every call to the underlying client runs on this
+backend's own bounded thread pool (see ``_call`` below) rather than pulling in
 ``aioboto3``/``aiobotocore`` as a second, less-mainstream AWS SDK dependency.
 
 Schema/behavior notes, grounded in AWS's own docs (xray-concepts.html,
@@ -57,6 +57,8 @@ traces should verify all of the above before relying on this in production.
 """
 
 import asyncio
+import concurrent.futures
+import functools
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -86,6 +88,13 @@ logger = logging.getLogger(__name__)
 # grounded in an explicit documented ceiling, matching Datadog's own default
 # lookback value.
 _DEFAULT_LOOKBACK = timedelta(days=30)
+
+# Ceiling on concurrent boto3 calls (and threads) this backend may hold:
+# above any single session's need, independent of host CPU count, and below
+# the smallest default executor so even a saturated X-Ray backend leaves
+# the loop's shared executor to everyone else. Fixed on purpose (no env
+# var) - raising it only raises the operator's X-Ray spend per burst.
+_MAX_CONCURRENT_XRAY_CALLS = 8
 
 _MAX_TRACES_TO_HYDRATE = 50
 
@@ -176,6 +185,13 @@ class XRayBackend(BaseBackend):
             retries={"max_attempts": 3, "mode": "standard"},
         )
         self._xray_client = boto3.client("xray", region_name=aws_region, config=botocore_config)
+        # Blocking boto3 work never touches the event loop's shared default
+        # executor: it runs on this pool, and the semaphore (same size) keeps
+        # the (N+1)th caller parked without a thread of its own - see _call.
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_MAX_CONCURRENT_XRAY_CALLS, thread_name_prefix="xray-boto3"
+        )
+        self._call_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_XRAY_CALLS)
 
     def _create_headers(self) -> dict[str, str]:
         """N/A for this backend - X-Ray auth is SigV4 request signing
@@ -205,6 +221,16 @@ class XRayBackend(BaseBackend):
     async def _call(self, operation: str, **kwargs: Any) -> dict[str, Any]:
         """Run one synchronous boto3 X-Ray client call off the event loop.
 
+        On this backend's own executor (never asyncio.to_thread's shared
+        default one) and behind a semaphore of the same size: at most
+        _MAX_CONCURRENT_XRAY_CALLS boto3 calls are in flight, further callers
+        wait on the semaphore holding no thread, and a burst of readiness
+        probes or tool calls can neither starve other sessions' X-Ray calls
+        nor exhaust the default executor every other to_thread user in the
+        process shares. boto3 needs no contextvars, so run_in_executor is
+        equivalent to to_thread here; botocore's own connect/read timeouts
+        bound how long a thread is held.
+
         Args:
             operation: boto3 client method name (e.g. "get_trace_summaries")
             **kwargs: Passed through to the boto3 method
@@ -216,15 +242,22 @@ class XRayBackend(BaseBackend):
             botocore.exceptions.ClientError: Left to propagate bare,
                 matching every other backend's convention of letting its
                 underlying SDK's exceptions bubble up unwrapped.
+            RuntimeError: After close() - the executor is shut down.
         """
         method = getattr(self._xray_client, operation)
-        result: dict[str, Any] = await asyncio.to_thread(method, **kwargs)
+        async with self._call_semaphore:
+            result: dict[str, Any] = await asyncio.get_running_loop().run_in_executor(
+                self._executor, functools.partial(method, **kwargs)
+            )
         return result
 
     async def close(self) -> None:
-        """Close the boto3 client, then delegate to BaseBackend.close() for
+        """Shut the executor down (pending, never-started calls are
+        cancelled; a running one finishes on its own botocore timeout),
+        close the boto3 client, then delegate to BaseBackend.close() for
         the query-cache clear (its httpx-close half is a no-op here, since
         self._client is never populated by this backend)."""
+        self._executor.shutdown(wait=False, cancel_futures=True)
         self._xray_client.close()
         await super().close()
 
