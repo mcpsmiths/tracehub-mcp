@@ -34,7 +34,9 @@ For anyone auditing this project as a dependency:
 - All GitHub Actions third-party steps are pinned to a full commit SHA (not a mutable tag) across
   every workflow.
 - The release toolchain is version- and hash-pinned in-tree: the release job installs Commitizen
-  only from `.github/requirements-release.txt` (`pip install --require-hashes --no-deps`); `uv` is
+  only from `.github/requirements-release.txt` (`pip install --require-hashes --no-deps
+  --only-binary=:all:`, so a mismatched wheel hash fails the install instead of falling back
+  to an sdist build with run-time-resolved build dependencies); `uv` is
   pinned to the same version as the Dockerfile in every workflow; the build backend (`hatchling`)
   and its build-time dependencies are exact-pinned in `pyproject.toml` and hash-bound through
   `.github/requirements-build.txt` (`uv build --build-constraints ... --require-hashes`). Nothing
@@ -45,7 +47,9 @@ For anyone auditing this project as a dependency:
 - Secret detection: TruffleHog scans the commit range of every push to `main` and every pull
   request, and weekly (plus on demand) the whole history of every branch, with a custom detector
   for Traceloop API keys (`.trufflehog.yaml`) that no built-in detector or GitHub partner pattern
-  covers; a `gitleaks` pre-commit hook with the same rule (`.gitleaks.toml`) runs locally.
+  covers; a `gitleaks` pre-commit hook with the same rule (`.gitleaks.toml`) runs locally - its
+  one allowlist entry exempts a single literal test-fixture line for one default rule, never a
+  path.
 - Published container images (`ghcr.io/mcpsmiths/tracehub-mcp`) include build provenance
   attestation and an SBOM via `docker/build-push-action`.
 - Releases are published to PyPI via GitHub Actions using
