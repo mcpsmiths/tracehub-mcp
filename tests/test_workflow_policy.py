@@ -130,6 +130,27 @@ def test_release_jobs_only_pip_install_with_hashes() -> None:
     assert offenders == [], offenders
 
 
+def test_hash_pinned_install_refuses_the_sdist_fallback() -> None:
+    """--require-hashes alone is not fail-closed: when only the WHEEL hash of
+    an entry is wrong pip falls back to the still-hashed sdist and runs an
+    isolated build whose backend (uv_build, unpinned) it fetches from PyPI at
+    that moment - exit 0 (runtime verification T7 fix1/03-04). With
+    --only-binary=:all: the same file fails with "THESE PACKAGES DO NOT MATCH
+    THE HASHES" (exit 1), and nothing is ever built next to RELEASE_PAT."""
+    steps = _bump_version_steps()
+    install = steps[_step_index(steps, lambda s: "requirements-release.txt" in _run(s))]
+    run = _run(install)
+    assert "--only-binary=:all:" in run, run
+    assert "--require-hashes" in run and "--no-deps" in run, run
+    # YAML comments are not part of the parsed step: read the raw text and
+    # require the step's comment block to explain the sdist fallback it closes.
+    lines = RELEASE_YML.read_text(encoding="utf-8").splitlines()
+    (idx,) = [
+        i for i, line in enumerate(lines) if "pip install" in line and "--only-binary=:all:" in line
+    ]
+    assert any("sdist" in line for line in lines[idx - 14 : idx]), lines[idx - 14 : idx]
+
+
 def test_requirements_release_pins_commitizen_with_hashes() -> None:
     assert REQUIREMENTS_RELEASE.is_file(), (
         ".github/requirements-release.txt is missing - generate it with "

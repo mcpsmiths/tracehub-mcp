@@ -62,7 +62,18 @@ jobs:
         # current by Dependabot's pip entry for /.github). --require-hashes
         # makes pip refuse any artifact whose hash is not listed there and
         # --no-deps forbids any resolution outside the file.
-        run: pip install --require-hashes --no-deps -r .github/requirements-release.txt
+        #
+        # --only-binary=:all: closes the one gap those two leave: when an
+        # entry's WHEEL hash does not match but its sdist hash still does,
+        # pip falls back to the sdist and runs an isolated build whose
+        # backend (commitizen's uv_build, unpinned) it fetches from PyPI at
+        # that moment - exit 0, with freshly resolved code executing in the
+        # job that holds RELEASE_PAT (observed with pip 25.3). Wheels only:
+        # the same file then fails with "THESE PACKAGES DO NOT MATCH THE
+        # HASHES" and nothing is built here. Every pin in the file ships a
+        # wheel (uv pip compile --generate-hashes records them all).
+        run: |
+          pip install --require-hashes --no-deps --only-binary=:all: -r .github/requirements-release.txt
 
       - name: Configure git identity for the bump commit
         # commitizen-action used to do this unconditionally from its inputs;
