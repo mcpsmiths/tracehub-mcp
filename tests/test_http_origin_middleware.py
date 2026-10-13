@@ -17,6 +17,7 @@ from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from opentelemetry_mcp.security import is_loopback_host
 from opentelemetry_mcp.server import (
     _MAX_LOGGED_HEADER_CHARS,
     OriginValidationMiddleware,
@@ -192,6 +193,19 @@ class TestBracketedHostTrailingText:
         ):
             assert client.get("/", headers={"host": host}).status_code == 421, host
         assert client.get("/", headers={"host": "[2001:db8::1]:8443"}).status_code == 200
+
+    def test_non_ascii_whitespace_padding_is_not_stripped(self) -> None:
+        # Delta verification: str.strip() removed a latin-1 NBSP (0xA0) / NEL (0x85) h11 decodes
+        # from the header bytes, so 'verify.local\xa0' matched the allowlist and '[::1]\xa0'
+        # passed as loopback. Only ASCII whitespace is trimmed now; the padded value equals no
+        # allowlist entry and is no loopback spelling. (The HTTP test client refuses non-ASCII
+        # header bytes, so the normaliser is exercised directly - prober-1 used a raw socket.)
+        assert _hostname_from_host_header("verify.local\xa0") == "verify.local\xa0"
+        assert _hostname_from_host_header("\xa0verify.local") == "\xa0verify.local"
+        assert _hostname_from_host_header("verify.local\x85") == "verify.local\x85"
+        assert _hostname_from_host_header("[::1]\xa0") == "[::1]\xa0"
+        assert _hostname_from_host_header(" verify.local\t") == "verify.local"
+        assert is_loopback_host("[::1]\xa0") is False
 
     def test_hostname_from_host_header_keeps_a_malformed_bracketed_value_whole(self) -> None:
         assert _hostname_from_host_header("[::1]evil.example") == "[::1]evil.example"

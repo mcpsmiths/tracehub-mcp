@@ -519,3 +519,6 @@ def test_a_bracketed_literal_with_a_tail_is_not_loopback() -> None:
     # Allowlisted names accept exactly one trailing dot; loopback names must not accept more.
     assert is_loopback_host("localhost..") is False
     assert is_loopback_host("127.0.0.1..") is False
+    # Non-ASCII whitespace padding is not whitespace here: '[::1]\xa0' is no loopback spelling.
+    assert is_loopback_host("[::1]\xa0") is False
+    assert is_loopback_host("localhost\xa0") is False

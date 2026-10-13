@@ -65,7 +65,9 @@ def _normalize_host(host: str) -> str:
     it is, so it parses as no address and matches no name. Stripping the dots
     first turned "[::1]." into "::1" and let a Host the header parser had
     refused pass the loopback test (round-2 review)."""
-    host = host.strip()
+    # ASCII whitespace only: str.strip() also removed a latin-1 NBSP/NEL h11 decodes from
+    # the header bytes, so '[::1]\xa0' passed as loopback (delta verification).
+    host = host.strip(" \t\r\n")
     if host.startswith("[") and host.endswith("]"):
         return host[1:-1]
     # Exactly one trailing dot (the DNS root label), like the allowlist side; rstrip let
