@@ -1505,6 +1505,38 @@ class TestMainCli:
         assert config_arg.proxy_headers is True
         assert config_arg.forwarded_allow_ips == "10.0.0.1"
 
+    def test_access_log_is_off_by_default_and_the_flag_enables_it(self) -> None:
+        # Off by default: uvicorn's access line carries the full request target, so a token
+        # a misconfigured client puts in the query string would be logged (PR #41 round 2).
+        # Operators who want request lines opt in; the query-string filter still applies.
+        for extra, expected in (
+            ([], False),
+            (["--access-log"], True),
+            (["--no-access-log"], False),
+        ):
+            runner = CliRunner()
+            with (
+                patch.object(server, "mcp"),
+                patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+            ):
+                mock_server_cls.return_value.serve = AsyncMock()
+                result = runner.invoke(server.main, ["--transport", "http", *extra])
+            assert result.exit_code == 0, result.output
+            assert mock_server_cls.call_args.args[0].access_log is expected
+
+    def test_access_log_env_var_enables_it(self) -> None:
+        runner = CliRunner()
+        with (
+            patch.object(server, "mcp"),
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(
+                server.main, ["--transport", "http"], env={"MCP_ACCESS_LOG": "true"}
+            )
+        assert result.exit_code == 0, result.output
+        assert mock_server_cls.call_args.args[0].access_log is True
+
     def test_forwarded_allow_ips_env_var_keeps_uvicorns_name(self) -> None:
         """Operators who already set uvicorn's FORWARDED_ALLOW_IPS see
         identical behaviour - the option deliberately reuses that name."""

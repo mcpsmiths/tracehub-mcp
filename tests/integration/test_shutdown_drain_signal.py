@@ -91,7 +91,8 @@ def _spawn_server(port: int, backend_url: str, **extra_flags: str) -> subprocess
         backend_url,
     ]
     for flag, value in extra_flags.items():
-        args.extend([flag, value])
+        # An empty value means a bare boolean flag (e.g. --access-log).
+        args.extend([flag, value] if value else [flag])
     # All args are this file's own hardcoded literals plus sys.executable -
     # nothing here originates from external/untrusted input.
     return subprocess.Popen(  # noqa: S603
@@ -127,6 +128,10 @@ class TestShutdownDrainSignal:
                 # INFO line, which the server quiets to WARNING unless the
                 # operator asks for DEBUG (it prints the full request URL).
                 "--log-level": "DEBUG",
+                # The '"POST /mcp HTTP/1.1" 200 OK' evidence is uvicorn's access
+                # line, off by default since the round-2 hardening (a token in the
+                # query string would be logged); this test opts back in.
+                "--access-log": "",
             },
         )
         try:

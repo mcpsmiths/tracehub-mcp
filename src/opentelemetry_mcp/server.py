@@ -2187,6 +2187,7 @@ def _build_uvicorn_config(
     port: int,
     graceful_shutdown_timeout_seconds: int,
     forwarded_allow_ips: str | None,
+    access_log: bool = False,
 ) -> uvicorn.Config:
     """The uvicorn.Config main() serves the HTTP app with.
 
@@ -2200,9 +2201,10 @@ def _build_uvicorn_config(
     named (the CLI option deliberately reuses uvicorn's FORWARDED_ALLOW_IPS
     env var name, so operators who already set it see identical behaviour).
 
-    ``access_log=False``: uvicorn's access line carries the full request
-    target, query string included, so a token a client put there was
-    logged verbatim (see AccessLogQueryStringFilter). The filter is
+    ``access_log`` defaults to False: uvicorn's access line carries the full
+    request target, query string included, so a token a client put there was
+    logged verbatim (see AccessLogQueryStringFilter). Operators who want
+    request lines opt in with --access-log / MCP_ACCESS_LOG. The filter is
     attached to the ``uvicorn.access`` logger after Config.__init__ has run
     its dictConfig (which resets that logger's handlers, not its filters;
     addFilter is idempotent for the same instance), so a re-enabled access
@@ -2222,7 +2224,7 @@ def _build_uvicorn_config(
         timeout_graceful_shutdown=graceful_shutdown_timeout_seconds,
         proxy_headers=forwarded_allow_ips is not None,
         forwarded_allow_ips=forwarded_allow_ips,
-        access_log=False,
+        access_log=access_log,
     )
     logging.getLogger("uvicorn.access").addFilter(_ACCESS_LOG_QUERY_FILTER)
     return config
@@ -2757,6 +2759,17 @@ def _backend_config_options(f: Any) -> Any:
     "which only accepts whole seconds (only for --transport http, "
     "default: 2, overrides GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS env var)",
 )
+@click.option(
+    "--access-log/--no-access-log",
+    default=False,
+    envvar="MCP_ACCESS_LOG",
+    show_envvar=True,
+    help="On HTTP transport, write uvicorn's per-request access line for every "
+    "request. Off by default: the line carries the full request target, so a token a "
+    "misconfigured client puts in the query string would be logged; when enabled, the "
+    "query string is stripped from every access line (only for --transport http, "
+    "default: off)",
+)
 def main(
     ctx: click.Context,
     backend: str | None,
@@ -2795,6 +2808,7 @@ def main(
     shutdown_drain_seconds: float,
     backend_close_timeout_seconds: float,
     graceful_shutdown_timeout_seconds: int,
+    access_log: bool,
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
@@ -3017,6 +3031,7 @@ def main(
                 port=port,
                 graceful_shutdown_timeout_seconds=graceful_shutdown_timeout_seconds,
                 forwarded_allow_ips=forwarded_allow_ips,
+                access_log=access_log,
             )
             asyncio.run(uvicorn.Server(uvicorn_config).serve())
         else:
