@@ -10,7 +10,7 @@ import re
 import sys
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal, NoReturn
 
 import click
@@ -1848,6 +1848,60 @@ def _build_http_app(
     )
 
 
+# A request target's query string inside the quoted request line of an
+# already-rendered access-log message ('... "POST /mcp?x=1 HTTP/1.1" 401'):
+# the target can contain no whitespace, so the first whitespace followed by
+# "HTTP/" ends it.
+_ACCESS_LOG_TARGET_QUERY_RE = re.compile(r"\?\S*(?=\s+HTTP/)")
+
+
+class AccessLogQueryStringFilter(logging.Filter):
+    """Strips the query string from uvicorn's access-log request line.
+
+    uvicorn's default access log (INFO, on by default, written to stdout)
+    records the full request target. A client that presents the operator
+    bearer token in the query string (?access_token=..., ?token=...) is
+    refused with 401 and the token is never echoed in a body or header,
+    but that one line put it verbatim in the server log (runtime
+    verification prober-1 L01). main() therefore serves with
+    access_log=False - this project logs rejected Host/Origin values,
+    rate-limit breaches, slow backend requests and tool errors itself, and
+    exports per-call spans when OTel is configured - and this filter sits
+    on the ``uvicorn.access`` logger so an access log an operator turns
+    back on (any handler on that logger re-enables it) cannot leak either.
+
+    uvicorn 0.40 logs ``'%s - "%s %s HTTP/%s" %d'`` with the five-tuple
+    (client_addr, method, target, http_version, status); its
+    AccessFormatter unpacks ``record.args`` positionally, so the target is
+    replaced inside a same-shaped tuple rather than by pre-rendering the
+    message. Any other record shape is stripped on the rendered text.
+    Never raises: a logger-level filter runs inside the logging caller
+    (uvicorn's protocol code), where an exception would abort the request.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        with suppress(Exception):
+            self._strip_query_string(record)
+        return True
+
+    @staticmethod
+    def _strip_query_string(record: logging.LogRecord) -> None:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            target = args[2]
+            if "?" in target:
+                record.args = (*args[:2], target.partition("?")[0], *args[3:])
+            return
+        message = record.getMessage()
+        stripped = _ACCESS_LOG_TARGET_QUERY_RE.sub("", message)
+        if stripped != message:
+            record.msg = stripped
+            record.args = None
+
+
+_ACCESS_LOG_QUERY_FILTER = AccessLogQueryStringFilter()
+
+
 def _build_uvicorn_config(
     app: Any,
     *,
@@ -1867,8 +1921,16 @@ def _build_uvicorn_config(
     header is honoured only for connections from the proxies the operator
     named (the CLI option deliberately reuses uvicorn's FORWARDED_ALLOW_IPS
     env var name, so operators who already set it see identical behaviour).
+
+    ``access_log=False``: uvicorn's access line carries the full request
+    target, query string included, so a token a client put there was
+    logged verbatim (see AccessLogQueryStringFilter). The filter is
+    attached to the ``uvicorn.access`` logger after Config.__init__ has run
+    its dictConfig (which resets that logger's handlers, not its filters;
+    addFilter is idempotent for the same instance), so a re-enabled access
+    log is stripped of query strings too.
     """
-    return uvicorn.Config(
+    config = uvicorn.Config(
         app,
         host=host,
         port=port,
@@ -1882,7 +1944,10 @@ def _build_uvicorn_config(
         timeout_graceful_shutdown=graceful_shutdown_timeout_seconds,
         proxy_headers=forwarded_allow_ips is not None,
         forwarded_allow_ips=forwarded_allow_ips,
+        access_log=False,
     )
+    logging.getLogger("uvicorn.access").addFilter(_ACCESS_LOG_QUERY_FILTER)
+    return config
 
 
 _BACKEND_CLOSE_TIMEOUT_SECONDS = 5.0
