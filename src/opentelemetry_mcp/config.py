@@ -7,7 +7,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, field_validator
+from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, ValidationError, field_validator
 
 from opentelemetry_mcp.backends.base import DEFAULT_MAX_RESPONSE_BYTES
 from opentelemetry_mcp.backends.cache import DEFAULT_QUERY_CACHE_MAX_ENTRIES
@@ -435,7 +435,18 @@ class ServerConfig(BaseModel):
             # The userinfo check runs on the raw string first: the TypeAdapter's
             # own ValidationError would echo a malformed credentialed URL.
             _reject_url_userinfo(backend_url, source="--url")
-            parsed = TypeAdapter(HttpUrl).validate_python(backend_url)
+            try:
+                parsed = TypeAdapter(HttpUrl).validate_python(backend_url)
+            except ValidationError as exc:
+                # A bare TypeAdapter error carries no field location, so the
+                # generic rendering could only name pydantic's validator
+                # wrapper ("function-wrap[wrap_val()]"), not the option the
+                # operator typed; its str() would also echo the value. Name
+                # the flag and keep the messages, which say what was wrong.
+                reasons = "; ".join(
+                    err["msg"] for err in exc.errors(include_url=False, include_input=False)
+                )
+                raise ValueError(f"--url: {reasons}") from None
             self.backend.url = BackendConfig.validate_url(parsed)
 
         if api_key:

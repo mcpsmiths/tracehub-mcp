@@ -2318,6 +2318,53 @@ def _install_shutdown_drain(
     app.router.lifespan_context = combined_lifespan
 
 
+# The CLI flag that overrides a configuration field, by the field name
+# pydantic reports in a ValidationError's loc. The env var needs no table: it
+# is the upper-cased, "_"-joined loc (BACKEND_URL, MAX_TRACES_PER_QUERY),
+# because config.py names every variable after its field. The secondary
+# backend has env vars only.
+_CONFIG_FIELD_FLAGS: dict[str, str] = {
+    "type": "--backend",
+    "url": "--url",
+    "api_key": "--api-key",
+    "app_key": "--app-key",
+    "sentry_org": "--sentry-org",
+    "sentry_project": "--sentry-project",
+    "tempo_instance_id": "--tempo-instance-id",
+    "aws_region": "--aws-region",
+    "newrelic_account_id": "--newrelic-account-id",
+    "honeycomb_dataset": "--honeycomb-dataset",
+    "environments": "--environments",
+    "log_level": "--log-level",
+    "max_traces_per_query": "--max-traces-per-query",
+    "slow_request_threshold_ms": "--slow-request-threshold-ms",
+    "query_cache_ttl_seconds": "--query-cache-ttl-seconds",
+    "query_cache_max_entries": "--query-cache-max-entries",
+}
+# A bare TypeAdapter error is titled after pydantic's internal validator
+# wrapper, "function-wrap[wrap_val()]", and may prefix its messages the same
+# way; operator text names options, never pydantic internals.
+_PYDANTIC_WRAPPER_RE = re.compile(r"function-[a-z]+\[[^\]]*\]")
+_PYDANTIC_WRAPPER_PREFIX_RE = re.compile(r"^(?:function-[a-z]+\[[^\]]*\]:\s*)+")
+
+
+def _config_error_name(title: str, loc: tuple[int | str, ...]) -> str:
+    """The operator-facing spelling of a ValidationError location: the env
+    var and, where one exists, the CLI flag ("BACKEND_URL (--url)",
+    "BACKEND_TIMEOUT"); "configuration" for an error pydantic reports with
+    no location at all."""
+    parts = [str(part) for part in loc]
+    if not parts:
+        return "configuration"
+    if title == "BackendConfig":
+        # Validated on its own (not as ServerConfig's `backend` field), the
+        # model's fields are still the primary backend's variables.
+        parts = ["backend", *parts]
+    name = "_".join(parts).upper()
+    flag = _CONFIG_FIELD_FLAGS.get(parts[-1]) if parts[0] != "secondary_backend" else None
+    return f"{name} ({flag})" if flag else name
+
+
 def _format_config_error(error: Exception) -> str:
     """The text main() and doctor report for a failed configuration load.
 
@@ -2329,14 +2376,23 @@ def _format_config_error(error: Exception) -> str:
     a URL out of pydantic altogether; this is the second half: only each
     error's location and message are reported - never input_value, never
     str(exc) - and the result passes through the redaction once more in
-    case a message itself quotes a URL.
+    case a message itself quotes a URL. The location is rendered as the
+    option the operator set (_config_error_name) and pydantic's internal
+    validator names are dropped: a bare TypeAdapter error used to render as
+    "function-wrap[wrap_val()]: function-wrap[wrap_val()]: Input should be
+    a valid URL ..." with no option name (round-2 review).
     """
     if isinstance(error, ValidationError):
         problems = "; ".join(
-            f"{'.'.join(str(part) for part in err['loc']) or error.title}: {err['msg']}"
+            f"{_config_error_name(error.title, err['loc'])}: "
+            f"{_PYDANTIC_WRAPPER_PREFIX_RE.sub('', err['msg'])}"
             for err in error.errors(include_url=False, include_input=False)
         )
-        text = f"{error.title}: {problems}"
+        text = (
+            problems
+            if _PYDANTIC_WRAPPER_RE.fullmatch(error.title)
+            else f"{error.title}: {problems}"
+        )
     else:
         text = str(error)
     return redact_userinfo_in_text(text)

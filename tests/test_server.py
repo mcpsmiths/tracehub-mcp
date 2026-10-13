@@ -27,7 +27,7 @@ import pytest
 from click.testing import CliRunner
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from pydantic import HttpUrl, ValidationError
+from pydantic import HttpUrl, TypeAdapter, ValidationError
 from starlette.testclient import TestClient
 
 from opentelemetry_mcp import server
@@ -2594,7 +2594,7 @@ class TestConfigErrorsReportLocationAndMessageOnly:
 
         text = server._format_config_error(exc_info.value)
 
-        assert "url" in text
+        assert "BACKEND_URL (--url)" in text
         assert "must not embed credentials" in text
         assert "input_value" not in text
         _assert_credential_free(text)
@@ -2603,6 +2603,65 @@ class TestConfigErrorsReportLocationAndMessageOnly:
         text = server._format_config_error(ValueError("bad config at https://u:pw@h.test/"))
 
         assert text == "bad config at https://[REDACTED]@h.test/"
+
+    def test_malformed_url_flag_names_the_option(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Round-2 review of the config-error rendering: a credential-free
+        malformed --url rendered as 'function-wrap[wrap_val()]:
+        function-wrap[wrap_val()]: Input should be a valid URL, relative
+        URL without a base' - pydantic's internal validator name twice, no
+        option name, no value. The operator must be told which option."""
+        runner = CliRunner()
+        with caplog.at_level(logging.ERROR), patch.object(server, "mcp"):
+            result = runner.invoke(server.main, ["--print-config", "--url", "not a url"])
+
+        assert result.exit_code == 1
+        (record,) = [r for r in caplog.records if "Configuration error" in r.message]
+        assert "--url" in record.message
+        assert "valid URL" in record.message
+        assert "function-wrap" not in record.message
+        assert "input_value" not in record.message
+
+    def test_doctor_malformed_url_flag_names_the_option(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(server.main, ["doctor", "--url", "not a url"])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Configuration" in result.output
+        assert "--url" in result.output
+        assert "function-wrap" not in result.output
+
+    def test_field_errors_render_as_env_var_and_flag(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            ServerConfig(
+                backend=BackendConfig(type="jaeger", url=HttpUrl("http://localhost:16686")),
+                max_traces_per_query=5000,
+            )
+
+        text = server._format_config_error(exc_info.value)
+
+        assert text == (
+            "ServerConfig: MAX_TRACES_PER_QUERY (--max-traces-per-query): "
+            "Input should be less than or equal to 1000"
+        )
+
+    def test_nested_backend_field_errors_render_with_their_prefix(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            BackendConfig(type="jaeger", url=HttpUrl("http://localhost:16686"), timeout=0)
+
+        text = server._format_config_error(exc_info.value)
+
+        assert "BACKEND_TIMEOUT (--timeout)" not in text  # no such flag: env var only
+        assert text == "BackendConfig: BACKEND_TIMEOUT: Input should be greater than 0"
+
+    def test_loc_less_validation_error_drops_pydantic_wrapper_names(self) -> None:
+        """Defence in depth should a bare TypeAdapter error ever reach the
+        formatter again: no 'function-wrap[...]' text, a generic name."""
+        with pytest.raises(ValidationError) as exc_info:
+            TypeAdapter(HttpUrl).validate_python("not a url")
+
+        text = server._format_config_error(exc_info.value)
+
+        assert text == "configuration: Input should be a valid URL, relative URL without a base"
 
     def test_out_of_range_env_value_names_the_field_not_the_input(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -2614,7 +2673,7 @@ class TestConfigErrorsReportLocationAndMessageOnly:
 
         assert result.exit_code == 1
         (record,) = [r for r in caplog.records if "Configuration error" in r.message]
-        assert "max_traces_per_query" in record.message
+        assert "MAX_TRACES_PER_QUERY (--max-traces-per-query)" in record.message
         assert "less than or equal to 1000" in record.message
         assert "input_value" not in record.message
 
@@ -2627,7 +2686,7 @@ class TestConfigErrorsReportLocationAndMessageOnly:
 
         assert result.exit_code == 1
         assert "[FAIL] Configuration" in result.output
-        assert "max_traces_per_query" in result.output
+        assert "MAX_TRACES_PER_QUERY (--max-traces-per-query)" in result.output
         assert "input_value" not in result.output
 
 
