@@ -82,9 +82,9 @@ Concrete implementations:
 - [backends/traceloop.py](opentelemetry_mcp/backends/traceloop.py) - Traceloop backend
 - [backends/datadog.py](opentelemetry_mcp/backends/datadog.py) - Datadog backend
 - [backends/sentry.py](opentelemetry_mcp/backends/sentry.py) - Sentry backend
-- [backends/xray.py](opentelemetry_mcp/backends/xray.py) - AWS X-Ray backend (boto3/SigV4, not httpx - see its module docstring)
+- [backends/xray.py](opentelemetry_mcp/backends/xray.py) - AWS X-Ray backend (boto3/SigV4, not httpx - see its module docstring; every boto3 call goes through `_call` on the instance's private `ThreadPoolExecutor(8)` behind a same-size `asyncio.Semaphore`, never the loop's default executor - `_MAX_CONCURRENT_XRAY_CALLS` is fixed, no env var; `close()` shuts the pool down)
 - [backends/newrelic.py](opentelemetry_mcp/backends/newrelic.py) - New Relic backend (NerdGraph GraphQL API - built without a live account to verify against, see its module docstring for exactly what's unverified)
-- [backends/honeycomb.py](opentelemetry_mcp/backends/honeycomb.py) - Honeycomb backend (Query Data API - built without a live account to verify against; the programmatic Query Data API is documented as Enterprise-plan exclusive, see its module docstring)
+- [backends/honeycomb.py](opentelemetry_mcp/backends/honeycomb.py) - Honeycomb backend (Query Data API - built without a live account to verify against; the programmatic Query Data API is documented as Enterprise-plan exclusive, see its module docstring; Create Query Result runs pace through one `_RateLimiter` per `(url, api_key)` - `_shared_rate_limiter`, 10/min, shared by a same-key `SECONDARY_BACKEND_*` instance and the `/ready` probe - and `acquire(max_wait_seconds=self.timeout)` raises `HoneycombRateLimitedError` instead of parking a caller past `BACKEND_TIMEOUT`)
 
 ### Tool-Based Architecture
 
