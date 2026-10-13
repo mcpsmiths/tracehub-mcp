@@ -1986,6 +1986,30 @@ def _install_shutdown_drain(
     app.router.lifespan_context = combined_lifespan
 
 
+def _format_config_error(error: Exception) -> str:
+    """The text main() and doctor report for a failed configuration load.
+
+    A pydantic ValidationError's str() appends input_value=<the raw value>
+    to every error, truncated by pydantic-core to 24 + "..." + 23
+    characters. For a credentialed URL that cut removed the "@"
+    redact_userinfo_in_text keys on, so the password prefix was printed
+    (runtime verification P7b). config._reject_url_userinfo now keeps such
+    a URL out of pydantic altogether; this is the second half: only each
+    error's location and message are reported - never input_value, never
+    str(exc) - and the result passes through the redaction once more in
+    case a message itself quotes a URL.
+    """
+    if isinstance(error, ValidationError):
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in err['loc']) or error.title}: {err['msg']}"
+            for err in error.errors(include_url=False, include_input=False)
+        )
+        text = f"{error.title}: {problems}"
+    else:
+        text = str(error)
+    return redact_userinfo_in_text(text)
+
+
 def _print_config_backend_dict(backend_config: BackendConfig) -> dict[str, Any]:
     """Shape shared by --print-config's "backend"/"secondary_backend" keys.
     Built by hand, not model_dump(): sentry_org/sentry_project/
@@ -2461,8 +2485,8 @@ def main(
                 _apply_log_level(_config.log_level)
         except (ValidationError, ValueError) as e:
             # pydantic's ValidationError echoes input_value='<the URL>' and a
-            # traceback would print it again: the redacted message only.
-            logger.error(f"Configuration error: {redact_userinfo_in_text(str(e))}")
+            # traceback would print it again: location and message only.
+            logger.error(f"Configuration error: {_format_config_error(e)}")
             sys.exit(1)
 
         if print_config:
@@ -2683,7 +2707,7 @@ def doctor(
         click.secho("[OK] Configuration loaded and validated", fg="green")
     except Exception as e:
         # pydantic's ValidationError echoes the raw input URL (see main()).
-        click.secho(f"[FAIL] Configuration: {redact_userinfo_in_text(str(e))}", fg="red")
+        click.secho(f"[FAIL] Configuration: {_format_config_error(e)}", fg="red")
         sys.exit(1)
 
     try:

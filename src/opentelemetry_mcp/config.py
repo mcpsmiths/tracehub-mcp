@@ -4,18 +4,53 @@ import logging
 import math
 import os
 from typing import Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, field_validator
 
 from opentelemetry_mcp.backends.base import DEFAULT_MAX_RESPONSE_BYTES
 from opentelemetry_mcp.backends.cache import DEFAULT_QUERY_CACHE_MAX_ENTRIES
-from opentelemetry_mcp.security import is_cloud_metadata_host, is_loopback_host
+from opentelemetry_mcp.security import (
+    is_cloud_metadata_host,
+    is_loopback_host,
+    redact_userinfo_in_text,
+)
 
 logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
+
+
+def _reject_url_userinfo(raw_url: str, *, source: str) -> None:
+    """Refuse a URL carrying a userinfo component BEFORE pydantic parses it.
+
+    BackendConfig.validate_url rejects the same URLs, but by then the raw
+    string is pydantic's input: a ValidationError's str() appends
+    input_value=<the URL> truncated by pydantic-core to 24 + "..." + 23
+    characters, and for a URL longer than ~50 characters that cut removes
+    the "@" the textual redaction (security.redact_userinfo_in_text) keys
+    on - so the password's leading characters survived in the startup error
+    on every surface (runtime verification P7b). Judging the raw env/CLI
+    string here means a credentialed URL never becomes a ValidationError
+    input at all; the only text that leaves is the redacted URL. `source`
+    names the variable or flag the value came from.
+    """
+    try:
+        parts = urlsplit(raw_url)
+        has_userinfo = bool(parts.username or parts.password)
+    except ValueError:
+        # Malformed authority (an unbalanced IPv6 bracket): pydantic would
+        # echo it too, so fall through to the textual shape check alone.
+        has_userinfo = False
+    redacted = redact_userinfo_in_text(raw_url)
+    if has_userinfo or redacted != raw_url:
+        raise ValueError(
+            f"{source} must not embed credentials (user:password@host); got {redacted!r}. "
+            "Use BACKEND_API_KEY (Bearer) or BACKEND_TEMPO_INSTANCE_ID + BACKEND_API_KEY "
+            "(Basic) so the secret is never stringified"
+        )
 
 
 class BackendConfig(BaseModel):
@@ -165,6 +200,7 @@ class BackendConfig(BaseModel):
             )
         if not backend_url:
             raise ValueError(f"{prefix}URL is required when {prefix}TYPE is set")
+        _reject_url_userinfo(backend_url, source=f"{prefix}URL")
 
         # Parse environments from comma-separated string
         environments_str = os.getenv(f"{prefix}ENVIRONMENTS", "prd")
@@ -396,6 +432,9 @@ class ServerConfig(BaseModel):
             # bypassing validate_url's scheme/metadata/CVE-2025-6514 checks
             # entirely, since direct attribute assignment on an already
             # constructed model does not re-run field validators here.
+            # The userinfo check runs on the raw string first: the TypeAdapter's
+            # own ValidationError would echo a malformed credentialed URL.
+            _reject_url_userinfo(backend_url, source="--url")
             parsed = TypeAdapter(HttpUrl).validate_python(backend_url)
             self.backend.url = BackendConfig.validate_url(parsed)
 

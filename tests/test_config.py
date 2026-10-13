@@ -202,8 +202,12 @@ class TestUserinfoInBackendUrl:
         monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "jaeger")
         monkeypatch.setenv("SECONDARY_BACKEND_URL", f"https://u:{VFY_MARKER}@h.test")
 
-        with pytest.raises(ValidationError, match="must not embed credentials"):
+        # A plain ValueError: the env path refuses the raw string before
+        # pydantic can echo it (see TestUserinfoIsRefusedBeforePydanticParsesTheUrl).
+        with pytest.raises(ValueError, match="must not embed credentials") as exc_info:
             BackendConfig.from_env_optional()
+
+        assert VFY_MARKER not in str(exc_info.value)
 
     def test_rejection_logs_nothing_containing_the_password(
         self, caplog: pytest.LogCaptureFixture
@@ -247,3 +251,118 @@ class TestUserinfoInBackendUrl:
         assert VFY_MARKER_A not in repr(config)
         assert VFY_MARKER_B not in repr(config)
         assert VFY_MARKER_A not in str(config)
+
+
+# Fragments only - no contiguous credential-shaped literal in this file.
+LONG_USER = "judgeuser"
+LONG_PASSWORD = "".join(["Qz7Vk", "Mx9Rt", "LpWnY", "bHdFg", "Js"])
+
+
+def _assert_credential_free(text: str) -> None:
+    assert LONG_USER not in text
+    for start in range(len(LONG_PASSWORD) - 3):
+        assert LONG_PASSWORD[start : start + 4] not in text, LONG_PASSWORD[start : start + 4]
+
+
+class TestUserinfoIsRefusedBeforePydanticParsesTheUrl:
+    """pydantic-core echoes a ValidationError's input_value truncated to
+    24 + "..." + 23 characters, which for a credentialed URL over ~50 chars
+    removes the "@" the textual redaction needs and leaves the password
+    prefix in the one message guaranteed to be printed. The raw env/CLI
+    value is therefore checked with urllib.parse.urlsplit first and refused
+    with a plain ValueError that quotes only the redacted URL; a credential
+    never becomes a ValidationError input at all."""
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            "tempo.internal.example.com/tempo",
+            "127.0.0.1:18199/a/longer/base/path",
+            "127.0.0.1:18164/?x=1#frag",
+            "[2001:db8::1]:3200/tempo/api/search?limit=20#top",
+        ],
+    )
+    def test_backend_url_env_raises_a_plain_value_error_with_the_redacted_url(
+        self, monkeypatch: pytest.MonkeyPatch, tail: str
+    ) -> None:
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", f"https://{LONG_USER}:{LONG_PASSWORD}@{tail}")
+
+        with pytest.raises(ValueError, match="must not embed credentials") as exc_info:
+            BackendConfig.from_env()
+
+        assert not isinstance(exc_info.value, ValidationError)
+        text = str(exc_info.value)
+        assert text.startswith("BACKEND_URL ")
+        assert f"https://[REDACTED]@{tail}" in text
+        _assert_credential_free(text)
+
+    def test_secondary_backend_url_env_names_its_own_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv(
+            "SECONDARY_BACKEND_URL",
+            f"https://{LONG_USER}:{LONG_PASSWORD}@observability.corp.example.com:443/tempo",
+        )
+
+        with pytest.raises(ValueError, match="must not embed credentials") as exc_info:
+            BackendConfig.from_env_optional()
+
+        assert not isinstance(exc_info.value, ValidationError)
+        assert str(exc_info.value).startswith("SECONDARY_BACKEND_URL ")
+        _assert_credential_free(str(exc_info.value))
+
+    def test_cli_url_override_refuses_before_the_type_adapter_can_echo_it(self) -> None:
+        """A credentialed URL pydantic cannot even parse used to surface as
+        the TypeAdapter's ValidationError, input_value included."""
+        config = ServerConfig(backend=BackendConfig(type="jaeger", url=HttpUrl("http://localhost")))
+        malformed = f"https://{LONG_USER}:{LONG_PASSWORD}@h.test:notaport/very/long/path/here"
+
+        with pytest.raises(ValueError, match="must not embed credentials") as exc_info:
+            config.apply_cli_overrides(backend_url=malformed)
+
+        assert not isinstance(exc_info.value, ValidationError)
+        _assert_credential_free(str(exc_info.value))
+        assert str(config.backend.url) == "http://localhost/"
+
+    def test_malformed_ipv6_authority_with_userinfo_is_still_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """urlsplit raises for an unbalanced bracket; the textual shape
+        check must still keep the raw value away from pydantic."""
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", f"https://{LONG_USER}:{LONG_PASSWORD}@[2001:db8::1/x")
+
+        with pytest.raises(ValueError, match="must not embed credentials") as exc_info:
+            BackendConfig.from_env()
+
+        assert not isinstance(exc_info.value, ValidationError)
+        _assert_credential_free(str(exc_info.value))
+
+    def test_password_with_a_literal_at_sign_is_fully_redacted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv(
+            "BACKEND_URL", f"https://{LONG_USER}:p@{LONG_PASSWORD}@tempo.internal.example.com/x"
+        )
+
+        with pytest.raises(ValueError, match="must not embed credentials") as exc_info:
+            BackendConfig.from_env()
+
+        _assert_credential_free(str(exc_info.value))
+        assert "p@" not in str(exc_info.value)
+
+    def test_credential_free_urls_still_reach_pydantic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Positive controls: a normal URL loads, and a malformed one
+        without userinfo still gets pydantic's own diagnosis."""
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", "https://tempo.internal.example.com:3200/tempo")
+        assert str(BackendConfig.from_env().url) == "https://tempo.internal.example.com:3200/tempo"
+
+        monkeypatch.setenv("BACKEND_URL", "not a url at all")
+        with pytest.raises(ValidationError):
+            BackendConfig.from_env()

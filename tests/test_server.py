@@ -15,6 +15,7 @@ CLI entrypoint.
 import io
 import json
 import logging
+import re
 from collections.abc import Generator
 from datetime import datetime
 from typing import Any
@@ -26,7 +27,7 @@ import pytest
 from click.testing import CliRunner
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from pydantic import HttpUrl
+from pydantic import HttpUrl, ValidationError
 from starlette.testclient import TestClient
 
 from opentelemetry_mcp import server
@@ -2243,8 +2244,8 @@ class TestConfigErrorsNeverEchoUserinfo:
     def test_userinfo_in_backend_url_env_var_is_rejected_without_a_traceback(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The env path raises pydantic's ValidationError (which echoes the
-        raw input) rather than the CLI path's plain ValueError."""
+        """The env path refuses the raw string before pydantic sees it and
+        quotes only the redacted URL in its message."""
         monkeypatch.setenv("BACKEND_URL", f"https://u:{self.MARKER}@h.test")
         runner = CliRunner()
         with caplog.at_level(logging.ERROR), patch.object(server, "mcp") as mock_mcp:
@@ -2411,3 +2412,214 @@ class TestConfigErrorsNeverEchoUserinfo:
         (line,) = [r.message for r in caplog.records if "connected to:" in r.message]
         assert line.rpartition("connected to: ")[2] == "https://h.test/"
         assert self.MARKER not in line
+
+
+# A credentialed URL long enough that pydantic-core's input_value echo
+# (24 leading + "..." + 23 trailing characters) cuts out the "@" the textual
+# redaction keys on. Fragments only - no contiguous credential-shaped literal.
+LONG_URL_USER = "judgeuser"
+LONG_URL_PASSWORD = "".join(["Qz7Vk", "Mx9Rt", "LpWnY", "bHdFg", "Js"])
+LONG_URL_TAILS = [
+    "tempo.internal.example.com/tempo",
+    "127.0.0.1:18199/a/longer/base/path",
+    "127.0.0.1:18164/?x=1#frag",
+    "observability.corp.example.com:443/tempo",
+    "[2001:db8::1]:3200/tempo/api/search?limit=20#top",
+]
+
+
+def _long_credentialed_url(tail: str, scheme: str = "https") -> str:
+    return f"{scheme}://{LONG_URL_USER}:{LONG_URL_PASSWORD}@{tail}"
+
+
+def _assert_credential_free(text: str) -> None:
+    """Neither the username nor any 4-character run of the password may
+    appear, and every URL authority shown either carries the redaction
+    marker or no userinfo at all."""
+    assert LONG_URL_USER not in text
+    for start in range(len(LONG_URL_PASSWORD) - 3):
+        run = LONG_URL_PASSWORD[start : start + 4]
+        assert run not in text, run
+    for match in re.finditer(r"://([^/?#\s]*@)", text):
+        assert match.group(1) == "[REDACTED]@", match.group(0)
+
+
+@pytest.mark.parametrize("tail", LONG_URL_TAILS)
+class TestLongCredentialedUrlsNeverLeakAPasswordPrefix:
+    """Runtime verification P7b: for BACKEND_URL / SECONDARY_BACKEND_URL /
+    --url values longer than ~50 characters the startup error printed
+    input_value='https://judgeuser:JUDGED...ernal.example.com/tempo' - the
+    password prefix - on every surface, because pydantic-core truncates the
+    echoed input before redact_userinfo_in_text can find the "@". Every
+    surface must exit 1 and print nothing of the credential."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", "http://localhost:16686")
+        monkeypatch.delenv("BACKEND_API_KEY", raising=False)
+        monkeypatch.delenv("SECONDARY_BACKEND_TYPE", raising=False)
+        monkeypatch.delenv("SECONDARY_BACKEND_URL", raising=False)
+        monkeypatch.delenv("MCP_HTTP_BEARER_TOKEN", raising=False)
+
+    def _config_error_record(self, caplog: pytest.LogCaptureFixture) -> logging.LogRecord:
+        (record,) = [r for r in caplog.records if "Configuration error" in r.message]
+        assert record.exc_info is None
+        return record
+
+    def test_print_config_with_backend_url_env(
+        self, tail: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("BACKEND_URL", _long_credentialed_url(tail))
+        runner = CliRunner()
+        with caplog.at_level(logging.DEBUG), patch.object(server, "mcp") as mock_mcp:
+            result = runner.invoke(server.main, ["--print-config"])
+
+        assert result.exit_code == 1
+        _assert_credential_free(result.output)
+        _assert_credential_free(caplog.text)
+        assert "must not embed credentials" in self._config_error_record(caplog).message
+        mock_mcp.run.assert_not_called()
+
+    def test_print_config_with_secondary_backend_url_env(
+        self, tail: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("SECONDARY_BACKEND_URL", _long_credentialed_url(tail))
+        runner = CliRunner()
+        with caplog.at_level(logging.DEBUG), patch.object(server, "mcp"):
+            result = runner.invoke(server.main, ["--print-config"])
+
+        assert result.exit_code == 1
+        _assert_credential_free(result.output)
+        _assert_credential_free(caplog.text)
+        assert "SECONDARY_BACKEND_URL" in self._config_error_record(caplog).message
+
+    def test_print_config_with_url_flag(self, tail: str, caplog: pytest.LogCaptureFixture) -> None:
+        runner = CliRunner()
+        with caplog.at_level(logging.DEBUG), patch.object(server, "mcp"):
+            result = runner.invoke(
+                server.main, ["--print-config", "--url", _long_credentialed_url(tail)]
+            )
+
+        assert result.exit_code == 1
+        _assert_credential_free(result.output)
+        _assert_credential_free(caplog.text)
+        assert "must not embed credentials" in self._config_error_record(caplog).message
+
+    def test_http_startup_with_backend_url_env(
+        self, tail: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("BACKEND_URL", _long_credentialed_url(tail, scheme="http"))
+        runner = CliRunner()
+        with (
+            caplog.at_level(logging.DEBUG),
+            patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls,
+        ):
+            mock_server_cls.return_value.serve = AsyncMock()
+            result = runner.invoke(server.main, ["--transport", "http"])
+
+        assert result.exit_code == 1
+        _assert_credential_free(result.output)
+        _assert_credential_free(caplog.text)
+        self._config_error_record(caplog)
+        mock_server_cls.return_value.serve.assert_not_awaited()
+
+    def test_stdio_startup_with_backend_url_env(
+        self, tail: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("BACKEND_URL", _long_credentialed_url(tail))
+        runner = CliRunner()
+        with caplog.at_level(logging.DEBUG), patch.object(server, "mcp") as mock_mcp:
+            result = runner.invoke(server.main, ["--transport", "stdio"])
+
+        assert result.exit_code == 1
+        _assert_credential_free(result.output)
+        _assert_credential_free(caplog.text)
+        self._config_error_record(caplog)
+        mock_mcp.run.assert_not_called()
+
+    def test_doctor_with_backend_url_env(self, tail: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_URL", _long_credentialed_url(tail))
+        runner = CliRunner()
+        result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Configuration" in result.output
+        assert "must not embed credentials" in result.output
+        _assert_credential_free(result.output)
+
+    def test_doctor_with_secondary_backend_url_env(
+        self, tail: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SECONDARY_BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("SECONDARY_BACKEND_URL", _long_credentialed_url(tail))
+        runner = CliRunner()
+        result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Configuration" in result.output
+        assert "SECONDARY_BACKEND_URL" in result.output
+        _assert_credential_free(result.output)
+
+    def test_doctor_with_url_flag(self, tail: str) -> None:
+        runner = CliRunner()
+        result = runner.invoke(server.main, ["doctor", "--url", _long_credentialed_url(tail)])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Configuration" in result.output
+        _assert_credential_free(result.output)
+
+
+class TestConfigErrorsReportLocationAndMessageOnly:
+    """Defence in depth behind the config-layer pre-check: should a
+    ValidationError still reach main()/doctor, only each error's location
+    and message are printed - never input_value, never str(exc)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", "http://localhost:16686")
+        monkeypatch.delenv("MAX_TRACES_PER_QUERY", raising=False)
+
+    def test_validation_error_text_carries_no_input_value(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            BackendConfig(type="jaeger", url=HttpUrl(_long_credentialed_url(LONG_URL_TAILS[0])))
+
+        text = server._format_config_error(exc_info.value)
+
+        assert "url" in text
+        assert "must not embed credentials" in text
+        assert "input_value" not in text
+        _assert_credential_free(text)
+
+    def test_plain_value_error_text_is_passed_through_redacted(self) -> None:
+        text = server._format_config_error(ValueError("bad config at https://u:pw@h.test/"))
+
+        assert text == "bad config at https://[REDACTED]@h.test/"
+
+    def test_out_of_range_env_value_names_the_field_not_the_input(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("MAX_TRACES_PER_QUERY", "5000")
+        runner = CliRunner()
+        with caplog.at_level(logging.ERROR), patch.object(server, "mcp"):
+            result = runner.invoke(server.main, ["--print-config"])
+
+        assert result.exit_code == 1
+        (record,) = [r for r in caplog.records if "Configuration error" in r.message]
+        assert "max_traces_per_query" in record.message
+        assert "less than or equal to 1000" in record.message
+        assert "input_value" not in record.message
+
+    def test_doctor_out_of_range_env_value_names_the_field_not_the_input(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAX_TRACES_PER_QUERY", "5000")
+        runner = CliRunner()
+        result = runner.invoke(server.main, ["doctor"])
+
+        assert result.exit_code == 1
+        assert "[FAIL] Configuration" in result.output
+        assert "max_traces_per_query" in result.output
+        assert "input_value" not in result.output
