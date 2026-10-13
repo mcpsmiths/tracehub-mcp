@@ -11,6 +11,7 @@ pattern for mocking _get_backend.
 """
 
 import asyncio
+import logging
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -109,7 +110,10 @@ def test_ready_returns_503_when_health_check_unhealthy() -> None:
     assert response.status_code == 503
     body = response.json()
     assert body["status"] == "not_ready"
-    assert body["health_check"]["error"] == "connection refused"
+    assert body["health_check"]["status"] == "unhealthy"
+    # The body carries a class, never the backend's own text (see
+    # TestReadyBodyCarriesOnlyAGenericErrorClass).
+    assert body["health_check"]["error"] == "backend unreachable"
 
 
 def test_ready_returns_503_when_list_services_raises() -> None:
@@ -122,7 +126,7 @@ def test_ready_returns_503_when_list_services_raises() -> None:
     assert response.status_code == 503
     body = response.json()
     assert body["status"] == "not_ready"
-    assert body["list_services"]["error"] == "timeout"
+    assert body["list_services"]["error"] == "backend timeout"
 
 
 def test_ready_returns_503_when_get_backend_itself_raises() -> None:
@@ -135,14 +139,15 @@ def test_ready_returns_503_when_get_backend_itself_raises() -> None:
             response = client.get("/ready")
 
     assert response.status_code == 503
-    assert response.json()["error"] == "Server configuration not set"
+    assert response.json() == {"status": "not_ready", "error": "backend error"}
 
 
 class TestReadyNeverEchoesUrlUserinfo:
-    """/ready answers unauthenticated peers; the error strings it copies out
-    of health_check/list_services embed the request URL (httpx's
-    HTTPStatusError text), so any credential a bypassed config left in the
-    URL must be redacted inside _run_backend_checks - doctor inherits it."""
+    """/ready answers unauthenticated peers. The error strings
+    health_check/list_services produce embed the request URL (httpx's
+    HTTPStatusError text): _run_backend_checks redacts them for doctor and
+    the server log, and the /ready body itself now carries only a short
+    error class, so neither a credential nor the host can leave."""
 
     MARKER = "VFY-PW-ready"
     ERROR = f"Client error '401 Unauthorized' for url 'https://u:{MARKER}@h.test/api/services'"
@@ -163,7 +168,8 @@ class TestReadyNeverEchoesUrlUserinfo:
 
         assert response.status_code == 503
         assert self.MARKER not in response.text
-        assert "h.test/api/services" in response.json()["health_check"]["error"]
+        assert "h.test" not in response.text
+        assert response.json()["health_check"]["error"] == "backend error 401"
 
     def test_health_check_exception_and_list_services_error_are_redacted(self) -> None:
         fake_backend = _healthy_backend()
@@ -175,9 +181,10 @@ class TestReadyNeverEchoesUrlUserinfo:
 
         assert response.status_code == 503
         assert self.MARKER not in response.text
+        assert "h.test" not in response.text
         body = response.json()
-        assert "[REDACTED]@h.test" in body["health_check"]["error"]
-        assert "[REDACTED]@h.test" in body["list_services"]["error"]
+        assert body["health_check"]["error"] == "backend error 401"
+        assert body["list_services"]["error"] == "backend error 401"
 
     def test_get_backend_failure_is_redacted(self) -> None:
         with patch.object(server, "_get_backend", AsyncMock(side_effect=RuntimeError(self.ERROR))):
@@ -535,3 +542,206 @@ class TestReadyNeverAnsweredFromTheQueryCache:
         assert body["health_check"]["status"] == "unhealthy"
         assert "401" in body["health_check"]["error"]
         assert "401" in body["list_services"]["error"]
+
+
+class TestReadyBodyCarriesOnlyAGenericErrorClass:
+    """Runtime verification probe-4 P1-P3: the unauthenticated /ready 503
+    body echoed the backend's internal URL host:port and httpx's raw error
+    text ("All connection attempts failed", "Client error '503 ...' for url
+    'http://127.0.0.1:18164/api/services'"), and a failed or timed-out probe
+    left no server log line. The body now names a short class per failing
+    half - 'backend unreachable', 'backend timeout', 'backend error <status>',
+    'backend unhealthy' - and the redacted detail is logged once at WARNING,
+    bounded and repr-quoted like the Host/Origin rejection lines."""
+
+    FAKE_HOST_PORT = "127.0.0.1:18164"
+
+    def _ready(self, fake_backend: AsyncMock) -> Any:
+        with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+            with _build_client() as client:
+                return client.get("/ready")
+
+    def test_unhealthy_status_text_is_classified_and_the_detail_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fake_backend = _healthy_backend()
+        detail = (
+            f"Server error '503 Service Unavailable' for url "
+            f"'http://{self.FAKE_HOST_PORT}/api/services'"
+        )
+        fake_backend.health_check = AsyncMock(
+            return_value=HealthCheckResponse(
+                status="unhealthy", backend="jaeger", url="http://x", error=detail
+            )
+        )
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.server"):
+            response = self._ready(fake_backend)
+
+        assert response.status_code == 503
+        assert response.json()["health_check"] == {
+            "status": "unhealthy",
+            "error": "backend error 503",
+        }
+        assert self.FAKE_HOST_PORT not in response.text
+        assert "Service Unavailable" not in response.text
+        [message] = [
+            r.getMessage() for r in caplog.records if "Readiness probe failed" in r.getMessage()
+        ]
+        assert self.FAKE_HOST_PORT in message
+        assert repr(detail) in message
+
+    def test_transport_exceptions_are_classified_by_type(self) -> None:
+        fake_backend = _healthy_backend()
+        fake_backend.health_check = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        fake_backend.list_services = AsyncMock(
+            side_effect=httpx.ConnectError(
+                f"All connection attempts failed for http://{self.FAKE_HOST_PORT}/"
+            )
+        )
+
+        response = self._ready(fake_backend)
+
+        assert response.status_code == 503
+        body = response.json()
+        assert body["health_check"] == {"status": "error", "error": "backend timeout"}
+        assert body["list_services"] == {"error": "backend unreachable"}
+        assert self.FAKE_HOST_PORT not in response.text
+
+    def test_http_status_exception_names_the_status_only(self) -> None:
+        fake_backend = _healthy_backend()
+        request = httpx.Request("GET", f"http://{self.FAKE_HOST_PORT}/api/services")
+        response_401 = httpx.Response(401, request=request)
+        fake_backend.list_services = AsyncMock(
+            side_effect=httpx.HTTPStatusError("boom", request=request, response=response_401)
+        )
+
+        response = self._ready(fake_backend)
+
+        assert response.json()["list_services"] == {"error": "backend error 401"}
+        assert self.FAKE_HOST_PORT not in response.text
+
+    def test_a_healthy_body_keeps_its_shape(self) -> None:
+        response = self._ready(_healthy_backend())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "ready",
+            "health_check": {"status": "healthy", "error": None},
+            "list_services": {"count": 2},
+        }
+
+    def test_detail_is_logged_once_per_fresh_probe(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake_backend = _healthy_backend()
+        fake_backend.list_services = AsyncMock(side_effect=RuntimeError("probe detail"))
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.server"):
+            with patch.object(server, "_get_backend", AsyncMock(return_value=fake_backend)):
+                with _build_client() as client:
+                    first = client.get("/ready")
+                    second = client.get("/ready")
+
+        assert first.status_code == second.status_code == 503
+        failures = [r for r in caplog.records if "Readiness probe failed" in r.getMessage()]
+        assert len(failures) == 1
+        assert "probe detail" in failures[0].getMessage()
+
+    def test_log_line_is_bounded_and_quoted(self, caplog: pytest.LogCaptureFixture) -> None:
+        fake_backend = _healthy_backend()
+        oversized = "x\n" + "a" * (50 * server._MAX_LOGGED_PROBE_ERROR_CHARS)
+        fake_backend.list_services = AsyncMock(side_effect=RuntimeError(oversized))
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.server"):
+            self._ready(fake_backend)
+
+        [message] = [
+            r.getMessage() for r in caplog.records if "Readiness probe failed" in r.getMessage()
+        ]
+        assert "\n" not in message
+        assert "'x\\n" in message
+        assert len(message) <= 128 + 2 * server._MAX_LOGGED_PROBE_ERROR_CHARS
+
+    def test_timed_out_probe_is_logged(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(server, "_READINESS_CHECK_TIMEOUT_SECONDS", 0.05)
+        fake_backend = _healthy_backend()
+        never = asyncio.Event()
+
+        async def _hang() -> list[str]:
+            await never.wait()
+            return []
+
+        fake_backend.list_services = AsyncMock(side_effect=_hang)
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.server"):
+            response = self._ready(fake_backend)
+
+        assert response.status_code == 503
+        assert "timed out" in response.json()["error"]
+        assert any(
+            "Readiness probe failed" in r.getMessage() and "timed out" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_get_backend_failure_is_generic_in_the_body_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        detail = f"Backend construction failed for http://u:pw@{self.FAKE_HOST_PORT}/"
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.server"):
+            with patch.object(server, "_get_backend", AsyncMock(side_effect=RuntimeError(detail))):
+                with _build_client() as client:
+                    response = client.get("/ready")
+
+        assert response.status_code == 503
+        assert response.json() == {"status": "not_ready", "error": "backend error"}
+        assert self.FAKE_HOST_PORT not in response.text
+        [message] = [r.getMessage() for r in caplog.records if "Readiness probe" in r.getMessage()]
+        assert f"[REDACTED]@{self.FAKE_HOST_PORT}" in message
+        assert "pw@" not in message
+
+
+class TestBackendErrorClassification:
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            (httpx.ConnectError("[Errno 61] Connection refused"), "backend unreachable"),
+            (httpx.RemoteProtocolError("peer closed connection"), "backend unreachable"),
+            (OSError("network is down"), "backend unreachable"),
+            (httpx.ReadTimeout(""), "backend timeout"),
+            (TimeoutError(), "backend timeout"),
+            (RuntimeError("timed out waiting"), "backend timeout"),
+            (RuntimeError("something odd"), "backend error"),
+        ],
+    )
+    def test_exception_types(self, error: BaseException, expected: str) -> None:
+        assert server._classify_backend_error(error) == expected
+
+    def test_status_error_anywhere_in_the_chain(self) -> None:
+        request = httpx.Request("GET", "http://h.test/")
+        status = httpx.HTTPStatusError(
+            "x", request=request, response=httpx.Response(429, request=request)
+        )
+        wrapped = RuntimeError("wrapped")
+        wrapped.__cause__ = status
+
+        assert server._classify_backend_error(wrapped) == "backend error 429"
+
+    def test_timeout_wins_over_transport(self) -> None:
+        assert server._classify_backend_error(httpx.ConnectTimeout("")) == "backend timeout"
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            (None, "backend unhealthy"),
+            ("", "backend unhealthy"),
+            ("Client error '401 Unauthorized' for url 'http://h.test/api'", "backend error 401"),
+            ("Server error '503 Service Unavailable' for url 'x'", "backend error 503"),
+            ("status code 429", "backend error 429"),
+            ("All connection attempts failed", "backend unreachable"),
+            ("[Errno 61] Connection refused", "backend unreachable"),
+            ("Name or service not known", "backend unreachable"),
+            ("Read timed out", "backend timeout"),
+            ("timeout", "backend timeout"),
+            ("trace id 503abc not found", "backend unhealthy"),
+            ("some other failure", "backend unhealthy"),
+        ],
+    )
+    def test_error_text(self, text: str | None, expected: str) -> None:
+        assert server._classify_backend_error_text(text) == expected

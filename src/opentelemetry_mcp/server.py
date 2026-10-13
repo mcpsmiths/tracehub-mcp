@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal, NoReturn
 
 import click
+import httpx
 import uvicorn
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -134,6 +135,52 @@ def _exception_chain(error: BaseException) -> Iterator[BaseException]:
             current = None
         else:
             current = current.__context__
+
+
+# What an unauthenticated GET /ready peer learns about a failed probe: one
+# of these classes per failing half, never the backend's own text, which
+# embeds the internal URL (host:port) and httpx's error phrasing (runtime
+# verification probe-4 P1-P3). The redacted detail goes to the server log.
+_STATUS_IN_ERROR_TEXT_RE = re.compile(r"(?:error|status(?: code)?)\s+'?([45]\d\d)\b", re.IGNORECASE)
+_TIMEOUT_IN_ERROR_TEXT_RE = re.compile(r"time[d]?[ -]?out", re.IGNORECASE)
+_UNREACHABLE_IN_ERROR_TEXT_RE = re.compile(
+    r"connect|refused|unreachable|resolve|name or service|network|reset by peer|broken pipe",
+    re.IGNORECASE,
+)
+# Upper bound on how much of a probe's error text reaches the log line:
+# httpx's status-error text with its documentation link is ~200 chars.
+_MAX_LOGGED_PROBE_ERROR_CHARS = 256
+
+
+def _classify_backend_error_text(text: str | None) -> str:
+    """Short class for a backend error that only exists as text (every
+    backend's health_check catches its exception and returns str(e))."""
+    if not text:
+        return "backend unhealthy"
+    if _TIMEOUT_IN_ERROR_TEXT_RE.search(text):
+        return "backend timeout"
+    status = _STATUS_IN_ERROR_TEXT_RE.search(text)
+    if status:
+        return f"backend error {status.group(1)}"
+    if _UNREACHABLE_IN_ERROR_TEXT_RE.search(text):
+        return "backend unreachable"
+    return "backend unhealthy"
+
+
+def _classify_backend_error(error: BaseException) -> str:
+    """Short class for a backend exception, judged on the exception chain's
+    types first (httpx timeouts, status errors, transport/OS errors) and on
+    the text only as a fallback."""
+    chain = list(_exception_chain(error))
+    if any(isinstance(link, httpx.TimeoutException | TimeoutError) for link in chain):
+        return "backend timeout"
+    for link in chain:
+        if isinstance(link, httpx.HTTPStatusError):
+            return f"backend error {link.response.status_code}"
+    if any(isinstance(link, httpx.TransportError | OSError) for link in chain):
+        return "backend unreachable"
+    classified = _classify_backend_error_text(str(error))
+    return "backend error" if classified == "backend unhealthy" else classified
 
 
 def _handle_tool_error(tool_name: str, error: Exception) -> NoReturn:
@@ -479,6 +526,8 @@ async def _run_backend_checks_memoized(backend: BaseBackend) -> tuple[bool, dict
             details = {
                 "error": f"readiness check timed out after {_READINESS_CHECK_TIMEOUT_SECONDS:g} s"
             }
+        if not all_ok:
+            _log_readiness_failure(details)
 
         ttl = (
             _readiness_cache_seconds
@@ -503,9 +552,11 @@ async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any
     call against the server's own cached _get_backend() instance without
     disrupting subsequent real tool calls that share it.
 
-    Every error string is redacted HERE, not by the callers: /ready hands
-    the details to unauthenticated peers and doctor prints them, and httpx
-    error text embeds the request URL (userinfo included) verbatim.
+    Every error string is redacted HERE, not by the callers: doctor prints
+    them and /ready logs them, and httpx error text embeds the request URL
+    (userinfo included) verbatim. Each failing half also carries an
+    "error_class" - the only error text _readiness_body copies into the
+    unauthenticated /ready response.
 
     The list_services half goes through BaseBackend.list_services_uncached,
     never the cache-wrapped public method: with QUERY_CACHE_TTL_SECONDS set
@@ -522,19 +573,61 @@ async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any
             "error": redact_userinfo_in_text(health.error),
         }
         if health.status != "healthy":
+            details["health_check"]["error_class"] = _classify_backend_error_text(health.error)
             all_ok = False
     except Exception as e:
-        details["health_check"] = {"status": "error", "error": redact_userinfo_in_text(str(e))}
+        details["health_check"] = {
+            "status": "error",
+            "error": redact_userinfo_in_text(str(e)),
+            "error_class": _classify_backend_error(e),
+        }
         all_ok = False
 
     try:
         services_found = await backend.list_services_uncached()
         details["list_services"] = {"count": len(services_found)}
     except Exception as e:
-        details["list_services"] = {"error": redact_userinfo_in_text(str(e))}
+        details["list_services"] = {
+            "error": redact_userinfo_in_text(str(e)),
+            "error_class": _classify_backend_error(e),
+        }
         all_ok = False
 
     return all_ok, details
+
+
+def _readiness_body(all_ok: bool, details: dict[str, Any]) -> dict[str, Any]:
+    """The /ready response body: status and service count as before, and for
+    a failing half only its error class. The route's own deadline message
+    (details["error"], no backend text) passes through unchanged."""
+    body: dict[str, Any] = {"status": "ready" if all_ok else "not_ready"}
+    for key in ("health_check", "list_services"):
+        half = details.get(key)
+        if not isinstance(half, dict):
+            continue
+        public = {field: half[field] for field in ("status", "count") if field in half}
+        if "error" in half:
+            public["error"] = half.get("error_class")
+        body[key] = public
+    if "error" in details:
+        body["error"] = details["error"]
+    return body
+
+
+def _log_readiness_failure(details: dict[str, Any]) -> None:
+    """One WARNING per fresh failed probe (the memo bounds how often this
+    runs) carrying the redacted detail, cut to _MAX_LOGGED_PROBE_ERROR_CHARS
+    and repr()-quoted so the line can never carry a raw control character -
+    the same bound-and-quote shape as the Host/Origin rejection lines."""
+    parts: list[str] = []
+    for key in ("health_check", "list_services"):
+        half = details.get(key)
+        if isinstance(half, dict) and half.get("error") is not None:
+            text = str(half["error"])[:_MAX_LOGGED_PROBE_ERROR_CHARS]
+            parts.append(f"{key}={half.get('status', 'error')} {text!r}")
+    if details.get("error") is not None:
+        parts.append(f"error={str(details['error'])[:_MAX_LOGGED_PROBE_ERROR_CHARS]!r}")
+    logger.warning(f"Readiness probe failed: {'; '.join(parts) or 'no detail'}")
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -553,19 +646,20 @@ async def ready_route(request: Request) -> Response:
     can never break a real tool call that shares the same backend. The
     probe result is memoized and single-flighted by
     _run_backend_checks_memoized because this route is unauthenticated and
-    each probe costs the backend real, budgeted work."""
+    each probe costs the backend real, budgeted work. The body names only
+    an error class per failing half (_readiness_body); the redacted detail,
+    which embeds the backend's internal host:port, goes to the log."""
     try:
         backend = await _get_backend()
     except Exception as e:
+        detail = redact_userinfo_in_text(str(e))[:_MAX_LOGGED_PROBE_ERROR_CHARS]
+        logger.warning(f"Readiness probe could not obtain a backend: {detail!r}")
         return JSONResponse(
-            {"status": "not_ready", "error": redact_userinfo_in_text(str(e))}, status_code=503
+            {"status": "not_ready", "error": _classify_backend_error(e)}, status_code=503
         )
 
     all_ok, details = await _run_backend_checks_memoized(backend)
-    return JSONResponse(
-        {"status": "ready" if all_ok else "not_ready", **details},
-        status_code=200 if all_ok else 503,
-    )
+    return JSONResponse(_readiness_body(all_ok, details), status_code=200 if all_ok else 503)
 
 
 @mcp.tool(title="Search Traces", annotations=_READ_ONLY_TOOL_ANNOTATIONS)

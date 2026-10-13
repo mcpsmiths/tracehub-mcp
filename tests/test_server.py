@@ -2110,10 +2110,16 @@ class TestUserinfoNeverLeavesTheProcess:
 
         assert response.status_code == 503
         assert self.MARKER not in response.text
+        assert "h.test" not in response.text
         body = response.json()
-        assert "401" in body["health_check"]["error"]
-        assert "401" in body["list_services"]["error"]
+        assert body["health_check"]["error"] == "backend error 401"
+        assert body["list_services"]["error"] == "backend error 401"
         assert self.MARKER not in caplog.text
+        # The redacted detail went to the log instead of the body.
+        assert any(
+            "Readiness probe failed" in r.message and "[REDACTED]@h.test" in r.message
+            for r in caplog.records
+        )
         # Not vacuous: the slow-request WARNING did fire and named the path.
         assert any("Slow backend request" in r.message for r in caplog.records)
         assert any("/api/services" in r.message for r in caplog.records)
