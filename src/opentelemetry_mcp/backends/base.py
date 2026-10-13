@@ -590,7 +590,6 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         self,
         wrapped: httpx.AsyncBaseTransport | None = None,
         slow_request_threshold_ms: float | None = None,
-        allowed_host: str | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         total_deadline_seconds: float | None = None,
         allowed_origin: str | None = None,
@@ -602,11 +601,6 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
             slow_request_threshold_ms: If set, log a warning for any request
                 that takes longer than this, independent of the configured
                 log level
-            allowed_host: If set, refuse (RedirectTargetBlockedError) any
-                request whose host differs from this one, case-insensitively.
-                The host-only pin, kept for callers that have a host name but
-                no URL (test modules build the transport this way);
-                production clients pin the origin instead, see below.
             allowed_origin: If set, a URL whose scheme, host and port
                 (default port filled in; userinfo and path ignored) are the
                 only origin this transport will send to - any other is
@@ -614,8 +608,11 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
                 `client` sets it to the configured backend URL, so a 3xx
                 Location chosen by the backend can never steer the shared
                 client elsewhere: not to another host, and not to another
-                port or scheme on the same host either (the host-only pin
-                let a backend redirect into the MCP server's own listener).
+                port or scheme on the same host either. This is the ONLY
+                pin: the earlier host-only parameter (allowed_host) let a
+                backend redirect into the MCP server's own listener and was
+                removed rather than kept as a weaker opt-in; None (the
+                test-convenience shape) means no pin at all.
             max_response_bytes: Ceiling on the DECODED size of any single
                 response (initial or redirect hop). A larger declared
                 Content-Length is refused before the body is read; a body
@@ -630,7 +627,6 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         """
         self._wrapped = wrapped if wrapped is not None else httpx.AsyncHTTPTransport()
         self._slow_request_threshold_ms = slow_request_threshold_ms
-        self._allowed_host = allowed_host.lower() if allowed_host is not None else None
         self._allowed_origin = (
             _origin_of(httpx.URL(allowed_origin)) if allowed_origin is not None else None
         )
@@ -696,14 +692,6 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         if is_cloud_metadata_host(request.url.host):
             raise MetadataEndpointBlockedError(
                 f"Refusing to connect to cloud metadata endpoint: {request.url.host}"
-            )
-        if (
-            self._allowed_host is not None
-            and (request.url.host or "").lower() != self._allowed_host
-        ):
-            raise RedirectTargetBlockedError(
-                f"Refusing request to {request.url.host!r}: the configured backend host is "
-                f"{self._allowed_host!r} and a backend response may not redirect elsewhere"
             )
         if self._allowed_origin is not None:
             origin = _origin_of(request.url)

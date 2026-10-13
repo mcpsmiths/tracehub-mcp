@@ -2090,7 +2090,7 @@ class TestUserinfoNeverLeavesTheProcess:
         transport = _RetryingTransport(
             wrapped=httpx.MockTransport(handler),
             slow_request_threshold_ms=0.0,
-            allowed_host="h.test",
+            allowed_origin="https://h.test",
         )
         backend._client = httpx.AsyncClient(
             base_url=backend.url, transport=transport, follow_redirects=True

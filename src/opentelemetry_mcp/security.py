@@ -15,8 +15,9 @@ Two callers with different trust levels share these helpers:
   (169.254.43518) IPv4 spellings that httpx keeps as plain hostnames, and all
   of them reach 169.254.169.254. is_cloud_metadata_host canonicalises those
   spellings before the denylist comparison. DNS aliases of a metadata address
-  are not resolved here - the transport's host pin (allowed_host) is the
-  layer that refuses them, by refusing every host but the configured one.
+  are not resolved here - the transport's origin pin (allowed_origin) is the
+  layer that refuses them, by refusing every scheme, host and port but the
+  configured one.
 
 The module also owns the URL-userinfo redaction helpers. BackendConfig
 rejects `user:password@host` in BACKEND_URL outright, so a validated config

@@ -293,8 +293,9 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
 4b. If the backend needs its own `client` property (e.g. `follow_redirects=False` because it
    sends a non-standard credential header httpx would not strip on a cross-origin hop), build
    the transport with `self._create_transport()` rather than constructing `_RetryingTransport`
-   directly - that is where the configured-host pin (`allowed_host`, refusing backend-chosen
-   redirect targets) and slow-request logging are wired, and `tests/test_base_backend.py`
+   directly - that is where the configured-origin pin (`allowed_origin`: scheme, host and port,
+   refusing backend-chosen redirect targets) and slow-request logging are wired, and
+   `tests/test_base_backend.py`
    asserts every backend's client carries them
 5. Add the new backend name to every hardcoded backend-name literal site (must update in
    lockstep): [config.py](opentelemetry_mcp/config.py)'s `BackendConfig.type` `Literal` (and its

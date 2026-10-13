@@ -516,7 +516,7 @@ class TestReadyNeverAnsweredFromTheQueryCache:
         backend._client = httpx.AsyncClient(
             base_url=backend.url,
             transport=_RetryingTransport(
-                wrapped=httpx.MockTransport(handler), allowed_host="localhost"
+                wrapped=httpx.MockTransport(handler), allowed_origin="http://localhost:16686"
             ),
         )
         return backend

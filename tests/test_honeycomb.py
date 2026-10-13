@@ -382,7 +382,7 @@ class TestCreateQueryResultParkingBound:
             base_url=backend.url,
             headers=backend._create_headers(),
             transport=_RetryingTransport(
-                wrapped=httpx.MockTransport(handler), allowed_host="api.honeycomb.io"
+                wrapped=httpx.MockTransport(handler), allowed_origin="https://api.honeycomb.io"
             ),
         )
         return requests, sleep_calls
@@ -834,7 +834,7 @@ class TestPollQueryResultPathSegment:
         backend._client = httpx.AsyncClient(
             base_url=backend.url,
             transport=_RetryingTransport(
-                wrapped=httpx.MockTransport(handler), allowed_host="api.honeycomb.io"
+                wrapped=httpx.MockTransport(handler), allowed_origin="https://api.honeycomb.io"
             ),
         )
 
@@ -854,7 +854,7 @@ class TestPollQueryResultPathSegment:
         backend._client = httpx.AsyncClient(
             base_url=backend.url,
             transport=_RetryingTransport(
-                wrapped=httpx.MockTransport(handler), allowed_host="api.honeycomb.io"
+                wrapped=httpx.MockTransport(handler), allowed_origin="https://api.honeycomb.io"
             ),
         )
 

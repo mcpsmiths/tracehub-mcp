@@ -541,30 +541,17 @@ class TestRedirectHostPin:
         assert "/health" not in message
         assert "/base" not in message
 
-    async def test_legacy_host_only_pin_still_pins_the_host(self) -> None:
-        """allowed_host stays for callers that have only a host name (other
-        test modules build the transport that way); production clients use
-        allowed_origin via BaseBackend._create_transport."""
-        hosts_seen: list[str] = []
-
-        async def handler(request: httpx.Request) -> httpx.Response:
-            hosts_seen.append(request.url.host or "")
-            if request.url.scheme == "http":
-                return httpx.Response(302, headers={"Location": "https://backend.test/other"})
-            return httpx.Response(200)
-
-        transport = _RetryingTransport(
-            wrapped=httpx.MockTransport(handler), allowed_host="backend.test"
-        )
-
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://backend.test", follow_redirects=True
-        ) as client:
-            assert (await client.get("/search")).status_code == 200
-            with pytest.raises(RedirectTargetBlockedError):
-                await client.get("http://other.test/x")
-
-        assert hosts_seen == ["backend.test", "backend.test"]
+    def test_constructor_no_longer_accepts_the_host_only_pin(self) -> None:
+        """The host-only pin (allowed_host) let a backend redirect into any
+        other port or scheme on its own host (runtime probe-2 R/T/X/Y); the
+        origin pin replaced it in production and the parameter is gone, so
+        no future caller can opt into the weaker check by accident. A
+        TypeError here is the contract: the keyword must not come back."""
+        with pytest.raises(TypeError, match="allowed_host"):
+            _RetryingTransport(  # type: ignore[call-arg]
+                wrapped=httpx.MockTransport(lambda request: httpx.Response(200)),
+                allowed_host="backend.test",
+            )
 
     async def test_host_comparison_is_case_insensitive(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
@@ -627,13 +614,14 @@ class TestRedirectHostPin:
 
         assert handler_calls == 0
 
-    async def test_transport_without_allowed_host_keeps_following_cross_host_redirects(
+    async def test_transport_without_an_origin_pin_keeps_following_cross_host_redirects(
         self,
     ) -> None:
-        """Test-convenience shape: a transport built with no allowed_host (as
-        every pre-existing test does) must behave exactly as before - the
-        pin is opt-in at construction, and BaseBackend.client is what opts
-        in for production (see test_backend_clients_pin_the_configured_host)."""
+        """Test-convenience shape: a transport built with allowed_origin=None
+        (as every pre-existing test does) must behave exactly as before -
+        the pin is opt-in at construction, and BaseBackend.client is what
+        opts in for production (see
+        test_backend_clients_pin_the_configured_origin)."""
         hosts_seen: list[str] = []
 
         async def handler(request: httpx.Request) -> httpx.Response:
@@ -701,7 +689,6 @@ def test_backend_clients_pin_the_configured_origin(backend: BaseBackend) -> None
     assert isinstance(client._transport, _RetryingTransport)
     expected_port = 16686 if "16686" in backend.url else 443
     assert client._transport._allowed_origin == ("https", "backend.example", expected_port)
-    assert client._transport._allowed_host is None
 
 
 _ONE_MIB = 1024 * 1024
@@ -1386,7 +1373,7 @@ class TestRequestDeadline:
         assert all(budget is budgets_seen[0] for budget in budgets_seen)
 
     async def test_transport_without_a_deadline_behaves_as_before(self) -> None:
-        """Test-convenience shape, same as allowed_host: no deadline unless
+        """Test-convenience shape, same as allowed_origin=None: no deadline unless
         one is configured; BaseBackend._create_transport always configures
         one (see test_backend_clients_derive_the_deadline_from_the_timeout)."""
         stream = _TrickleStream(interval_seconds=0.05)
