@@ -2096,31 +2096,51 @@ def _build_http_app(
 # logger that hands over a longer pre-rendered line is not logging a request
 # line any HTTP parser accepted, so the record is dropped rather than scanned.
 _MAX_ACCESS_LOG_LINE_CHARS = 8 * 1024
-_WHITESPACE_RE = re.compile(r"\s")
-_NON_WHITESPACE_RE = re.compile(r"\S")
+# The ASCII whitespace an access line can contain between its tokens.
+_WHITESPACE_CHARS = " \t\r\n\x0b\x0c"
 
 
 def _cut_rendered_target_query(message: str) -> str:
-    """`message` with the query string of its quoted request line removed
-    ('... "POST /mcp?x=1 HTTP/1.1" 401' -> '... "POST /mcp HTTP/1.1" 401'):
-    the first "?" that is followed, with no whitespace in between, by
-    whitespace and "HTTP/" - a target contains no whitespace, so that is
-    where it ends. Only the first "?" is considered (in an access line it
-    can only sit in the target), and every step - find the "?", find the
-    next whitespace, skip it - advances, so the cost is linear in the line.
-    The regex this replaces, r"\\?\\S*(?=\\s+HTTP/)", re-scanned the rest of
-    the line from every "?" and took 2.2 s on 16 KiB of "?" with no " HTTP/"
-    (round-2 review of the filter). Anything else is returned unchanged."""
-    query_start = message.find("?")
-    if query_start == -1:
+    """`message` with the query string of its quoted request line(s) removed
+    ('... "POST /mcp?x=1 HTTP/1.1" 401' -> '... "POST /mcp HTTP/1.1" 401').
+
+    Anchored on the request line, not on the first "?": every "HTTP/" that is
+    preceded by whitespace ends a request target, the target is the
+    whitespace-free token right before that whitespace, and a "?" is cut only
+    inside such a token. A custom access format that puts a referer (with its
+    own "?") or a user agent (even one reading "HTTP/1.1") before the request
+    line therefore still loses the target's query string (round-2 review of
+    the first linear scan, which cut at the first "?" of the line). Every
+    step advances or is a bounded str.find/rfind, so the cost stays linear in
+    the line - the regex this replaced, r"\\?\\S*(?=\\s+HTTP/)", re-scanned
+    the rest of the line from every "?" and took 2.2 s on 16 KiB of "?".
+    Anything else is returned unchanged."""
+    pieces: list[str] = []
+    copied_to = 0  # start of the not-yet-emitted remainder
+    floor = 0  # tokens before this index were already examined
+    search_from = 0
+    while True:
+        marker = message.find("HTTP/", search_from)
+        if marker == -1:
+            break
+        search_from = marker + 1
+        if marker == 0 or not message[marker - 1].isspace():
+            continue
+        target_end = marker
+        while target_end > floor and message[target_end - 1].isspace():
+            target_end -= 1
+        token_start = max(message.rfind(ch, floor, target_end) for ch in _WHITESPACE_CHARS) + 1
+        token_start = max(token_start, floor)
+        floor = marker
+        query_start = message.find("?", token_start, target_end)
+        if query_start == -1:
+            continue
+        pieces.append(message[copied_to:query_start])
+        copied_to = target_end
+    if not pieces:
         return message
-    whitespace = _WHITESPACE_RE.search(message, query_start)
-    if whitespace is None:
-        return message
-    after_whitespace = _NON_WHITESPACE_RE.search(message, whitespace.start())
-    if after_whitespace is None or not message.startswith("HTTP/", after_whitespace.start()):
-        return message
-    return message[:query_start] + message[whitespace.start() :]
+    pieces.append(message[copied_to:])
+    return "".join(pieces)
 
 
 class AccessLogQueryStringFilter(logging.Filter):

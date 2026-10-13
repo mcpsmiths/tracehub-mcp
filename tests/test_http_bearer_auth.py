@@ -361,6 +361,28 @@ class TestAccessLogQueryStringFilter:
 
         assert record.getMessage() == '127.0.0.1:1 - "GET /mcp HTTP/1.1" 401'
 
+    def test_strips_the_target_query_even_with_tokens_before_the_request_line(self) -> None:
+        """A custom access format may put a referer (with its own '?') or a user
+        agent (even one that says 'HTTP/1.1') before the request line; the
+        TARGET's query string is still the one removed. The first version of the
+        linear scan cut only at the first '?' in the line (round-2 review)."""
+        record = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg=(
+                '127.0.0.1:1 - "http://ref.example/?r=1" "evil HTTP/1.1" '
+                f'"GET /mcp?token={QUERY_DUMMY} HTTP/1.1" 401'
+            ),
+            args=None,
+            exc_info=None,
+        )
+        AccessLogQueryStringFilter().filter(record)
+
+        assert QUERY_DUMMY not in record.getMessage()
+        assert '"GET /mcp HTTP/1.1" 401' in record.getMessage()
+
     def test_never_raises_on_an_unformattable_record(self) -> None:
         record = logging.LogRecord(
             name="uvicorn.access",
