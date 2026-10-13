@@ -53,6 +53,7 @@ from opentelemetry_mcp import observability, server
 from opentelemetry_mcp.config import BackendConfig, ServerConfig
 from opentelemetry_mcp.models import SearchTracesResult
 from opentelemetry_mcp.observability import (
+    _MAX_STATUS_DESCRIPTION_CHARS,
     McpServerTracingMiddleware,
     TraceContextLogFilter,
     _redact_secrets,
@@ -732,6 +733,45 @@ class TestMcpServerTracingMiddlewareCardinality:
         )
 
         assert _last_span_attrs(exporter)["gen_ai.tool.name"] == long_but_registered
+
+    async def test_unknown_tool_status_description_is_bounded(self) -> None:
+        """probe-4 P5b: label and span name collapse to the sentinel, but
+        fastmcp's NotFoundError text ("Unknown tool: '<name>'") carried the
+        peer-chosen name verbatim into the exported span status - 5016
+        characters for a 5000-character name. The description is a fixed
+        size whatever the peer sends."""
+        exporter, _reader = self._install_instrumented_middleware()
+        name = "z" * 5000
+
+        async with Client(server.mcp) as client:
+            result = await client.call_tool(name, {}, raise_on_error=False)
+
+        assert result.is_error
+        (span,) = [s for s in exporter.get_finished_spans() if s.name == "tools/call unknown"]
+        assert span.status.status_code == StatusCode.ERROR
+        description = span.status.description
+        assert description is not None
+        assert description.startswith("Unknown tool: 'zzz"), description[:40]
+        assert len(description) <= _MAX_STATUS_DESCRIPTION_CHARS, len(description)
+        assert description.endswith("..."), description[-10:]
+
+    async def test_control_characters_in_the_status_description_are_escaped(self) -> None:
+        """P5b's second probe: a name carrying NUL, a newline and an ANSI
+        colour sequence reached the status text raw. Rendered repr-style,
+        like the Host/Origin log lines and the root log handler."""
+        tracer, exporter = _tracer_with_exporter()
+        middleware = McpServerTracingMiddleware(tracer=tracer)
+        name = "list_services\x00\n\x1b[31m"
+
+        async def call_next(ctx: MiddlewareContext[Any]) -> str:
+            raise LookupError(f"Unknown tool: '{name}'")
+
+        with pytest.raises(LookupError):
+            await middleware.on_call_tool(_context(tool_name=name), call_next)
+
+        description = exporter.get_finished_spans()[0].status.description
+        assert description == "Unknown tool: 'list_services\\x00\\n\\x1b[31m'", description
+        assert description.isprintable()
 
     def test_http_peer_cannot_mint_labels(self) -> None:
         """The attack surface is the streamable-HTTP listener: a peer that

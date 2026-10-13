@@ -33,7 +33,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased, Sampler
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
 
-from opentelemetry_mcp.security import redact_userinfo_in_text
+from opentelemetry_mcp.security import escape_log_control_characters, redact_userinfo_in_text
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,12 @@ _UNKNOWN_TOOL_LABEL = "unknown"
 # Hard cap on a label before the registry is even consulted - no real tool
 # name approaches this, and it bounds the lookup cost for a hostile peer.
 _MAX_TOOL_NAME_LABEL_CHARS = 128
+# Fixed size of an exported span status description (see
+# _bounded_status_description): long enough for any backend error text this
+# server produces (an httpx status line with its redacted URL), and small
+# enough that a peer-chosen tool name echoed by fastmcp's NotFoundError
+# cannot make the exported span grow with the request.
+_MAX_STATUS_DESCRIPTION_CHARS = 256
 
 # The operator, not the caller, decides whether this server's own spans are
 # recorded. The SDK's default (parentbased_always_on) delegates a remote
@@ -106,6 +112,27 @@ def _redact_secrets(text: str) -> str:
             text = pattern.sub(lambda m: f"{m.group('field')}[REDACTED]", text)
         else:
             text = pattern.sub("[REDACTED]", text)
+    return text
+
+
+def _bounded_status_description(error: Exception) -> str:
+    """str(error) as an exported span status description: credential shapes
+    redacted, every control character repr-escaped, and cut to
+    _MAX_STATUS_DESCRIPTION_CHARS with a trailing "...".
+
+    _bounded_tool_label keeps a peer-chosen tools/call name out of the span
+    name and the metric label, but fastmcp's own NotFoundError text
+    ("Unknown tool: '<name>'") still carried that name verbatim into the
+    status description - 5016 characters for a 5000-character name, raw NUL
+    / newline / ESC included (runtime verification of PR #41, probe-4 P5b).
+    The same bound applies to every failure, backend errors included, so no
+    exception text can size the exported span. Redaction runs first so a
+    credential near the cut cannot be half-exposed; the escape runs before
+    the cut so it never splits an escape sequence.
+    """
+    text = escape_log_control_characters(_redact_secrets(str(error)))
+    if len(text) > _MAX_STATUS_DESCRIPTION_CHARS:
+        text = text[: _MAX_STATUS_DESCRIPTION_CHARS - 3] + "..."
     return text
 
 
@@ -394,7 +421,7 @@ class McpServerTracingMiddleware(Middleware):
         # include_args - so the exception message must always be
         # redacted, not just gated behind that flag, since a backend can
         # raise with a credential-shaped string embedded in its message.
-        span.set_status(Status(StatusCode.ERROR, _redact_secrets(str(error))))
+        span.set_status(Status(StatusCode.ERROR, _bounded_status_description(error)))
 
     @staticmethod
     def _session_id(context: MiddlewareContext[Any]) -> str | None:
