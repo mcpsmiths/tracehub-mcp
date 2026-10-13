@@ -101,6 +101,35 @@ def find_unreachable_error_spans(
     return [span for span in spans if span.span_id not in reachable and span.status == "ERROR"]
 
 
+def parent_cycle_span_ids(span: SpanData, spans: list[SpanData]) -> list[str]:
+    """The span_ids of the parent cycle that following parent_span_id links
+    upward from `span` runs into - in walk order, starting at the first span
+    of the loop - or [] when the walk ends at a root or at a parent that is
+    not in `spans`. A span whose parent is itself is a cycle of one.
+
+    This is how a trace with NO root at all gets named: when every span's
+    parent is present and non-self, find_roots is empty and no depth from a
+    root exists, so triage_trace reports the cycle (its size and the span
+    the walk entered it at) instead of walking the ring from an arbitrary
+    span as if that were the root - which gave a 5000-span ring confidence
+    "high" and "5000 span(s) deep from the root". Iterative and linear:
+    every span is visited at most once. A malformed trace that reuses a
+    span_id resolves the parent to whichever copy was listed last.
+    """
+    spans_by_id = {candidate.span_id: candidate for candidate in spans}
+    position: dict[str, int] = {}
+    walk: list[str] = []
+    current: SpanData | None = span
+    while current is not None and current.span_id not in position:
+        position[current.span_id] = len(walk)
+        walk.append(current.span_id)
+        parent_id = current.parent_span_id
+        current = spans_by_id.get(parent_id) if parent_id is not None else None
+    if current is None:
+        return []
+    return walk[position[current.span_id] :]
+
+
 def compute_critical_path(
     root: SpanData, children_map: dict[str | None, list[SpanData]]
 ) -> list[SpanData]:

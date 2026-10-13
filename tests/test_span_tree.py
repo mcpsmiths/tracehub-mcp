@@ -548,3 +548,34 @@ class TestFindUnreachableErrorSpans:
         roots = span_tree.find_roots(children_map)
 
         assert span_tree.find_unreachable_error_spans(spans, roots, children_map) == []
+
+
+class TestParentCycleSpanIds:
+    def test_ring_returns_every_span_of_the_cycle_starting_where_the_walk_entered(self) -> None:
+        a = _span("a", parent_span_id="c")
+        b = _span("b", parent_span_id="a")
+        c = _span("c", parent_span_id="b")
+        spans = [a, b, c]
+
+        assert span_tree.parent_cycle_span_ids(b, spans) == ["b", "a", "c"]
+
+    def test_tail_leading_into_a_cycle_reports_only_the_cycle(self) -> None:
+        a = _span("a", parent_span_id="b")
+        b = _span("b", parent_span_id="a")
+        tail = _span("tail", parent_span_id="a")
+        spans = [a, b, tail]
+
+        assert span_tree.parent_cycle_span_ids(tail, spans) == ["a", "b"]
+
+    def test_self_parent_is_a_cycle_of_one(self) -> None:
+        loner = _span("loner", parent_span_id="loner")
+
+        assert span_tree.parent_cycle_span_ids(loner, [loner]) == ["loner"]
+
+    def test_walk_ending_at_a_root_or_missing_parent_is_not_a_cycle(self) -> None:
+        root = _span("root")
+        child = _span("child", parent_span_id="root")
+        orphan = _span("orphan", parent_span_id="gone")
+
+        assert span_tree.parent_cycle_span_ids(child, [root, child]) == []
+        assert span_tree.parent_cycle_span_ids(orphan, [root, child, orphan]) == []
