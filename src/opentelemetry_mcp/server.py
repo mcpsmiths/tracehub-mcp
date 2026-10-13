@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import math
+import os
 import re
 import sys
 import time
@@ -1461,6 +1462,12 @@ def _apply_tool_gating(disable_tools: str | None, enabled_tools: str | None) -> 
 
 
 _MIN_HTTP_BEARER_TOKEN_CHARS = 32
+# Printable ASCII with no whitespace (0x21-0x7E): a superset of RFC 6750's
+# token68 alphabet, and exactly what a client can carry byte-for-byte in an
+# Authorization header - h11 trims surrounding whitespace and header bytes
+# are latin-1, so a value outside this set is accepted at startup but can
+# never be presented: auth "enabled", every client locked out.
+_HTTP_BEARER_TOKEN_CHARS_RE = re.compile(r"[\x21-\x7e]+")
 
 
 class OperatorTokenVerifier(TokenVerifier):
@@ -1506,6 +1513,14 @@ def _validate_http_listener_auth(
                 "MCP_HTTP_BEARER_TOKEN / --http-bearer-token must be at least "
                 f"{_MIN_HTTP_BEARER_TOKEN_CHARS} characters (got {len(http_bearer_token)}); "
                 "generate one with `openssl rand -hex 32`."
+            )
+        if not _HTTP_BEARER_TOKEN_CHARS_RE.fullmatch(http_bearer_token):
+            # Static text: the value is a credential and is never echoed.
+            raise click.UsageError(
+                "MCP_HTTP_BEARER_TOKEN / --http-bearer-token must consist of printable "
+                "ASCII characters with no whitespace (RFC 6750 token68 characters such as "
+                "the output of `openssl rand -hex 32`); the value given contains other "
+                "characters and no client could present it in an Authorization header."
             )
         return
     if is_loopback_host(host) or allow_unauthenticated_http:
@@ -2215,7 +2230,8 @@ def _backend_config_options(f: Any) -> Any:
     envvar="MCP_HTTP_BEARER_TOKEN",
     help="Shared bearer token every /mcp request must present as "
     "`Authorization: Bearer <token>` (only for --transport http; at least "
-    f"{_MIN_HTTP_BEARER_TOKEN_CHARS} characters, e.g. `openssl rand -hex 32`). "
+    f"{_MIN_HTTP_BEARER_TOKEN_CHARS} printable ASCII characters with no whitespace, "
+    "e.g. `openssl rand -hex 32`; an empty value, set or passed, is refused). "
     "Prefer the MCP_HTTP_BEARER_TOKEN env var over this flag: argv is visible "
     "to every local user via `ps`. /health and /ready stay unauthenticated.",
 )
@@ -2484,6 +2500,15 @@ def main(
         return
 
     global _config
+
+    if http_bearer_token is None:
+        # click resolves an environment variable whose value is empty as
+        # unset (Parameter.resolve_envvar_value returns None for ""), so
+        # `MCP_HTTP_BEARER_TOKEN=` in a compose file or .env started a
+        # loopback listener with no auth while `--http-bearer-token ''`
+        # exited 2. Read it back so both spellings take the same path; a
+        # non-empty value never reaches here (click already consumed it).
+        http_bearer_token = os.environ.get("MCP_HTTP_BEARER_TOKEN")
 
     # Before the try: a click.UsageError raised here reaches click's own
     # handler (exit 2, message on stderr) instead of the catch-all below.

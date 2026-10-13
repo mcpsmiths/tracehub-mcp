@@ -32,6 +32,7 @@ from contextlib import contextmanager
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import click
 import httpx
 import pytest
 import uvicorn
@@ -452,3 +453,142 @@ class TestQueryStringTokenNeverReachesTheServerLog:
         assert '"POST /mcp HTTP/1.1" 401' in re_enabled_lines
         assert QUERY_DUMMY not in re_enabled_lines
         assert "?" not in re_enabled_lines
+
+
+# Values that pass the 32-character floor but that no HTTP client can present
+# byte-exactly in an Authorization header (h11 trims OWS; header bytes are
+# latin-1), so accepting them locked the deployment out silently.
+ALL_SPACES = " " * 32
+NON_ASCII = "ü" * 32
+INNER_WHITESPACE = TEST_TOKEN[:20] + "\t" + TEST_TOKEN[21:]
+# Exactly 48 printable-ASCII characters, the shape the probes used.
+FORTY_EIGHT = "-".join(["forty", "eight", "char", "ascii", "operator", "value", "0123456789"])
+
+
+def _invoke_http(args: list[str]) -> tuple[Any, Any]:
+    runner = CliRunner()
+    with patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls:
+        mock_server_cls.return_value.serve = AsyncMock()
+        result = runner.invoke(server.main, ["--transport", "http", *args])
+    return result, mock_server_cls.return_value.serve
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestEmptyBearerTokenEnvIsAUsageError:
+    """Prober-1 F2: click resolves an environment variable whose value is
+    empty as unset, so MCP_HTTP_BEARER_TOKEN= (a blank line in a compose
+    file or .env) silently started a loopback listener with NO auth and
+    only the generic WARNING, while --http-bearer-token '' exited 2 with
+    '(got 0)'. Both spellings must take the same path."""
+
+    def test_empty_env_var_on_loopback_exits_2_naming_the_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MCP_HTTP_BEARER_TOKEN", "")
+
+        result, serve = _invoke_http([])
+
+        assert result.exit_code == 2, result.output
+        assert "MCP_HTTP_BEARER_TOKEN" in result.output
+        assert "(got 0)" in result.output
+        serve.assert_not_awaited()
+        assert server.mcp.auth is None
+
+    def test_empty_env_var_on_a_network_bind_gets_the_same_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MCP_HTTP_BEARER_TOKEN", "")
+
+        result, serve = _invoke_http(["--host", ALL_INTERFACES])
+
+        assert result.exit_code == 2, result.output
+        assert "(got 0)" in result.output
+        serve.assert_not_awaited()
+
+    def test_empty_flag_is_unchanged_control(self) -> None:
+        result, serve = _invoke_http(["--http-bearer-token", ""])
+
+        assert result.exit_code == 2, result.output
+        assert "(got 0)" in result.output
+        serve.assert_not_awaited()
+
+    def test_unset_env_var_still_serves_loopback_unauthenticated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Positive control: absent (not empty) keeps the documented
+        loopback default."""
+        monkeypatch.delenv("MCP_HTTP_BEARER_TOKEN", raising=False)
+
+        result, serve = _invoke_http([])
+
+        assert result.exit_code == 0, result.output
+        serve.assert_awaited_once()
+        assert server.mcp.auth is None
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestBearerTokenMustBePrintableAscii:
+    """Prober-1 F4: 32 spaces and 32 non-ASCII code points passed the
+    length check, auth was 'enabled', and no client could ever present the
+    value - a silent lockout. Such a value is a usage error, and the
+    message never echoes it."""
+
+    @pytest.mark.parametrize("value", [ALL_SPACES, NON_ASCII, INNER_WHITESPACE])
+    def test_env_var_value_is_refused_without_being_echoed(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("MCP_HTTP_BEARER_TOKEN", value)
+
+        result, serve = _invoke_http(["--host", ALL_INTERFACES])
+
+        assert result.exit_code == 2, result.output
+        assert "MCP_HTTP_BEARER_TOKEN" in result.output
+        assert "printable ASCII" in result.output
+        assert value not in result.output
+        serve.assert_not_awaited()
+        assert server.mcp.auth is None
+
+    @pytest.mark.parametrize("value", [ALL_SPACES, NON_ASCII, INNER_WHITESPACE])
+    def test_flag_value_is_refused_without_being_echoed(self, value: str) -> None:
+        result, serve = _invoke_http(["--host", ALL_INTERFACES, "--http-bearer-token", value])
+
+        assert result.exit_code == 2, result.output
+        assert "printable ASCII" in result.output
+        assert value not in result.output
+        serve.assert_not_awaited()
+
+    def test_48_char_ascii_value_still_starts_from_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert len(FORTY_EIGHT) == 48
+        monkeypatch.setenv("MCP_HTTP_BEARER_TOKEN", FORTY_EIGHT)
+
+        result, serve = _invoke_http(["--host", ALL_INTERFACES])
+
+        assert result.exit_code == 0, result.output
+        serve.assert_awaited_once()
+        assert isinstance(server.mcp.auth, OperatorTokenVerifier)
+
+    def test_48_char_ascii_value_still_starts_from_flag(self) -> None:
+        result, serve = _invoke_http(["--host", ALL_INTERFACES, "--http-bearer-token", FORTY_EIGHT])
+
+        assert result.exit_code == 0, result.output
+        serve.assert_awaited_once()
+
+    def test_every_token68_character_is_accepted(self) -> None:
+        """The documented recipe (`openssl rand -hex 32`) yields 64 hex
+        characters; every RFC 6750 token68 character is printable ASCII."""
+        for value in ("0f" * 32, "abc-._~+/" * 4 + "=="):
+            server._validate_http_listener_auth(
+                host=ALL_INTERFACES, http_bearer_token=value, allow_unauthenticated_http=False
+            )
+
+    @pytest.mark.parametrize("value", [ALL_SPACES, NON_ASCII, INNER_WHITESPACE, "x" * 31 + "\n"])
+    def test_validator_refuses_the_value_with_a_static_message(self, value: str) -> None:
+        with pytest.raises(click.UsageError) as exc_info:
+            server._validate_http_listener_auth(
+                host="127.0.0.1", http_bearer_token=value, allow_unauthenticated_http=False
+            )
+
+        assert "printable ASCII" in str(exc_info.value)
+        assert value not in str(exc_info.value)
