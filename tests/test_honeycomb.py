@@ -812,6 +812,60 @@ class TestCreateQueryResultEnterpriseGating:
             await backend._create_query_spec({"breakdowns": []})
 
 
+class TestPollQueryResultPathSegment:
+    """The result id is read from the backend's own create-query-result
+    response and spliced into a request path; "." / ".." / "" would be
+    collapsed by httpx's base_url merge into a different same-host endpoint
+    presented with the operator's key, so it is validated and percent-
+    encoded as exactly one segment before any poll (same helper as every
+    trace-id path in the other backends)."""
+
+    @pytest.mark.parametrize("result_id", [".", "..", "", "r" * 257])
+    async def test_dot_segment_or_oversized_result_id_never_hits_the_wire(
+        self, result_id: str
+    ) -> None:
+        backend = _backend()
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"complete": True, "data": {"results": []}})
+
+        backend._client = httpx.AsyncClient(
+            base_url=backend.url,
+            transport=_RetryingTransport(
+                wrapped=httpx.MockTransport(handler), allowed_host="api.honeycomb.io"
+            ),
+        )
+
+        with pytest.raises(ValueError, match="result_id"):
+            await backend._poll_query_result(result_id)
+
+        assert requests == []
+
+    async def test_result_id_is_encoded_as_one_path_segment(self) -> None:
+        backend = _backend()
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"complete": True, "data": {"results": []}})
+
+        backend._client = httpx.AsyncClient(
+            base_url=backend.url,
+            transport=_RetryingTransport(
+                wrapped=httpx.MockTransport(handler), allowed_host="api.honeycomb.io"
+            ),
+        )
+
+        assert await backend._poll_query_result("res/1?x=y") == []
+
+        assert len(requests) == 1
+        assert requests[0].url.raw_path == (
+            f"/1/query_results/{FAKE_DATASET}/res%2F1%3Fx%3Dy".encode()
+        )
+
+
 class TestPollQueryResult:
     async def test_returns_results_once_complete(self) -> None:
         backend = _backend()

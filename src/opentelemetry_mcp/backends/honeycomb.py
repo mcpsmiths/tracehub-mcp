@@ -75,6 +75,7 @@ import httpx
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
+from opentelemetry_mcp.backends.url_path import safe_path_segment
 from opentelemetry_mcp.constants import Fields, Status
 from opentelemetry_mcp.models import (
     Filter,
@@ -893,19 +894,25 @@ class HoneycombBackend(BaseBackend):
         """GET /1/query_results/{dataset}/{resultId} until complete or timeout.
 
         Args:
-            result_id: The query result's ID to poll
+            result_id: The query result's ID to poll - read from the
+                backend's own create-query-result response, so it is
+                validated and percent-encoded as exactly one path segment
+                (safe_path_segment) before any request is built
 
         Returns:
             List of raw result rows
 
         Raises:
-            ValueError: If the query never completes within the server's
+            ValueError: If the result id is not a valid single path segment
+                ("." / ".." / "" would be collapsed into a different
+                endpoint), if the query never completes within the server's
                 own documented execution timeout, or the response shape is
                 unexpected
         """
+        encoded_result_id = safe_path_segment(result_id, "result_id")
         deadline = time.monotonic() + _QUERY_EXECUTION_TIMEOUT_SECONDS + _POLL_INTERVAL_SECONDS
         while True:
-            response = await self.client.get(f"/1/query_results/{self.dataset}/{result_id}")
+            response = await self.client.get(f"/1/query_results/{self.dataset}/{encoded_result_id}")
             response.raise_for_status()
             payload = response.json()
 
