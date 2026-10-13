@@ -1,4 +1,4 @@
-"""Tests for the Dockerfile's base-image pinning.
+"""Tests for the Dockerfile's base-image pinning and runtime environment.
 
 Regression coverage for the finding that both FROM lines (builder:
 ghcr.io/astral-sh/uv, runtime: python) were pinned by mutable tag only, not
@@ -6,6 +6,9 @@ an immutable @sha256 digest - unlike every third-party step in this repo's
 .github/workflows/*.yml files, which are all SHA-pinned. A re-pushed tag
 (registry compromise, or an upstream re-tag) could otherwise be pulled
 silently on a subsequent build with no build-time detection.
+
+Also pins the image's ENV defaults that keep the shipped container from
+making egress this project did not ask for (FastMCP's PyPI update check).
 """
 
 import re
@@ -74,3 +77,40 @@ def test_runtime_stage_digest_pin() -> None:
     )
     assert pinned_image is not None, "runtime FROM line must keep its human-readable tag"
     assert from_lines[pinned_image], "runtime FROM line must pin an @sha256 digest"
+
+
+def _env_assignments() -> dict[str, str]:
+    """Every KEY=VALUE set by an ENV instruction in the runtime stage, with
+    backslash continuations folded and surrounding quotes removed. Only the
+    stage after the last FROM is the shipped image."""
+    text = DOCKERFILE_PATH.read_text()
+    runtime_stage = text.rsplit("\nFROM ", 1)[1]
+    folded = re.sub(r"\\\n\s*", " ", runtime_stage)
+    assignments: dict[str, str] = {}
+    for line in folded.splitlines():
+        if not line.startswith("ENV "):
+            continue
+        for key, value in re.findall(r'(\w+)=("[^"]*"|\S+)', line[len("ENV ") :]):
+            assignments[key] = value.strip('"')
+    return assignments
+
+
+def test_runtime_env_parser_sees_the_documented_defaults() -> None:
+    """Sanity check for the parser above so the assertion below cannot pass
+    vacuously: the three long-standing defaults must be visible to it."""
+    env = _env_assignments()
+    assert env["LOG_LEVEL"] == "INFO" and env["BACKEND_TIMEOUT"] == "30", env
+    assert env["MAX_TRACES_PER_QUERY"] == "500", env
+
+
+def test_runtime_image_disables_fastmcps_pypi_update_check_and_banner() -> None:
+    """In stdio mode the shipped image contacted https://pypi.org/pypi/fastmcp/json
+    at startup (runtime verification, docker-cli 29): FastMCP's own update
+    check, which README and CLAUDE.md tell operators to disable with
+    FASTMCP_CHECK_FOR_UPDATES=off / FASTMCP_SHOW_SERVER_BANNER=false - but
+    the Dockerfile's ENV block set neither, so every container made that
+    egress unless the operator repeated the advice. The values are the ones
+    fastmcp.settings accepts (Literal "off"; a boolean "false")."""
+    env = _env_assignments()
+    assert env.get("FASTMCP_CHECK_FOR_UPDATES") == "off", env
+    assert env.get("FASTMCP_SHOW_SERVER_BANNER") == "false", env
