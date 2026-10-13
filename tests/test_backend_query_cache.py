@@ -252,6 +252,77 @@ async def test_finisher_cancelled_before_its_first_step_still_releases_the_slot(
     assert cache._inflight["key"] is newer
 
 
+async def test_follower_arriving_in_the_leader_cancel_window_gets_a_fresh_result() -> None:
+    # Round-2 review of TB4: a leader cancelled with no follower waiting
+    # cancels the finisher, but the finisher only observes that at its next
+    # step. A follower created in between - leader.cancel(), then
+    # create_task(follower), then one loop turn - found the slot still
+    # registered, joined it, and received the finisher's CancelledError
+    # although it was never cancelled itself: the probe's -32000 "Connection
+    # closed", narrowed to one loop turn. The slot must read as a miss to
+    # that follower, which becomes a fresh leader and gets a real result.
+    cache = TTLCoalescingCache(ttl_seconds=60.0)
+    call_count = 0
+    started = asyncio.Event()
+
+    async def compute() -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            started.set()
+            await asyncio.Event().wait()  # the first computation ends only by cancellation
+        return f"data-{call_count}"
+
+    leader = asyncio.create_task(cache.get_or_compute("key", compute))
+    await started.wait()
+
+    leader.cancel()
+    follower = asyncio.create_task(cache.get_or_compute("key", compute))  # no yield between
+
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+    assert await asyncio.wait_for(follower, timeout=1.0) == "data-2"
+    assert call_count == 2
+    assert "key" not in cache._inflight
+    assert cache._entries["key"][1] == "data-2"
+
+
+@pytest.mark.parametrize("shape", ["abandoned", "finisher-cancelling", "future-cancelled"])
+async def test_a_slot_that_can_no_longer_answer_is_not_joined(shape: str) -> None:
+    # Defence in depth behind the test above: however a dead slot is still
+    # found under the key - marked abandoned, a finisher with a pending
+    # cancel, or a future already cancelled - a newcomer must not await it.
+    cache = TTLCoalescingCache(ttl_seconds=60.0)
+    loop = asyncio.get_running_loop()
+    stale = _InFlight(loop.create_future())
+
+    async def never_ends() -> str:
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    stale.finisher = asyncio.create_task(never_ends())
+    await asyncio.sleep(0)  # the finisher reaches its await
+    if shape == "abandoned":
+        stale.abandoned = True
+    elif shape == "finisher-cancelling":
+        stale.finisher.cancel()  # requested, not yet observed: the window itself
+    else:
+        stale.future.cancel()
+    cache._inflight["key"] = stale
+
+    async def compute() -> str:
+        return "fresh"
+
+    result = await asyncio.wait_for(cache.get_or_compute("key", compute), timeout=1.0)
+
+    assert result == "fresh"
+    assert cache._inflight.get("key") is not stale
+    assert cache._entries["key"][1] == "fresh"
+    stale.finisher.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stale.finisher
+
+
 async def test_clear_forces_a_recompute_on_next_call() -> None:
     cache = TTLCoalescingCache(ttl_seconds=60.0)
     call_count = 0

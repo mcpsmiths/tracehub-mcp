@@ -33,15 +33,36 @@ DEFAULT_QUERY_CACHE_MAX_ENTRIES = 1024
 
 class _InFlight:
     """One key's in-flight computation: the future every coalesced caller
-    awaits, and how many followers are waiting on it right now (the leader
-    reads this when it is cancelled, see TTLCoalescingCache.get_or_compute).
+    awaits, the finisher task that completes it (None until the leader has
+    started it), how many followers are waiting on it right now, and whether
+    the leader abandoned it (both read by TTLCoalescingCache.get_or_compute).
     Mutated only between awaits on the one event loop, so no lock."""
 
-    __slots__ = ("future", "waiting_followers")
+    __slots__ = ("abandoned", "finisher", "future", "waiting_followers")
 
     def __init__(self, future: asyncio.Future[Any]) -> None:
         self.future = future
+        self.finisher: asyncio.Task[Any] | None = None
         self.waiting_followers = 0
+        self.abandoned = False
+
+    def is_joinable(self) -> bool:
+        """False once this computation can no longer hand a newcomer a real
+        outcome: its leader abandoned it (see get_or_compute), its finisher
+        has a cancellation pending or already observed, or its future ended
+        in a cancellation. A newcomer then treats the key as a miss and
+        starts a fresh computation instead of inheriting a CancelledError
+        it never asked for."""
+        if self.abandoned:
+            return False
+        finisher = self.finisher
+        if finisher is not None and (finisher.cancelling() or finisher.cancelled()):
+            return False
+        future = self.future
+        return not (
+            future.done()
+            and (future.cancelled() or isinstance(future.exception(), asyncio.CancelledError))
+        )
 
 
 class TTLCoalescingCache:
@@ -109,10 +130,15 @@ class TTLCoalescingCache:
                 self._entries.move_to_end(key)  # a hit makes the entry most recently used
                 return cached[1]
             existing = self._inflight.get(key)
-            if existing is not None:
+            if existing is not None and existing.is_joinable():
                 is_leader = False
                 inflight = existing
             else:
+                # No computation under the key, or one that can no longer
+                # answer (its leader abandoned it, see below): this caller
+                # becomes a fresh leader and takes the slot. The old
+                # finisher's own cleanup is identity-checked, so it never
+                # removes the newer slot.
                 is_leader = True
                 inflight = _InFlight(asyncio.get_running_loop().create_future())
                 self._inflight[key] = inflight
@@ -151,15 +177,38 @@ class TTLCoalescingCache:
         # with -32000 "Connection closed" although the backend was healthy.
         # The finisher publishes the result to the shared future and the
         # cache and releases the slot whether or not the leader is still
-        # there. When NO follower is waiting at the moment the leader is
+        # there. When NO follower is waiting at the instant the leader is
         # cancelled, nobody can use the result, so the finisher is cancelled
-        # with it rather than left as orphan backend work.
+        # with it rather than left as orphan backend work. That instant is
+        # the only one at which the finisher is ever cancelled: once a
+        # follower has joined, the computation runs to completion and its
+        # result is cached even if every follower leaves before it finishes
+        # - a departed follower cannot un-send a backend request, and the
+        # cached result serves the next caller (clear() does not cancel
+        # either, see there).
         finisher = asyncio.create_task(self._compute_and_publish(key, inflight, compute, now))
+        inflight.finisher = finisher
         finisher.add_done_callback(functools.partial(self._settle_abandoned, key, inflight))
         try:
             return await asyncio.shield(finisher)
         except asyncio.CancelledError:
-            if inflight.waiting_followers == 0:
+            # Synchronous from here to the raise - no await - so the follower
+            # count is exact and nothing can join between the check and the
+            # cancel. The slot is released NOW rather than when the finisher
+            # observes its cancellation one loop turn later: a follower that
+            # arrived in that turn used to find the slot still registered,
+            # join it, and receive the finisher's CancelledError although it
+            # was never cancelled itself (round-2 review of the shielded
+            # finisher). Released and marked abandoned, the key reads as a
+            # miss to the next caller, which becomes a fresh leader; the
+            # finisher's own identity-checked cleanup then leaves that newer
+            # slot alone. Without the lock for the reason _settle_abandoned
+            # gives: no locked section in this class awaits, so none is in
+            # progress while this handler runs.
+            if inflight.waiting_followers == 0 and not finisher.done():
+                inflight.abandoned = True
+                if self._inflight.get(key) is inflight:
+                    del self._inflight[key]
                 finisher.cancel()
             raise
 
@@ -187,8 +236,11 @@ class TTLCoalescingCache:
             # catching it here (rather than bare `BaseException`, which
             # would also swallow SystemExit/KeyboardInterrupt) completes the
             # future with the same CancelledError instead - an honest "this
-            # shared computation never completed" outcome for anyone who
-            # joined in the meantime.
+            # shared computation never completed" outcome. Nobody receives
+            # it in practice: the leader released the slot and marked it
+            # abandoned before requesting the cancel, so no caller can join
+            # between the request and this step (is_joinable refuses the
+            # slot even if a stale reference were found).
             #
             # `done()` guard: the finisher is the only writer of this future
             # now that followers are shielded, so this is defence in depth -
