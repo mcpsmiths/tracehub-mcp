@@ -125,7 +125,8 @@ _MAX_REASONABLE_DURATION_MS = 1000 * 60 * 60 * 24 * 365 * 10
 # language), so there is no structural-injection risk the way there is for
 # Sentry/New Relic's own query builders - this allowlist is defense in depth
 # against a malformed/control-character-laden column name reaching the API,
-# not an injection guard.
+# not an injection guard. Applied with fullmatch(): with match(), the `$`
+# anchor also accepts a trailing newline.
 _VALID_HONEYCOMB_FIELD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
 
 # Breakdown columns requested on every search, so results carry enough
@@ -289,6 +290,24 @@ class _RateLimiter:
                     await asyncio.sleep(wait_seconds)
 
 
+# One limiter per (url, api_key): Honeycomb accounts the Create Query Result
+# limit per Configuration Key, so every backend instance built with the same
+# credential in this process (BACKEND_TYPE and SECONDARY_BACKEND_TYPE both
+# honeycomb) must pace through the same budget, not 10/min each.
+_rate_limiters: dict[tuple[str, str | None], _RateLimiter] = {}
+
+
+def _shared_rate_limiter(url: str, api_key: str | None) -> _RateLimiter:
+    """The one _RateLimiter every backend instance built with this (url,
+    api_key) shares, created on first use."""
+    key = (url, api_key)
+    limiter = _rate_limiters.get(key)
+    if limiter is None:
+        limiter = _RateLimiter(_QUERY_RESULT_RATE_LIMIT_PER_MINUTE)
+        _rate_limiters[key] = limiter
+    return limiter
+
+
 class HoneycombBackend(BaseBackend):
     """Honeycomb Query Data API backend."""
 
@@ -328,7 +347,8 @@ class HoneycombBackend(BaseBackend):
             )
 
         self.dataset = dataset
-        self._query_result_rate_limiter = _RateLimiter(_QUERY_RESULT_RATE_LIMIT_PER_MINUTE)
+        # Shared per credential, not per instance - see _rate_limiters.
+        self._query_result_rate_limiter = _shared_rate_limiter(self.url, self.api_key)
 
     def _create_headers(self) -> dict[str, str]:
         """Create headers for Honeycomb API requests.
@@ -970,7 +990,7 @@ class HoneycombBackend(BaseBackend):
             Honeycomb filter dict, or None if unsupported/unsafe
         """
         field = self._honeycomb_field(filter_obj.field)
-        if not _VALID_HONEYCOMB_FIELD_RE.match(field):
+        if not _VALID_HONEYCOMB_FIELD_RE.fullmatch(field):
             logger.warning(f"Rejecting filter with unsafe/invalid Honeycomb column name: {field!r}")
             return None
 

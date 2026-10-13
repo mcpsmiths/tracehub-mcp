@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from opentelemetry_mcp.backends import honeycomb
 from opentelemetry_mcp.backends.base import _RetryingTransport
 from opentelemetry_mcp.backends.honeycomb import (
     _MAX_QUERY_ROWS,
@@ -32,7 +33,17 @@ from opentelemetry_mcp.backends.honeycomb import (
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, SpanQuery, TraceQuery
 
 FAKE_CONFIG_KEY = "fake-honeycomb-configkey-1"
+OTHER_FAKE_CONFIG_KEY = "fake-honeycomb-configkey-2"
 FAKE_DATASET = "my-dataset"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_rate_limiter_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Limiters are shared per (url, api_key) across backend instances - and
+    therefore across the tests that all build _backend() with the same fake
+    credential. Each test gets an empty registry so the budget one test
+    spends (or the event loop one test's lock bound to) never leaks."""
+    monkeypatch.setattr(honeycomb, "_rate_limiters", {})
 
 
 def _backend() -> HoneycombBackend:
@@ -285,6 +296,61 @@ class TestRateLimiterParkingBound:
             await leader
 
 
+class TestRateLimiterRegistry:
+    """Honeycomb's 10/min Create Query Result limit is accounted per
+    Configuration Key, so two backend instances built with the same url and
+    key (e.g. BACKEND_TYPE and SECONDARY_BACKEND_TYPE both honeycomb) must
+    pace through ONE limiter - a per-instance limiter admitted 20 runs a
+    minute under a single key."""
+
+    def test_same_credential_shares_one_limiter(self) -> None:
+        a = _backend()
+        b = _backend()
+        assert a._query_result_rate_limiter is b._query_result_rate_limiter
+
+    def test_different_credentials_get_distinct_limiters(self) -> None:
+        a = _backend()
+        other_key = HoneycombBackend(
+            url="https://api.honeycomb.io", api_key=OTHER_FAKE_CONFIG_KEY, dataset=FAKE_DATASET
+        )
+        other_url = HoneycombBackend(
+            url="https://api.eu1.honeycomb.io", api_key=FAKE_CONFIG_KEY, dataset=FAKE_DATASET
+        )
+        assert a._query_result_rate_limiter is not other_key._query_result_rate_limiter
+        assert a._query_result_rate_limiter is not other_url._query_result_rate_limiter
+
+    async def test_eleventh_run_across_two_instances_waits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_now = [1000.0]
+        sleep_calls: list[float] = []
+
+        def _fake_monotonic() -> float:
+            return fake_now[0]
+
+        async def _fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            fake_now[0] += seconds
+
+        monkeypatch.setattr("opentelemetry_mcp.backends.honeycomb.time.monotonic", _fake_monotonic)
+        monkeypatch.setattr("opentelemetry_mcp.backends.honeycomb.asyncio.sleep", _fake_sleep)
+
+        a = _backend()
+        b = _backend()
+        for _ in range(_QUERY_RESULT_RATE_LIMIT_PER_MINUTE // 2):
+            await a._query_result_rate_limiter.acquire()
+            await b._query_result_rate_limiter.acquire()
+        assert sleep_calls == []
+
+        await b._query_result_rate_limiter.acquire()
+
+        assert sleep_calls == [pytest.approx(60.0)]
+
+    def test_registry_is_keyed_on_url_and_key(self) -> None:
+        _backend()
+        assert set(honeycomb._rate_limiters) == {("https://api.honeycomb.io", FAKE_CONFIG_KEY)}
+
+
 class TestCreateQueryResultParkingBound:
     """_create_query_result passes max_wait_seconds=self.timeout, so a tool
     call or readiness probe never parks inside the limiter longer than
@@ -464,6 +530,20 @@ class TestFilterToHoneycombFilter:
         backend = _backend()
         f = Filter(
             field="x'); DROP TABLE spans;--",
+            operator=FilterOperator.EQUALS,
+            value="v",
+            value_type=FilterType.STRING,
+        )
+        assert backend._filter_to_honeycomb_filter(f) is None
+
+    @pytest.mark.parametrize("field", ["gen_ai.system\n", "gen_ai.system\n\n", "name\r\n"])
+    def test_field_with_a_trailing_newline_is_rejected(self, field: str) -> None:
+        """re.match with a `$` anchor accepts a trailing newline (`$` matches
+        before it); the allowlist must be a fullmatch so no control
+        character reaches the query spec."""
+        backend = _backend()
+        f = Filter(
+            field=field,
             operator=FilterOperator.EQUALS,
             value="v",
             value_type=FilterType.STRING,
