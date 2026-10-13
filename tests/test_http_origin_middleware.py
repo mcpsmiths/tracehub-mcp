@@ -194,6 +194,15 @@ class TestBracketedHostTrailingText:
             assert client.get("/", headers={"host": host}).status_code == 421, host
         assert client.get("/", headers={"host": "[2001:db8::1]:8443"}).status_code == 200
 
+    def test_more_than_one_trailing_dot_is_refused_at_the_request_surface(self) -> None:
+        # Final-pass verification: 'localhost..' still answered 200 on a loopback bind because
+        # _canonical_hostname stripped one dot and is_loopback_host's normaliser the second.
+        client = _build_client(bind_host="127.0.0.1")
+        assert client.get("/", headers={"host": "localhost.."}).status_code == 421
+        assert client.get("/", headers={"host": "127.0.0.1.."}).status_code == 421
+        assert client.get("/", headers={"host": "localhost."}).status_code == 200
+        assert client.get("/", headers={"host": "localhost"}).status_code == 200
+
     def test_non_ascii_whitespace_padding_is_not_stripped(self) -> None:
         # Delta verification: str.strip() removed a latin-1 NBSP (0xA0) / NEL (0x85) h11 decodes
         # from the header bytes, so 'verify.local\xa0' matched the allowlist and '[::1]\xa0'
@@ -327,7 +336,10 @@ class TestHostAllowlistNormalisation:
 
     def test_hostname_from_host_header_normalises_both_shapes(self) -> None:
         assert _hostname_from_host_header("Verify.Local.:8000") == "verify.local"
-        assert _hostname_from_host_header("verify.local..") == "verify.local."
+        # Two or more trailing dots name nothing: returned whole so neither the loopback check
+        # (whose normaliser strips one dot itself) nor an allowlist entry can match it; with one
+        # strip here and one there, "localhost.." answered 200 (final-pass verification).
+        assert _hostname_from_host_header("verify.local..") == "verify.local.."
         assert _hostname_from_host_header("[2001:0DB8::0001]:80") == "2001:db8::1"
         assert _hostname_from_host_header("2001:0db8:0:0:0:0:0:1") == "2001:db8::1"
         # Not an address: left alone (and so never equal to a real literal).

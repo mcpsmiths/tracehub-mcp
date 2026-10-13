@@ -1656,6 +1656,12 @@ def _canonical_hostname(host: str) -> str:
     (runtime verification prober-1 F7). IPv4 spellings are deliberately
     not canonicalised: ``127.1`` / ``0x7f000001`` stay refused."""
     if host.endswith("."):
+        if host.endswith(".."):
+            # Two or more trailing dots name nothing. Return the value untouched so neither
+            # is_loopback_host (whose normaliser strips one dot itself) nor an allowlist entry
+            # (which may carry at most one) can match it: with one strip here and one there,
+            # 'localhost..' answered 200 on a loopback bind (final-pass verification).
+            return host
         host = host[:-1]
     if ":" in host:
         with suppress(ValueError):
