@@ -4,6 +4,7 @@ import asyncio
 import functools
 import logging
 import time
+import zlib
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
@@ -175,6 +176,108 @@ class ResponseTooLargeError(httpx.TransportError):
     """
 
 
+# The Content-Encodings the transport decodes itself, through
+# zlib.decompressobj driven with max_length, so that no decoding step ever
+# materialises more than the remaining byte budget plus one byte. httpx's own
+# decoders inflate each wire chunk completely before anything downstream can
+# count it, and a 64 KiB gzip chunk of zeros is ~64 MiB decoded: with the
+# httpx path, BACKEND_MAX_RESPONSE_BYTES bounded what was BUFFERED, not the
+# peak (one refused 200 MiB-decoded body under a 1 MiB cap cost +121 MiB
+# RSS in the runtime probe; eight concurrent ones ~500 MB). brotli and zstd
+# have no bounded-output decoder in the installed stack and are refused,
+# and the outgoing Accept-Encoding is held to this set so a well-behaved
+# backend never picks one of them (_BOUNDED_ACCEPT_ENCODING).
+_ZLIB_WBITS_BY_ENCODING = {
+    "gzip": zlib.MAX_WBITS | 16,
+    "x-gzip": zlib.MAX_WBITS | 16,
+    "deflate": zlib.MAX_WBITS,  # zlib-wrapped first; raw deflate on a header failure
+}
+_BOUNDED_ACCEPT_ENCODING = "gzip, deflate"
+_ACCEPTABLE_ENCODING_TOKENS = frozenset({*_ZLIB_WBITS_BY_ENCODING, "identity"})
+# How much of a backend-chosen Content-Encoding value reaches the error text
+# (tool-error channel and server log); repr()-quoted like 600ffb5's header
+# values so a control character can never reach a terminal unescaped.
+_MAX_QUOTED_ENCODING_CHARS = 64
+
+
+class UnsupportedContentEncodingError(httpx.TransportError):
+    """Raised, before a byte of the body is read, when a backend response
+    carries a Content-Encoding the transport cannot decode within the
+    byte budget (brotli, zstd, anything unknown, or a chain of encodings).
+    Not retryable: the same backend would answer the same way. httpx would
+    otherwise pass an unknown encoding through undecoded and inflate br/
+    zstd without an output bound when those extras are installed.
+    """
+
+
+def _content_encoding(headers: httpx.Headers) -> str | None:
+    """The one non-identity Content-Encoding of a response, or None for an
+    unencoded body. Raises UnsupportedContentEncodingError for an encoding
+    outside _ZLIB_WBITS_BY_ENCODING or for more than one applied encoding."""
+    encodings = [
+        value.strip().lower()
+        for value in headers.get_list("content-encoding", split_commas=True)
+        if value.strip() and value.strip().lower() != "identity"
+    ]
+    if not encodings:
+        return None
+    if len(encodings) == 1 and encodings[0] in _ZLIB_WBITS_BY_ENCODING:
+        return encodings[0]
+    shown = ", ".join(encodings)[:_MAX_QUOTED_ENCODING_CHARS]
+    raise UnsupportedContentEncodingError(
+        f"Backend response uses Content-Encoding {shown!r}, which cannot be decoded "
+        f"within BACKEND_MAX_RESPONSE_BYTES (only {_BOUNDED_ACCEPT_ENCODING} are accepted); "
+        "refusing to read it"
+    )
+
+
+def _offers_only_bounded_encodings(request: httpx.Request) -> bool:
+    """True when the request's Accept-Encoding names only codecs the
+    transport can bound (q-values ignored; an absent header or '*' invites
+    any codec and so counts as unbounded)."""
+    tokens = [
+        value.split(";", 1)[0].strip().lower()
+        for value in request.headers.get_list("accept-encoding", split_commas=True)
+    ]
+    return bool(tokens) and all(token in _ACCEPTABLE_ENCODING_TOKENS for token in tokens)
+
+
+class _BoundedInflater:
+    """zlib.decompressobj for one Content-Encoding, fed wire bytes with an
+    explicit output ceiling: decompress(raw, max_length) returns at most
+    max_length bytes and parks the rest of the INPUT in unconsumed_tail, so
+    a chunk that would inflate past the budget costs budget + 1 bytes, not
+    its full expansion. Mirrors httpx's DeflateDecoder in accepting both
+    zlib-wrapped and raw deflate, and its GZipDecoder in raising
+    httpx.DecodingError for a damaged stream."""
+
+    def __init__(self, encoding: str) -> None:
+        self._wbits = _ZLIB_WBITS_BY_ENCODING[encoding]
+        self._decompressor = zlib.decompressobj(self._wbits)
+        self._may_retry_as_raw_deflate = self._wbits == zlib.MAX_WBITS
+
+    def inflate(self, raw: bytes, max_length: int) -> bytes:
+        try:
+            decoded = self._decompressor.decompress(raw, max_length)
+        except zlib.error as exc:
+            if self._may_retry_as_raw_deflate:
+                # A deflate body sent without the zlib wrapper fails the
+                # header check on its first bytes; retry once as raw deflate,
+                # exactly as httpx does, then commit to that form.
+                self._may_retry_as_raw_deflate = False
+                self._decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+                return self.inflate(raw, max_length)
+            raise httpx.DecodingError(str(exc)) from exc
+        self._may_retry_as_raw_deflate = False
+        return decoded
+
+    def flush(self) -> bytes:
+        try:
+            return self._decompressor.flush()
+        except zlib.error as exc:
+            raise httpx.DecodingError(str(exc)) from exc
+
+
 # The wall-clock deadline for one LOGICAL backend request - connect, every
 # retry attempt and the sleep before it, every redirect hop and the whole
 # body read - derived from the operator's BACKEND_TIMEOUT as
@@ -275,20 +378,27 @@ def _deadline_exceeded() -> BackendDeadlineExceededError:
 class _BoundedResponse(httpx.Response):
     """The response _RetryingTransport hands back to httpx: the wrapped
     transport's status, headers, body stream and extensions, with an
-    aiter_bytes() that counts DECODED bytes and raises ResponseTooLargeError
-    once the running total passes the cap, and that gives up with
+    aiter_bytes() that decodes the RAW wire bytes itself under the byte
+    budget (see _BoundedInflater) and raises ResponseTooLargeError the
+    moment the decoded total passes the cap, and that gives up with
     BackendDeadlineExceededError when the logical request's deadline passes
     between two chunks (a body trickling in below the read timeout).
 
     httpx (~=0.28) reads every non-stream response - and every redirect hop
     it follows - through Response.aread(), which is implemented over
     aiter_bytes(), so this one override bounds all 25 response.json() sites
-    across the backends with no call-site changes. Overshoot is bounded by
-    the expansion of a single raw chunk, never by the whole body.
+    across the backends with no call-site changes. Peak materialisation is
+    bounded by the cap plus one wire chunk, never by a chunk's expansion.
+    `chunk_size` is accepted for signature compatibility; decoded data is
+    yielded as each wire chunk produces it (only aread() consumes this).
     """
 
     def __init__(
-        self, inner: httpx.Response, max_response_bytes: int, budget: _RequestBudget
+        self,
+        inner: httpx.Response,
+        max_response_bytes: int,
+        budget: _RequestBudget,
+        encoding: str | None,
     ) -> None:
         super().__init__(
             inner.status_code,
@@ -298,10 +408,29 @@ class _BoundedResponse(httpx.Response):
         )
         self._max_response_bytes = max_response_bytes
         self._budget = budget
+        # Not `_encoding`: httpx.Response keeps the text charset there.
+        self._content_encoding = encoding
+
+    async def _raise_too_large(self) -> None:
+        # Release the pooled connection now rather than leaving the
+        # half-read body to the client's own exception handling.
+        await self.aclose()
+        raise ResponseTooLargeError(
+            f"Backend response exceeded {self._max_response_bytes} decoded bytes "
+            "(BACKEND_MAX_RESPONSE_BYTES); refusing to buffer it"
+        )
 
     async def aiter_bytes(self, chunk_size: int | None = None) -> AsyncIterator[bytes]:
+        if hasattr(self, "_content"):
+            # Already read and decoded: httpx serves it from memory.
+            async for chunk in super().aiter_bytes(chunk_size):
+                yield chunk
+            return
+        inflater = (
+            None if self._content_encoding is None else _BoundedInflater(self._content_encoding)
+        )
         decoded_total = 0
-        chunks = super().aiter_bytes(chunk_size)
+        raw_chunks = self.aiter_raw()
         while True:
             # Each wait for the next chunk is capped at the time left on the
             # logical request, not at httpx's per-read timeout: a backend
@@ -316,24 +445,33 @@ class _BoundedResponse(httpx.Response):
                 raise
             try:
                 async with asyncio.timeout(remaining) as scope:
-                    chunk = await anext(chunks)
+                    raw = await anext(raw_chunks)
             except StopAsyncIteration:
                 break
             except TimeoutError:
                 if not scope.expired():
                     raise
-                # Release the pooled connection now rather than leaving the
-                # half-read body to the client's own exception handling.
                 await self.aclose()
                 raise _deadline_exceeded() from None
-            decoded_total += len(chunk)
+            if inflater is None:
+                decoded = raw
+            else:
+                # max_length = budget left + 1: a chunk that fits produces
+                # all of its output (unconsumed_tail stays empty); one that
+                # does not stops at the first byte over the cap.
+                decoded = inflater.inflate(raw, self._max_response_bytes - decoded_total + 1)
+            decoded_total += len(decoded)
             if decoded_total > self._max_response_bytes:
-                await self.aclose()
-                raise ResponseTooLargeError(
-                    f"Backend response exceeded {self._max_response_bytes} decoded bytes "
-                    "(BACKEND_MAX_RESPONSE_BYTES); refusing to buffer it"
-                )
-            yield chunk
+                await self._raise_too_large()
+            if decoded:
+                yield decoded
+        if inflater is not None:
+            tail = inflater.flush()
+            decoded_total += len(tail)
+            if decoded_total > self._max_response_bytes:
+                await self._raise_too_large()
+            if tail:
+                yield tail
 
 
 # Only genuine transport-level failures - a connection that never completed
@@ -533,6 +671,15 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
                 f"Refusing request to {request.url.host!r}: the configured backend host is "
                 f"{self._allowed_host!r} and a backend response may not redirect elsewhere"
             )
+        # Offer the backend only the codecs the response path can decode
+        # within the byte budget. httpx's default offer grows with the
+        # optional brotli/zstd extras; a backend honouring such an offer
+        # would then be refused on the way back (_content_encoding), so the
+        # offer is narrowed here, at the one point every backend's client
+        # shares. An offer already within the set (q-values included) is
+        # left exactly as the backend code wrote it.
+        if not _offers_only_bounded_encodings(request):
+            request.headers["Accept-Encoding"] = _BOUNDED_ACCEPT_ENCODING
 
         # A plain `async def` closure (rather than passing
         # self._wrapped.handle_async_request straight to tenacity) ensures
@@ -622,7 +769,15 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
                 f"Backend response declared Content-Length {shown}, above the "
                 f"{self._max_response_bytes}-byte BACKEND_MAX_RESPONSE_BYTES cap"
             )
-        response = _BoundedResponse(response, self._max_response_bytes, budget)
+        # Decided before the body is read, like the Content-Length check: an
+        # encoding the bounded decoder cannot handle is refused with the
+        # connection released, never inflated or passed through.
+        try:
+            encoding = _content_encoding(response.headers)
+        except UnsupportedContentEncodingError:
+            await response.aclose()
+            raise
+        response = _BoundedResponse(response, self._max_response_bytes, budget, encoding)
         if self._slow_request_threshold_ms is not None:
             duration_ms = (time.perf_counter() - start) * 1000
             if duration_ms > self._slow_request_threshold_ms:

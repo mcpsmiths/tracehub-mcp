@@ -12,7 +12,10 @@ import asyncio
 import gzip
 import json
 import logging
+import os
 import time
+import tracemalloc
+import zlib
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -30,6 +33,7 @@ from opentelemetry_mcp.backends.base import (
     MetadataEndpointBlockedError,
     RedirectTargetBlockedError,
     ResponseTooLargeError,
+    UnsupportedContentEncodingError,
     _is_rate_limited,
     _RequestBudget,
     _retry_after_seconds,
@@ -1524,3 +1528,316 @@ class TestRetryBudgetPerLogicalRequest:
 
         assert budget.can_afford_retry(0.5) is True
         assert budget.can_afford_retry(1.5) is False
+
+
+class _ChunkedStream(httpx.AsyncByteStream):
+    """A body delivered in fixed-size wire chunks, as httpcore hands them
+    to httpx (64 KiB reads), so decoding is exercised across chunk
+    boundaries rather than on one pre-assembled buffer."""
+
+    def __init__(self, data: bytes, chunk_size: int) -> None:
+        self._data = data
+        self._chunk_size = chunk_size
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for offset in range(0, len(self._data), self._chunk_size):
+            yield self._data[offset : offset + self._chunk_size]
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _gzip_bomb(decoded_mib: int) -> bytes:
+    """`decoded_mib` MiB of zeros, gzip-compressed in a streaming fashion so
+    the test itself never holds the decoded size in memory."""
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    parts = [compressor.compress(b"\0" * (1024 * 1024)) for _ in range(decoded_mib)]
+    parts.append(compressor.flush())
+    return b"".join(parts)
+
+
+def _encoded_response(encoding: str, body: bytes, chunk_size: int = 64 * 1024) -> httpx.Response:
+    return httpx.Response(
+        200,
+        headers={"Content-Encoding": encoding, "Content-Type": "application/json"},
+        stream=_ChunkedStream(body, chunk_size),
+    )
+
+
+class TestIncrementalDecoding:
+    """BACKEND_MAX_RESPONSE_BYTES bounded the bytes BUFFERED, not the peak:
+    httpx inflated each wire chunk completely before _BoundedResponse
+    counted it, and a 64 KiB gzip chunk of zeros is ~64 MiB decoded. The
+    runtime probe (probe-2 memory/01) served one 200 MiB-decoded gzip body
+    under a 1 MiB cap and watched RSS rise by 121 MiB; eight concurrent
+    bodies took the process from 10.9 MB to ~500 MB before all were
+    refused. The transport now inflates the raw wire bytes itself through
+    zlib with max_length = remaining budget + 1, so no step ever
+    materialises more than the cap plus one byte."""
+
+    async def test_gzip_bomb_is_refused_without_inflating_past_the_cap(self) -> None:
+        bomb = _gzip_bomb(200)
+        assert len(bomb) < 256 * 1024  # ~200 KiB on the wire for 200 MiB decoded
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return _encoded_response("gzip", bomb)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            tracemalloc.start()
+            try:
+                tracemalloc.reset_peak()
+                before, _ = tracemalloc.get_traced_memory()
+                with pytest.raises(ResponseTooLargeError, match="BACKEND_MAX_RESPONSE_BYTES"):
+                    await client.get("/api/traces/bomb")
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+
+        assert call_count == 1
+        # Cap + one wire chunk + decoder state, never a whole inflated chunk.
+        assert peak - before < _ONE_MIB + 4 * _ONE_MIB
+
+    async def test_legitimate_900_kib_gzip_json_under_the_cap_decodes_byte_for_byte(
+        self,
+    ) -> None:
+        body = json.dumps({"data": ["svc-a"], "pad": "a" * (900 * 1024)}).encode()
+        gz = gzip.compress(body)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return _encoded_response("gzip", gz)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/api/services")
+
+        assert response.content == body
+        assert response.json()["data"] == ["svc-a"]
+        assert len(response.json()["pad"]) == 900 * 1024
+
+    async def test_incompressible_gzip_body_spanning_many_wire_chunks_decodes_exactly(
+        self,
+    ) -> None:
+        """Random bytes do not compress, so every 7 KiB wire chunk inflates
+        to about 7 KiB and the decoder is driven across ~130 chunk
+        boundaries with partial zlib state between them."""
+        body = os.urandom(900 * 1024)
+        gz = gzip.compress(body)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return _encoded_response("gzip", gz, chunk_size=7 * 1024)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/blob")
+
+        assert response.content == body
+
+    @pytest.mark.parametrize("wbits", [zlib.MAX_WBITS, -zlib.MAX_WBITS], ids=["zlib", "raw"])
+    async def test_deflate_in_both_wire_forms_decodes(self, wbits: int) -> None:
+        """Content-Encoding: deflate is sent both zlib-wrapped and raw in the
+        wild; httpx's DeflateDecoder accepts both, and so must the bounded
+        path that replaces it."""
+        body = json.dumps({"data": ["svc-a"], "pad": "b" * 4096}).encode()
+        compressor = zlib.compressobj(6, zlib.DEFLATED, wbits)
+        deflated = compressor.compress(body) + compressor.flush()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return _encoded_response("deflate", deflated, chunk_size=512)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/api/services")
+
+        assert response.content == body
+
+    @pytest.mark.parametrize(("decoded_size", "allowed"), [(_ONE_MIB, True), (_ONE_MIB + 1, False)])
+    async def test_gzip_boundary_at_the_cap_is_unchanged(
+        self, decoded_size: int, allowed: bool
+    ) -> None:
+        """35fb662/23b2fe8 defined the boundary: exactly the cap passes, one
+        byte more is refused - now for the incrementally decoded path too."""
+        gz = gzip.compress(b"a" * decoded_size)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return _encoded_response("gzip", gz)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            if allowed:
+                response = await client.get("/blob")
+                assert len(response.content) == decoded_size
+            else:
+                with pytest.raises(ResponseTooLargeError):
+                    await client.get("/blob")
+
+    async def test_corrupt_gzip_body_raises_httpx_decoding_error(self) -> None:
+        """Same error type httpx's own decoder raises, so callers see no
+        new failure shape for a damaged body."""
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return _encoded_response("gzip", b"\x1f\x8b\x08\x00not really gzip data")
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            with pytest.raises(httpx.DecodingError):
+                await client.get("/api/services")
+
+    @pytest.mark.parametrize("encoding", ["br", "zstd", "x-custom", "gzip, deflate"])
+    async def test_encodings_zlib_cannot_bound_are_refused_before_the_body_is_read(
+        self, encoding: str
+    ) -> None:
+        """A decoder without an output bound (brotli, zstd, anything
+        unknown, or a chain of encodings) would reintroduce the finding, so
+        such a response is refused up front - the body is never read and
+        the connection is released - rather than inflated by whatever httpx
+        happens to have installed, or passed through undecoded as httpx
+        does for an unknown encoding."""
+        stream = _RecordingStream(b"x" * 16)
+        call_count = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(200, headers={"Content-Encoding": encoding}, stream=stream)
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), max_response_bytes=_ONE_MIB
+        )
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            with pytest.raises(UnsupportedContentEncodingError, match="Content-Encoding"):
+                await client.get("/api/services")
+
+        assert call_count == 1  # not retryable
+        assert stream.reads == 0
+        assert stream.closed is True
+
+    async def test_refusal_message_bounds_and_quotes_the_backend_chosen_encoding(self) -> None:
+        """The encoding value is backend-chosen text that ends up in the
+        tool-error channel and the server log: cut and repr()-quoted."""
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Encoding": "evil\x01" + "z" * 500},
+                stream=httpx.ByteStream(b""),
+            )
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            with pytest.raises(UnsupportedContentEncodingError) as exc_info:
+                await client.get("/api/services")
+
+        message = str(exc_info.value)
+        assert "'evil\\x01zzz" in message  # repr()-quoted, control character escaped
+        assert "z" * 100 not in message
+
+    async def test_text_charset_of_a_gzip_body_is_untouched_by_the_content_encoding(self) -> None:
+        """httpx.Response keeps the text charset in `_encoding`; the bounded
+        response records the Content-Encoding under a different name so
+        .text still decodes with the declared charset, not 'gzip'."""
+        body = json.dumps({"service": "caf\u00e9"}, ensure_ascii=False).encode("utf-8")
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            response = _encoded_response("gzip", gzip.compress(body))
+            response.headers["Content-Type"] = "application/json; charset=utf-8"
+            return response
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/api/services")
+
+        assert response.encoding == "utf-8"
+        assert response.text == body.decode("utf-8")
+        assert response.json() == {"service": "caf\u00e9"}
+
+    async def test_reiterating_a_read_body_serves_the_decoded_content(self) -> None:
+        """httpx callers may iterate aiter_bytes() after aread(); the bounded
+        override must then serve the decoded content from memory like the
+        base class, not touch the already-consumed stream."""
+        body = json.dumps({"data": ["svc-a"]}).encode()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return _encoded_response("gzip", gzip.compress(body))
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            response = await client.get("/api/services")
+            again = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+        assert response.content == body
+        assert again == body
+
+    def test_budget_with_a_passed_deadline_refuses_to_hand_out_time(self) -> None:
+        budget = _RequestBudget(deadline=time.monotonic() - 0.001)
+
+        with pytest.raises(BackendDeadlineExceededError):
+            budget.remaining_seconds()
+        assert _RequestBudget(deadline=None).remaining_seconds() is None
+
+    async def test_identity_and_absent_content_encoding_keep_the_plain_path(self) -> None:
+        body = json.dumps({"ok": True}).encode()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/identity":
+                return httpx.Response(200, headers={"Content-Encoding": "identity"}, content=body)
+            return httpx.Response(200, content=body)
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            assert (await client.get("/identity")).json() == {"ok": True}
+            assert (await client.get("/plain")).json() == {"ok": True}
+
+    async def test_accept_encoding_offered_to_the_backend_is_limited_to_bounded_codecs(
+        self,
+    ) -> None:
+        """httpx advertises every codec it has a decoder for (br/zstd when
+        those extras are installed); the transport rewrites the offer to the
+        codecs it can bound, so a well-behaved backend never picks one the
+        response path would then have to refuse. The default offer is
+        already within the set and passes through untouched."""
+        offers: dict[str, str | None] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            offers[request.url.path] = request.headers.get("Accept-Encoding")
+            return httpx.Response(200, json={"ok": True})
+
+        transport = _RetryingTransport(wrapped=httpx.MockTransport(handler))
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.test") as client:
+            await client.get("/default")
+            await client.get("/wide", headers={"Accept-Encoding": "gzip, deflate, br, zstd"})
+            await client.get("/any", headers={"Accept-Encoding": "*"})
+            await client.get("/qvalues", headers={"Accept-Encoding": "gzip;q=1.0, identity; q=0.5"})
+
+        assert offers["/default"] == "gzip, deflate"
+        assert offers["/wide"] == "gzip, deflate"
+        assert offers["/any"] == "gzip, deflate"
+        assert offers["/qvalues"] == "gzip;q=1.0, identity; q=0.5"
