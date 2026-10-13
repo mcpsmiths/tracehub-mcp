@@ -541,6 +541,40 @@ class TestRedirectHostPin:
         assert "/health" not in message
         assert "/base" not in message
 
+    async def test_refused_origin_text_bounds_the_backend_chosen_host(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Round-2 review of the origin pin: the refused origin is the
+        backend's own Location host, embedded verbatim in the tool-error
+        text and the log - a 5 kB hostname landed there whole, where the
+        Content-Encoding refusal in the same transport cuts its backend-
+        chosen value to 64 characters. Same bound here: repr-quoted, cut,
+        marked."""
+        long_host = "h" * 5000 + ".example"
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "backend.test":
+                return httpx.Response(302, headers={"Location": f"http://{long_host}/sink"})
+            raise AssertionError("the redirect hop must never reach the wrapped transport")
+
+        transport = _RetryingTransport(
+            wrapped=httpx.MockTransport(handler), allowed_origin="http://backend.test"
+        )
+
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://backend.test", follow_redirects=True
+        ) as client:
+            with caplog.at_level(logging.WARNING), pytest.raises(RedirectTargetBlockedError) as exc:
+                await client.get("/search")
+
+        message = str(exc.value)
+        assert len(message) < 400, len(message)
+        # 64 characters of the origin text ("http://" + 57 of the host), then the marker.
+        assert "Refusing request to 'http://" + "h" * 57 + "...'" in message
+        assert "h" * 58 not in message
+        assert "configured backend origin is 'http://backend.test:80'" in message
+        assert all("h" * 58 not in record.getMessage() for record in caplog.records)
+
     def test_constructor_no_longer_accepts_the_host_only_pin(self) -> None:
         """The host-only pin (allowed_host) let a backend redirect into any
         other port or scheme on its own host (runtime probe-2 R/T/X/Y); the

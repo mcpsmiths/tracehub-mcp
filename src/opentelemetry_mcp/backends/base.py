@@ -170,6 +170,24 @@ def _format_origin(origin: tuple[str, str, int | None]) -> str:
     return f"{scheme}://{host}" if port is None else f"{scheme}://{host}:{port}"
 
 
+# How much of a REFUSED origin reaches the refusal text. Its host comes from
+# the backend's own Location header, so it is backend-chosen like a
+# Content-Encoding value and reaches the same two sinks - the tool-error
+# channel and the server log; a 5 kB hostname used to land in both whole
+# (round-2 review of the origin pin). Cut to the same 64 characters the
+# encoding value is cut to, with a marker, and repr()-quoted so a control
+# character never reaches a terminal unescaped. The configured origin in the
+# same message is operator-set and stays whole.
+_MAX_QUOTED_ORIGIN_CHARS = 64
+
+
+def _bounded_origin_repr(origin: tuple[str, str, int | None]) -> str:
+    text = _format_origin(origin)
+    if len(text) > _MAX_QUOTED_ORIGIN_CHARS:
+        text = text[:_MAX_QUOTED_ORIGIN_CHARS] + "..."
+    return repr(text)
+
+
 # Ceiling on the DECODED (post-Content-Encoding) size of any single backend
 # response, in bytes. httpx advertises Accept-Encoding: gzip, deflate and
 # inflates transparently on the read path, so without a bound a ~1 KB wire
@@ -696,10 +714,11 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         if self._allowed_origin is not None:
             origin = _origin_of(request.url)
             if origin != self._allowed_origin:
-                # Origins only: no userinfo, path or query from the request
-                # URL reaches the tool-error channel or the log.
+                # Origins only - no userinfo, path or query from the request
+                # URL reaches the tool-error channel or the log - and the
+                # refused one bounded, its host being backend-chosen.
                 raise RedirectTargetBlockedError(
-                    f"Refusing request to {_format_origin(origin)!r}: the configured backend "
+                    f"Refusing request to {_bounded_origin_repr(origin)}: the configured backend "
                     f"origin is {_format_origin(self._allowed_origin)!r} and a backend response "
                     "may not redirect elsewhere"
                 )
