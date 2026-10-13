@@ -1,3 +1,31 @@
+## Unreleased
+
+### Fix
+
+- **security**: refuse credentialed URLs before pydantic can echo them <!-- TA1 -->
+- **security**: keep query-string tokens out of uvicorn's access log <!-- TA2 -->
+- **security**: refuse an empty or non-presentable HTTP bearer token <!-- TA3 -->
+- **security**: validate host, proxy and rate-limit options at startup <!-- TA4 -->
+- **security**: apply LOG_LEVEL in doctor so httpx request lines stay at DEBUG <!-- TA5 -->
+- **security**: answer /ready failures with an error class, log the detail <!-- TA6 -->
+- **security**: normalise Host allowlist names and IPv6 literals on both sides <!-- TA7 -->
+- **security**: bound every backend request by one total deadline <!-- TB1 -->
+- **security**: spend one retry and redirect budget per logical request <!-- TB2 -->
+- **security**: inflate backend bodies incrementally under the byte cap <!-- TB3 -->
+- **security**: finish a coalesced computation for followers when the leader is cancelled <!-- TB4 -->
+- **security**: bound triage chains and name a root-less parent cycle <!-- TB5 -->
+- **security**: pin backend requests to the configured origin, not the host <!-- TB6 -->
+- **security**: redact the truncated authority of a pydantic input_value echo <!-- TC1 -->
+- **security**: escape control characters in every root-handler log message <!-- TC2 -->
+- **security**: allowlist the bearer-auth test fixture for gitleaks' generic rule <!-- TC3 -->
+- **ci**: install the release toolchain from wheels only <!-- TC4 -->
+- **ci**: cross-check the tree version before publishing to the MCP Registry <!-- TC5 -->
+- **ci**: fail the smoke test on an empty platform; pass the token by name <!-- TC6 -->
+- **ci**: treat a re-dispatch with no new commits as the documented no-op <!-- TC7 -->
+- **security**: ship the image with FastMCP's PyPI update check off <!-- TC8 -->
+- **security**: bound and escape the exported span status description <!-- TC9 -->
+- **docs**: document the round-2 hardening and the operator-facing gaps <!-- TC10 -->
+
 ## v0.12.3 (2026-10-10)
 
 ### Fix
