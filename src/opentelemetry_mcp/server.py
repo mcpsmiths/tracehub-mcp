@@ -2118,13 +2118,14 @@ _WHITESPACE_CHARS = " \t\r\n\x0b\x0c"
 
 
 def _cut_rendered_target_query(message: str) -> str:
-    """`message` with the query string of its quoted request line(s) removed
+    """`message` with everything after the path of its quoted request line(s)
+    removed - the separators of _ACCESS_LOG_TARGET_CUT_RE
     ('... "POST /mcp?x=1 HTTP/1.1" 401' -> '... "POST /mcp HTTP/1.1" 401').
 
     Anchored on the request line, not on the first "?": every "HTTP/" that is
     preceded by whitespace ends a request target, the target is the
-    whitespace-free token right before that whitespace, and a "?" is cut only
-    inside such a token. A custom access format that puts a referer (with its
+    whitespace-free token right before that whitespace, and a separator is cut
+    only inside such a token. A custom access format that puts a referer (with its
     own "?") or a user agent (even one reading "HTTP/1.1") before the request
     line therefore still loses the target's query string (round-2 review of
     the first linear scan, which cut at the first "?" of the line). Every
@@ -2149,10 +2150,10 @@ def _cut_rendered_target_query(message: str) -> str:
         token_start = max(message.rfind(ch, floor, target_end) for ch in _WHITESPACE_CHARS) + 1
         token_start = max(token_start, floor)
         floor = marker
-        query_start = message.find("?", token_start, target_end)
-        if query_start == -1:
+        cut = _ACCESS_LOG_TARGET_CUT_RE.search(message, token_start, target_end)
+        if cut is None:
             continue
-        pieces.append(message[copied_to:query_start])
+        pieces.append(message[copied_to : cut.start()])
         copied_to = target_end
     if not pieces:
         return message
@@ -2161,9 +2162,12 @@ def _cut_rendered_target_query(message: str) -> str:
 
 
 # Where a request target stops being a path: the query string, a fragment (h11 accepts "#"
-# in the target and uvicorn quotes it as %23), a matrix parameter, and the percent-encoded
-# spellings of "?" and "#" - every place a client can put a token besides a path segment.
-_ACCESS_LOG_TARGET_CUT_RE = re.compile(r"[?#;]|%3[fF]|%23")
+# in the target and uvicorn quotes it as %23), a matrix parameter (uvicorn quotes its ";" as
+# %3B, so a raw ";" only ever arrives from a custom access format that logs the unquoted
+# target - the final verification pass found the ";" branch alone never matched a real
+# request), and the percent-encoded spellings of "?" and "#" - every place a client can
+# put a token besides a path segment.
+_ACCESS_LOG_TARGET_CUT_RE = re.compile(r"[?#;]|%3[fF]|%23|%3[bB]")
 _MAX_LOGGED_TARGET_CHARS = 2048
 
 

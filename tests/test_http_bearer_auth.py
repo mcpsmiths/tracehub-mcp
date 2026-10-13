@@ -341,11 +341,19 @@ class TestAccessLogQueryStringFilter:
     @pytest.mark.parametrize(
         ("target", "kept"),
         [
-            # uvicorn quotes the path, so a fragment or an encoded '?' arrives as %23 / %3F.
+            # uvicorn quotes the path, so a fragment, an encoded '?' or a matrix parameter's
+            # ';' arrives as %23 / %3F / %3B; the raw '#' and ';' rows cover a custom access
+            # format that logs the unquoted target.
             ("/health%23access_token%3D{tok}", "/health"),
             ("/mcp%3Faccess_token%3D{tok}", "/mcp"),
             ("/mcp#access_token={tok}", "/mcp"),
             ("/health;access_token={tok}", "/health"),
+            # Final verification pass: these spellings were logged verbatim because the pattern
+            # knew ';' but not the %3B uvicorn actually renders.
+            ("/health%3Baccess_token%3D{tok}", "/health"),
+            ("/mcp%3Baccess_token%3D{tok}", "/mcp"),
+            ("/mcp%3Bx%3D1%3Baccess_token%3D{tok}", "/mcp"),
+            ("/mcp%3baccess_token%3d{tok}", "/mcp"),
             ("/mcp?x=1#access_token={tok}", "/mcp"),
         ],
     )
@@ -395,6 +403,33 @@ class TestAccessLogQueryStringFilter:
         AccessLogQueryStringFilter().filter(record)
 
         assert record.getMessage() == '127.0.0.1:1 - "GET /mcp HTTP/1.1" 401'
+
+    @pytest.mark.parametrize(
+        ("target", "kept"),
+        [
+            ("/mcp%3Baccess_token%3D{tok}", "/mcp"),
+            ("/mcp%3Faccess_token%3D{tok}", "/mcp"),
+            ("/health%23access_token%3D{tok}", "/health"),
+            ("/health;access_token={tok}", "/health"),
+            ("/mcp#access_token={tok}", "/mcp"),
+        ],
+    )
+    def test_cuts_every_separator_from_a_pre_rendered_line(self, target: str, kept: str) -> None:
+        # The fallback used to cut at '?' only; it now stops at the same separators as the
+        # tuple path, and only inside the request target.
+        record = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg=f'127.0.0.1:1 - "GET {target.format(tok=QUERY_DUMMY)} HTTP/1.1" 404',
+            args=None,
+            exc_info=None,
+        )
+        AccessLogQueryStringFilter().filter(record)
+
+        assert record.getMessage() == f'127.0.0.1:1 - "GET {kept} HTTP/1.1" 404'
+        assert QUERY_DUMMY not in record.getMessage()
 
     def test_strips_the_target_query_even_with_tokens_before_the_request_line(self) -> None:
         """A custom access format may put a referer (with its own '?') or a user
