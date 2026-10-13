@@ -2791,6 +2791,15 @@ class TestNetworkOptionsAreValidatedAtStartup:
 
     # --allowed-hosts / MCP_ALLOWED_HOSTS -----------------------------------
 
+    def test_more_than_one_trailing_dot_is_refused(self) -> None:
+        # Delta verification: 'verify.local..' passed validation (two strips of one dot each)
+        # but matched neither 'verify.local' nor 'verify.local.' at runtime.
+        result, serve = _invoke_http_listener(["--allowed-hosts", "verify.local.."])
+
+        assert result.exit_code == 2, result.output
+        assert "more than one trailing dot" in result.output
+        serve.assert_not_called()
+
     def test_wildcard_must_be_the_only_allowed_hosts_entry(self) -> None:
         result, serve = _invoke_http_listener(["--allowed-hosts", "*,example.test"])
 
