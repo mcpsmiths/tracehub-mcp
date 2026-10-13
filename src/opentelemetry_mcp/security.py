@@ -185,6 +185,23 @@ def redact_userinfo_in_text(text: str | None) -> str | None:
     return _TRUNCATED_AUTHORITY_RE.sub(_REDACTED_TRUNCATED_AUTHORITY, redacted)
 
 
+# Every C0 control (U+0000-U+001F), DEL, every C1 control (U+0080-U+009F) and
+# the two Unicode line separators: the characters that let a logged value
+# start a forged log line, hide text behind a carriage return, or address the
+# terminal that tails the log (ESC sequences). TAB is included because it is
+# the one C0 character a header value carries through h11 unchanged.
+_LOG_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def escape_log_control_characters(text: str) -> str:
+    """`text` with every control character replaced by its repr-style escape
+    (`\\x01`, `\\t`, `\\n`, `\\x80`, `\\u2028`) - one line in, one line out,
+    and nothing else touched (printable non-ASCII text is kept as is). The
+    presentation matches the repr()-quoted Host/Origin values server.py logs
+    for its own rejection lines."""
+    return _LOG_CONTROL_CHARS_RE.sub(lambda match: repr(match.group())[1:-1], text)
+
+
 def _safe_redacted_text(value: object) -> str:
     """str(value) with URL userinfo redacted. A value whose __str__ raises
     becomes a type-name placeholder: this runs inside a logging filter,
@@ -210,7 +227,23 @@ def _redact_log_args(args: object) -> tuple[object, ...] | Mapping[str, object] 
 
 class UserinfoRedactingFilter(logging.Filter):
     """Handler-level last line of defence: rewrites a record so neither its
-    message nor its formatted traceback carries a URL userinfo component.
+    message nor its formatted traceback carries a URL userinfo component,
+    and so its message is one printable line - every C0/C1 control
+    character, DEL and U+2028/U+2029 in the rendered message is replaced by
+    its repr-style escape (escape_log_control_characters).
+
+    The escape is generic on purpose. 600ffb5 bounds and repr()-quotes the
+    Host/Origin values this project's own middleware logs, but the runtime
+    verification of PR #41 (probe-4 P8b/P8c) found the mcp SDK's
+    streamable_http_manager writing "Rejected request with unknown or
+    expired session ID: evil\\x01sess" with the raw \\x01, a raw TAB and raw
+    \\x80 bytes of a client-supplied mcp-session-id - a logger this project
+    does not own and cannot edit line by line. The message is rendered once
+    (record.getMessage()); when redaction or escaping changed it, record.msg
+    becomes the final text and record.args becomes (), so no later
+    formatter re-applies %-formatting to it. Records that need neither are
+    left exactly as they were. Tracebacks (exc_text) are redacted but keep
+    their newlines: they are multi-line by construction.
 
     Attach to HANDLERS (server.py's root stderr handler), not to the root
     logger - logger-level filters are never consulted for records that
@@ -233,26 +266,29 @@ class UserinfoRedactingFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        self._redact_message(record)
+        self._rewrite_message(record)
         self._redact_traceback(record)
         return True
 
     @staticmethod
-    def _redact_message(record: logging.LogRecord) -> None:
+    def _rewrite_message(record: logging.LogRecord) -> None:
         try:
             message = record.getMessage()
         except Exception:
             # Mismatched %-format arity or type. The Formatter will fail the
             # same way inside emit(), and handleError then prints
             # "Message: %r / Arguments: %s" - so redact the format string and
-            # each argument separately and let that notice be credential-free.
+            # each argument separately and let that notice be credential-free
+            # (%r / the tuple repr already escape control characters).
             record.msg = _safe_redacted_text(record.msg)
             record.args = _redact_log_args(record.args)
             return
-        redacted = redact_userinfo_in_text(message)
-        if redacted != message:
-            record.msg = redacted
-            record.args = None
+        # Redact first, then escape: the userinfo pattern must see the text
+        # as written, and the escape must see the final text.
+        rewritten = escape_log_control_characters(redact_userinfo_in_text(message))
+        if rewritten != message:
+            record.msg = rewritten
+            record.args = ()
 
     @staticmethod
     def _redact_traceback(record: logging.LogRecord) -> None:

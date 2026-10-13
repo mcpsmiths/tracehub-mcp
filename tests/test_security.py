@@ -7,15 +7,19 @@ import sys
 
 import pytest
 from pydantic import HttpUrl, ValidationError
+from starlette.testclient import TestClient
 
+from opentelemetry_mcp import server
 from opentelemetry_mcp.config import BackendConfig
 from opentelemetry_mcp.security import (
     UserinfoRedactingFilter,
+    escape_log_control_characters,
     is_cloud_metadata_host,
     is_loopback_host,
     redact_url_userinfo,
     redact_userinfo_in_text,
 )
+from tests.streamable_http_client import ACCEPT_HEADERS, MCP_PATH
 
 # Dummy marker standing in for a credential; nothing real.
 VFY_MARKER = "VFY-PW-5a9d"
@@ -276,7 +280,7 @@ class TestUserinfoRedactingFilter:
         assert UserinfoRedactingFilter().filter(record) is True
 
         assert record.getMessage() == "HTTP Request: GET https://[REDACTED]@h.test/x"
-        assert record.args is None
+        assert record.args == ()
         assert logging.Formatter("%(message)s").format(record) == (
             "HTTP Request: GET https://[REDACTED]@h.test/x"
         )
@@ -368,3 +372,115 @@ class TestUserinfoRedactingFilter:
         assert logging.Formatter("%(message)s").format(record) == (
             "Server error: x\n<traceback unavailable>"
         )
+
+
+class TestEscapeLogControlCharacters:
+    def test_escapes_c0_del_c1_and_unicode_line_separators_repr_style(self) -> None:
+        assert escape_log_control_characters(
+            "a\x00b\x01c\td\ne\rf\x1bg\x7fh\x80i\x9fj\u2028k\u2029"
+        ) == ("a\\x00b\\x01c\\td\\ne\\rf\\x1bg\\x7fh\\x80i\\x9fj\\u2028k\\u2029")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "plain ascii 100% done",
+            "Host: 'evil.example:8000'",
+            "caf\u00e9 \u00ff \u2603 \U0001f600",
+        ],
+    )
+    def test_printable_text_is_unchanged(self, text: str) -> None:
+        assert escape_log_control_characters(text) == text
+
+
+class TestUserinfoRedactingFilterControlCharacters:
+    """probe-4 P8b/P8c: the mcp SDK's streamable_http_manager logged
+    'Rejected request with unknown or expired session ID: evil\\x01sess' with
+    the raw \\x01, a raw TAB and raw \\x80 bytes from a client-supplied
+    mcp-session-id - the only raw control bytes found in any server log.
+    600ffb5 repr()-quotes the project's own Host/Origin lines; this filter
+    sits on the root handler every propagated record passes through, so
+    the escape happens generically after redaction."""
+
+    def _record(self, msg: str, *args: object) -> logging.LogRecord:
+        return logging.LogRecord(
+            name="mcp.server.streamable_http_manager",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg=msg,
+            args=args or None,
+            exc_info=None,
+        )
+
+    def test_control_characters_in_a_formatted_message_are_escaped_into_one_line(self) -> None:
+        record = self._record(
+            "Rejected request with %s session ID: %s", "unknown", "evil\x01\t\x80\u2028sess"
+        )
+
+        assert UserinfoRedactingFilter().filter(record) is True
+
+        rendered = logging.Formatter("%(message)s").format(record)
+        assert rendered == "Rejected request with unknown session ID: evil\\x01\\t\\x80\\u2028sess"
+        assert "\n" not in rendered and rendered.isprintable()
+        assert record.msg == rendered and record.args == ()
+
+    def test_newline_in_a_logged_value_cannot_forge_a_second_log_line(self) -> None:
+        forged = "x\n2026-10-13 00:00:00,000 - opentelemetry_mcp.server - CRITICAL - injected"
+        record = self._record("Rejected request with unknown or expired session ID: %s", forged)
+
+        UserinfoRedactingFilter().filter(record)
+
+        assert len(logging.Formatter("%(message)s").format(record).splitlines()) == 1
+        assert "\\n2026-10-13" in record.getMessage()
+
+    def test_userinfo_is_still_redacted_before_escaping(self) -> None:
+        record = self._record("%s %s", f"https://u:{VFY_MARKER}@h.test/x", "\x1b[31mred")
+
+        UserinfoRedactingFilter().filter(record)
+
+        assert record.getMessage() == "https://[REDACTED]@h.test/x \\x1b[31mred"
+        assert VFY_MARKER not in repr(record.__dict__)
+
+    def test_a_message_without_control_characters_or_userinfo_is_left_as_is(self) -> None:
+        record = self._record("Rejected request with unknown or expired session ID: %s", "abc123")
+
+        UserinfoRedactingFilter().filter(record)
+
+        assert record.msg == "Rejected request with unknown or expired session ID: %s"
+        assert record.args == ("abc123",)
+
+    def test_sdk_session_rejection_line_reaches_the_handler_escaped(self) -> None:
+        """End to end: the real mcp SDK session manager, a POST carrying a
+        peer-chosen mcp-session-id with a raw \\x01 and TAB, and the filter on
+        a handler attached to the SDK's logger (the shape server.py gives
+        the root handler) - the emitted line is single and printable."""
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(name)s - %(levelname)s - %(message)s"))
+        handler.addFilter(UserinfoRedactingFilter())
+        sdk_logger = logging.getLogger("mcp.server.streamable_http_manager")
+        previous_level = sdk_logger.level
+        sdk_logger.addHandler(handler)
+        sdk_logger.setLevel(logging.INFO)
+        previous_auth = server.mcp.auth
+        server.mcp.auth = None
+        try:
+            app = server.mcp.http_app(transport="streamable-http")
+            with TestClient(app) as client:
+                response = client.post(
+                    MCP_PATH,
+                    json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                    headers={**ACCEPT_HEADERS, "mcp-session-id": "evil\x01\tsess"},
+                )
+        finally:
+            server.mcp.auth = previous_auth
+            sdk_logger.removeHandler(handler)
+            sdk_logger.setLevel(previous_level)
+
+        assert response.status_code == 404
+        lines = stream.getvalue().splitlines()
+        rejected = [line for line in lines if "Rejected request" in line]
+        assert len(rejected) == 1, lines
+        assert rejected[0].endswith("session ID: evil\\x01\\tsess"), rejected[0]
+        assert rejected[0].isprintable()
