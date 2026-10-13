@@ -186,19 +186,42 @@ class TestRedactUserinfoInText:
                 "input_value='http://p4user:p4SuperJUD...7.0.0.1:18164/?x=1#frag'",
                 "input_value='http://[REDACTED]...7.0.0.1:18164/?x=1#frag'",
             ),
-            # A truncated authority without any credential is redacted too:
-            # the elided middle cannot be proven credential-free.
+            # A truncated host:port with no credential is redacted too - the
+            # ":" is what marks a visible head as possibly "user:pass", and
+            # the elided middle cannot be proven credential-free. Accepted
+            # false positive (round-2 review of this pattern, IF7): the
+            # pattern also serves as the credential oracle in
+            # server._handle_tool_error, so it must not fire on a plain host.
             (
-                "input_value='https://metadata.google....adata/v1/instance/'",
-                "input_value='https://[REDACTED]...adata/v1/instance/'",
+                "echo of 'https://host:8443...' failed",
+                "echo of 'https://[REDACTED]...' failed",
             ),
         ],
-        ids=["judge-https", "judge-http-path", "probe4-query-fragment", "host-only"],
+        ids=["judge-https", "judge-http-path", "probe4-query-fragment", "host-port"],
     )
     def test_truncated_authority_without_a_visible_at_is_redacted(
         self, truncated: str, expected: str
     ) -> None:
         assert redact_userinfo_in_text(truncated) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # The round-2 review's case: a backend error that merely mentions a
+            # host followed by an ellipsis is prose, not a truncated credential.
+            "connect to https://tempo.internal... failed",
+            "Connecting to https://example.com... done",
+            # A truncated host-only echo: no ":" in the visible head.
+            "input_value='https://metadata.google....adata/v1/instance/'",
+        ],
+    )
+    def test_truncated_host_without_a_colon_is_left_alone(self, text: str) -> None:
+        """redact_userinfo_in_text is also the oracle in server._handle_tool_error:
+        a changed text means "this chain carries a credential", the traceback is
+        dropped and the model sees a redacted ToolError. A plain host followed
+        by "..." must therefore not change; only a run carrying ":" (user:pass
+        or host:port) is treated as a possibly-truncated credential."""
+        assert redact_userinfo_in_text(text) == text
 
     def test_truncated_echo_with_a_visible_at_keeps_the_userinfo_redaction(self) -> None:
         """Where the ellipsis falls inside the password the "@" stays visible

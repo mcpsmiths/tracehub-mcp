@@ -370,6 +370,39 @@ class TestHandleToolError:
         assert marker not in caplog.text  # message AND any formatted traceback
         assert "list_services" in caplog.text
 
+    def test_host_before_an_ellipsis_is_not_mistaken_for_a_credential(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """redact_userinfo_in_text is the oracle here: a changed text means
+        "credential". Its truncated-authority pattern (TC1) used to fire on
+        any authority before "...", so a backend error that merely mentioned
+        a host - "connect to https://tempo.internal... failed" - lost its
+        traceback and reached the model as "[REDACTED]...". It now needs a
+        ":" in the run (user:pass, or host:port as the accepted false
+        positive), so this error keeps the identity re-raise."""
+        error = ConnectionError("connect to https://tempo.internal... failed")
+
+        with caplog.at_level("ERROR"), pytest.raises(ConnectionError) as exc_info:
+            server._handle_tool_error("list_services", error)
+
+        assert exc_info.value is error
+        (record,) = caplog.records
+        assert record.exc_info is not None
+        assert "https://tempo.internal... failed" in record.getMessage()
+
+    def test_truncated_credential_echo_still_becomes_a_redacted_tool_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        marker = "VFY-PW-trunc"
+        error = RuntimeError(f"rejected input_value='https://judgeuser:{marker}...ample.com/tempo'")
+
+        with caplog.at_level("ERROR"), pytest.raises(ToolError) as exc_info:
+            server._handle_tool_error("list_services", error)
+
+        assert marker not in str(exc_info.value)
+        assert "https://[REDACTED]...ample.com/tempo" in str(exc_info.value)
+        assert marker not in caplog.text
+
     def test_credential_bearing_cause_also_becomes_a_redacted_tool_error(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:

@@ -138,17 +138,30 @@ _REDACTED_USERINFO = "[REDACTED]@"
 # so "https://judgeuser:JUDGED...ernal.example.com/tempo" carried the head of
 # the password past the redaction (runtime verification of PR #41, judge
 # blocker 1). A truncated authority is therefore judged by what IS visible:
-# after "://", the shortest run with no "/", "?", "#", whitespace or "@" that
-# ends in "..." is replaced wholesale - the elided middle cannot be proven
-# credential-free, so a truncated host-only URL is redacted as well. "@" is
-# excluded so a userinfo the pattern above already rewrote
-# ("[REDACTED]@very.l...ample.com") is left alone, and "/" ends the run so an
-# ellipsis anywhere after the authority ("https://h.test/docs/...") never
-# matches. The whole dot run is consumed because a visible head may itself
-# end in a dot ("https://metadata.google....adata/v1/instance/"). The visible
-# tail after the ellipsis is kept: when the "@" is elided the last 23
-# characters are host and path text, so the message stays actionable.
-_TRUNCATED_AUTHORITY_RE = re.compile(r"(?<=://)[^/?#\s@]+?\.{3,}")
+# after "://", a run with no "/", "?", "#", whitespace or "@" that contains a
+# ":" and ends in "..." is replaced wholesale - the ":" is what marks the
+# visible head as a possible "user:pass", and the elided middle cannot then be
+# proven credential-free. The ":" is required because this function is also
+# the credential ORACLE in server._handle_tool_error (a changed text means
+# "this exception chain carries a credential": the traceback is dropped and
+# the model sees a redacted ToolError), so a backend error that merely
+# mentions a host before an ellipsis - "connect to https://tempo.internal...
+# failed", honeycomb.py's payload excerpt cut inside a hostname - must be left
+# alone (round-2 review of this pattern). Two consequences, both accepted: a
+# truncated "host:port..." is redacted too (false positive, harmless), and a
+# visible head that is a 16+-character USERNAME with the ":" elided is not
+# caught here (the host part never is either) - config._reject_url_userinfo
+# refusing credentialed URLs before pydantic ever sees them is the primary
+# control, this pattern the defence in depth. "@" is excluded so a userinfo
+# the pattern above already rewrote ("[REDACTED]@very.l...ample.com") is left
+# alone, and "/" ends the run so an ellipsis anywhere after the authority
+# ("https://h.test/docs/...") never matches. The whole dot run is consumed
+# because a visible head may itself end in a dot. The visible tail after the
+# ellipsis is kept: when the "@" is elided the last 23 characters are host and
+# path text, so the message stays actionable. Linear: the greedy run before
+# the ":" excludes ":" itself, so backtracking it cannot produce a second
+# match position.
+_TRUNCATED_AUTHORITY_RE = re.compile(r"(?<=://)[^/?#\s@:]*:[^/?#\s@]*?\.{3,}")
 _REDACTED_TRUNCATED_AUTHORITY = "[REDACTED]..."
 
 
@@ -177,9 +190,13 @@ def redact_userinfo_in_text(text: None) -> None: ...
 def redact_userinfo_in_text(text: str | None) -> str | None:
     """Replace the userinfo of every URL embedded in `text` with
     "[REDACTED]@", keeping scheme, host and path, and the visible head of a
-    truncated authority ("https://judgeuser:JUDGED...") with "[REDACTED]...".
-    For exception messages (httpx error text, pydantic's input_value echo)
-    and log lines."""
+    truncated authority that carries a ":" ("https://judgeuser:JUDGED...")
+    with "[REDACTED]...". For exception messages (httpx error text,
+    pydantic's input_value echo) and log lines. Consumers compare the result
+    with the input to decide whether a text carried a credential at all
+    (server._handle_tool_error, UserinfoRedactingFilter), so a URL that only
+    names a host - "https://tempo.internal..." included - comes back
+    unchanged."""
     if text is None:
         return None
     redacted = _URL_USERINFO_RE.sub(_REDACTED_USERINFO, text)
