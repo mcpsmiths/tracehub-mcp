@@ -203,6 +203,42 @@ async def test_cancelling_a_follower_does_not_fail_the_leader_end_to_end() -> No
     assert mock_get.call_count == 1
 
 
+async def test_cancelling_the_leader_does_not_fail_other_sessions_followers_end_to_end() -> None:
+    """Through a real cache-wrapped backend method: the first session's
+    list_services() is cancelled by its client while two other sessions'
+    identical calls are coalesced onto it. The backend request must
+    complete once and answer both followers (the runtime probe saw them
+    fail with "Connection closed" although the backend was healthy)."""
+    backend, mock_get = _mocked_backend({"data": ["svc-a"]})
+    backend.configure_query_cache(60.0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def gated_get(*args: Any, **kwargs: Any) -> AsyncMock:
+        started.set()
+        await release.wait()
+        return _fake_response({"data": ["svc-a"]})
+
+    mock_get.side_effect = gated_get
+
+    leader = asyncio.create_task(backend.list_services())
+    await started.wait()
+    followers = [asyncio.create_task(backend.list_services()) for _ in range(2)]
+    await asyncio.sleep(0)  # the followers join the leader's in-flight future
+
+    leader.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+
+    release.set()
+    results = await asyncio.wait_for(asyncio.gather(*followers), timeout=1.0)
+    assert results == [["svc-a"], ["svc-a"]]
+    assert mock_get.call_count == 1
+    # And the shared result is cached for the next caller.
+    assert await backend.list_services() == ["svc-a"]
+    assert mock_get.call_count == 1
+
+
 async def test_oversized_key_bypasses_cache() -> None:
     """A cache key is rendered from the validated arguments (model_dump_json),
     so its size tracks the request. For Jaeger a non-service.name filter is
