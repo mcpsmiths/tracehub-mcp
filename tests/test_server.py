@@ -2623,3 +2623,170 @@ class TestConfigErrorsReportLocationAndMessageOnly:
         assert "[FAIL] Configuration" in result.output
         assert "max_traces_per_query" in result.output
         assert "input_value" not in result.output
+
+
+def _invoke_http_listener(args: list[str]) -> tuple[Any, Any]:
+    """main() with --transport http and uvicorn.Server mocked; returns the
+    CliRunner result and the (never really awaited) serve() mock."""
+    runner = CliRunner()
+    with patch("opentelemetry_mcp.server.uvicorn.Server") as mock_server_cls:
+        mock_server_cls.return_value.serve = AsyncMock()
+        result = runner.invoke(server.main, ["--transport", "http", *args])
+    return result, mock_server_cls.return_value.serve
+
+
+class TestNetworkOptionsAreValidatedAtStartup:
+    """Runtime verification (docker-cli 30, prober-1 F6/F8): the listener
+    accepted --allowed-hosts '*,example.test' (the listed name silently
+    ignored because '*' disables validation), --allowed-hosts 'bad host!',
+    --forwarded-allow-ips not-an-ip / 999.1.1.1 (uvicorn keeps an unparsable
+    entry as a literal that never matches), --rate-limit-max-requests -1 and
+    --rate-limit-window-seconds 0. Like the duration options, each is now a
+    usage error (exit 2) naming the flag and its env var, echoing at most a
+    bounded repr of the offending entry."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("BACKEND_TYPE", "jaeger")
+        monkeypatch.setenv("BACKEND_URL", "http://localhost:16686")
+        for name in (
+            "BACKEND_API_KEY",
+            "MCP_HTTP_BEARER_TOKEN",
+            "MCP_ALLOWED_HOSTS",
+            "FORWARDED_ALLOW_IPS",
+            "RATE_LIMIT_MAX_REQUESTS",
+            "RATE_LIMIT_WINDOW_SECONDS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+    # --allowed-hosts / MCP_ALLOWED_HOSTS -----------------------------------
+
+    def test_wildcard_must_be_the_only_allowed_hosts_entry(self) -> None:
+        result, serve = _invoke_http_listener(["--allowed-hosts", "*,example.test"])
+
+        assert result.exit_code == 2, result.output
+        assert "--allowed-hosts" in result.output
+        assert "MCP_ALLOWED_HOSTS" in result.output
+        assert "only entry" in result.output
+        serve.assert_not_awaited()
+
+    @pytest.mark.parametrize("entry", ["bad host!", "*.example.test", "-leading.example", "a..b"])
+    def test_an_entry_that_is_neither_hostname_nor_ip_literal_is_refused(self, entry: str) -> None:
+        result, serve = _invoke_http_listener(["--allowed-hosts", f"tracehub.example,{entry}"])
+
+        assert result.exit_code == 2, result.output
+        assert "--allowed-hosts" in result.output
+        assert repr(entry) in result.output
+        serve.assert_not_awaited()
+
+    def test_allowed_hosts_env_var_is_validated_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MCP_ALLOWED_HOSTS", "bad host!")
+
+        result, serve = _invoke_http_listener([])
+
+        assert result.exit_code == 2, result.output
+        assert "MCP_ALLOWED_HOSTS" in result.output
+        serve.assert_not_awaited()
+
+    def test_offending_entry_is_echoed_as_a_bounded_repr(self) -> None:
+        oversized = "bad host!" + "a" * 500
+
+        result, _ = _invoke_http_listener(["--allowed-hosts", oversized])
+
+        assert result.exit_code == 2, result.output
+        assert "'bad host!" in result.output
+        assert "a" * 70 not in result.output
+
+    def test_valid_allowed_hosts_shapes_start_the_listener(self) -> None:
+        result, serve = _invoke_http_listener(
+            [
+                "--allowed-hosts",
+                "tracehub.example,TraceHub.Example:8443,10.0.0.5:8080,[2001:db8::1]:8443,verify.local.",
+            ]
+        )
+
+        assert result.exit_code == 0, result.output
+        serve.assert_awaited_once()
+
+    def test_lone_wildcard_still_opts_out(self) -> None:
+        result, serve = _invoke_http_listener(["--allowed-hosts", "*"])
+
+        assert result.exit_code == 0, result.output
+        serve.assert_awaited_once()
+
+    # --forwarded-allow-ips / FORWARDED_ALLOW_IPS ---------------------------
+
+    @pytest.mark.parametrize("entry", ["not-an-ip", "999.1.1.1", "10.0.0.1/8", "*,127.0.0.1"])
+    def test_forwarded_allow_ips_entries_must_be_ip_literals_or_cidrs(self, entry: str) -> None:
+        result, serve = _invoke_http_listener(["--forwarded-allow-ips", entry])
+
+        assert result.exit_code == 2, result.output
+        assert "--forwarded-allow-ips" in result.output
+        assert "FORWARDED_ALLOW_IPS" in result.output
+        serve.assert_not_awaited()
+
+    def test_forwarded_allow_ips_env_var_is_validated_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FORWARDED_ALLOW_IPS", "999.1.1.1")
+
+        result, serve = _invoke_http_listener([])
+
+        assert result.exit_code == 2, result.output
+        serve.assert_not_awaited()
+
+    @pytest.mark.parametrize("value", ["*", "127.0.0.1", "10.0.0.0/8,::1,fd00::/8"])
+    def test_valid_forwarded_allow_ips_start_the_listener(self, value: str) -> None:
+        result, serve = _invoke_http_listener(["--forwarded-allow-ips", value])
+
+        assert result.exit_code == 0, result.output
+        serve.assert_awaited_once()
+
+    # --rate-limit-max-requests / --rate-limit-window-seconds ---------------
+
+    def test_negative_rate_limit_max_requests_is_refused(self) -> None:
+        result, serve = _invoke_http_listener(["--rate-limit-max-requests", "-1"])
+
+        assert result.exit_code == 2, result.output
+        assert "--rate-limit-max-requests" in result.output
+        assert "RATE_LIMIT_MAX_REQUESTS" in result.output
+        serve.assert_not_awaited()
+
+    def test_rate_limit_max_requests_env_var_is_validated_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("RATE_LIMIT_MAX_REQUESTS", "-1")
+
+        result, serve = _invoke_http_listener([])
+
+        assert result.exit_code == 2, result.output
+        serve.assert_not_awaited()
+
+    @pytest.mark.parametrize("value", ["0", "-5", "inf", "nan"])
+    def test_non_positive_or_non_finite_rate_limit_window_is_refused(self, value: str) -> None:
+        result, serve = _invoke_http_listener(["--rate-limit-window-seconds", value])
+
+        assert result.exit_code == 2, result.output
+        assert "--rate-limit-window-seconds" in result.output
+        assert "RATE_LIMIT_WINDOW_SECONDS" in result.output
+        serve.assert_not_awaited()
+
+    def test_rate_limit_window_env_var_is_validated_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("RATE_LIMIT_WINDOW_SECONDS", "0")
+
+        result, serve = _invoke_http_listener([])
+
+        assert result.exit_code == 2, result.output
+        serve.assert_not_awaited()
+
+    def test_zero_max_requests_still_disables_the_limiter_and_positive_values_start(
+        self,
+    ) -> None:
+        result, serve = _invoke_http_listener(
+            ["--rate-limit-max-requests", "0", "--rate-limit-window-seconds", "0.5"]
+        )
+
+        assert result.exit_code == 0, result.output
+        serve.assert_awaited_once()

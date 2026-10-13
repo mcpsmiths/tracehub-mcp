@@ -1579,6 +1579,100 @@ def _is_unspecified_address(hostname: str) -> bool:
         return False
 
 
+# Upper bound on how much of a rejected option value a startup usage error
+# echoes back: enough to recognise a typo, never a whole pasted document.
+_MAX_OPTION_VALUE_REPR_CHARS = 64
+
+# One RFC 1123 hostname label: letters, digits and hyphens, no leading or
+# trailing hyphen, 1-63 characters.
+_HOSTNAME_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+
+
+def _bounded_repr(value: str) -> str:
+    text = repr(value)
+    if len(text) > _MAX_OPTION_VALUE_REPR_CHARS:
+        text = text[: _MAX_OPTION_VALUE_REPR_CHARS - 3] + "..."
+    return text
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_rfc1123_hostname(name: str) -> bool:
+    """Dot-separated RFC 1123 labels, at most 253 characters, one optional
+    trailing dot (the FQDN spelling)."""
+    if name.endswith("."):
+        name = name[:-1]
+    if not name or len(name) > 253:
+        return False
+    return all(_HOSTNAME_LABEL_RE.fullmatch(label) for label in name.split("."))
+
+
+def _validate_allowed_hosts_option(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> str | None:
+    """Option callback for --allowed-hosts / MCP_ALLOWED_HOSTS. Startup used
+    to accept '*,example.test' (the listed name silently ignored, because
+    '*' disables Host validation) and 'bad host!' (an entry no Host header
+    can ever equal, so a 421 for every request). Each entry must parse as
+    an IP literal or an RFC 1123 hostname after the port is stripped, and
+    '*' may only stand alone."""
+    if value is None:
+        return None
+    entries = _parse_csv_option(value) or []
+    if "*" in entries and len(entries) > 1:
+        raise click.BadParameter(
+            "'*' disables Host validation entirely and must be the only entry; list the "
+            "accepted hostnames instead, or pass '*' alone to opt out"
+        )
+    for entry in entries:
+        if entry == "*":
+            continue
+        hostname = _hostname_from_host_header(entry)
+        if not (_is_ip_literal(hostname) or _is_rfc1123_hostname(hostname)):
+            raise click.BadParameter(
+                f"{_bounded_repr(entry)} is not a hostname or IP literal; entries are "
+                "comma-separated names, IPv4 literals or [IPv6] literals, each with an "
+                "optional :port, or the single value '*'"
+            )
+    return value
+
+
+def _validate_forwarded_allow_ips_option(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> str | None:
+    """Option callback for --forwarded-allow-ips / FORWARDED_ALLOW_IPS.
+    uvicorn's ProxyHeadersMiddleware keeps an entry it cannot parse as an
+    IP network ('not-an-ip', '999.1.1.1', a CIDR with host bits set) as a
+    literal compared against the peer address, so the proxy the operator
+    meant to trust silently never was. Entries must parse with
+    ipaddress.ip_network (strict, as uvicorn parses them); '*' may only
+    stand alone."""
+    if value is None:
+        return None
+    entries = _parse_csv_option(value) or []
+    if "*" in entries and len(entries) > 1:
+        raise click.BadParameter(
+            "'*' trusts X-Forwarded-For from every peer and must be the only entry"
+        )
+    for entry in entries:
+        if entry == "*":
+            continue
+        try:
+            ipaddress.ip_network(entry)
+        except ValueError:
+            raise click.BadParameter(
+                f"{_bounded_repr(entry)} is not an IP address or CIDR network; entries are "
+                "comma-separated IPv4/IPv6 addresses or networks, or the single value '*'"
+            ) from None
+    return value
+
+
 class OriginValidationMiddleware(BaseHTTPMiddleware):
     """Validate the Host and Origin headers on requests to the streamable-http
     transport.
@@ -1825,7 +1919,8 @@ _DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS = 1800.0
 
 def _require_finite_seconds(ctx: click.Context, param: click.Parameter, value: float) -> float:
     """Option callback for the duration options (--session-idle-timeout-seconds,
-    --readiness-cache-seconds). click.FloatRange(min=0, ...) still admits
+    --readiness-cache-seconds, --rate-limit-window-seconds).
+    click.FloatRange(min=0, ...) still admits
     ``inf`` (``inf > 0`` holds) and ``nan``
     (every comparison against it is False), and the mcp SDK's
     StreamableHTTPSessionManager raises ValueError for both only at lifespan
@@ -2249,7 +2344,9 @@ def _backend_config_options(f: Any) -> Any:
     "--allowed-hosts",
     type=str,
     default=None,
+    callback=_validate_allowed_hosts_option,
     envvar="MCP_ALLOWED_HOSTS",
+    show_envvar=True,
     help="Comma-separated hostnames/IP literals accepted in the Host header "
     "besides loopback names and the bound address; any other Host answers 421 "
     "(DNS-rebinding defence). A loopback --host validates Host automatically; "
@@ -2261,7 +2358,9 @@ def _backend_config_options(f: Any) -> Any:
     "--forwarded-allow-ips",
     type=str,
     default=None,
+    callback=_validate_forwarded_allow_ips_option,
     envvar="FORWARDED_ALLOW_IPS",
+    show_envvar=True,
     help="Comma-separated proxy IPs/CIDRs (or '*') whose X-Forwarded-For may "
     "replace the TCP peer address as the rate-limit key. Unset (default): the "
     "header is never trusted, not even from 127.0.0.1 - uvicorn's own implicit "
@@ -2327,21 +2426,25 @@ def _backend_config_options(f: Any) -> Any:
 )
 @click.option(
     "--rate-limit-max-requests",
-    type=int,
+    type=click.IntRange(min=0),
     default=100,
     envvar="RATE_LIMIT_MAX_REQUESTS",
+    show_envvar=True,
     help="Max requests per client IP per --rate-limit-window-seconds on the "
     "HTTP transport (only for --transport http, default: 100, set to 0 "
     "to disable, overrides RATE_LIMIT_MAX_REQUESTS env var)",
 )
 @click.option(
     "--rate-limit-window-seconds",
-    type=float,
+    # min_open: see --session-idle-timeout-seconds for the types-click note.
+    type=click.FloatRange(min=0, min_open=True),  # type: ignore[call-arg]
+    callback=_require_finite_seconds,
     default=60.0,
     envvar="RATE_LIMIT_WINDOW_SECONDS",
+    show_envvar=True,
     help="Fixed window size in seconds for --rate-limit-max-requests (only "
-    "for --transport http, default: 60.0, overrides "
-    "RATE_LIMIT_WINDOW_SECONDS env var)",
+    "for --transport http, must be a finite number > 0, default: 60.0, "
+    "overrides RATE_LIMIT_WINDOW_SECONDS env var)",
 )
 @click.option(
     "--readiness-cache-seconds",
