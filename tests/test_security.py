@@ -516,3 +516,6 @@ def test_a_bracketed_literal_with_a_tail_is_not_loopback() -> None:
         assert is_loopback_host(host) is False, host
     assert is_loopback_host("[::1]") is True
     assert is_loopback_host("localhost.") is True
+    # Allowlisted names accept exactly one trailing dot; loopback names must not accept more.
+    assert is_loopback_host("localhost..") is False
+    assert is_loopback_host("127.0.0.1..") is False

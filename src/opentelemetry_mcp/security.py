@@ -68,7 +68,9 @@ def _normalize_host(host: str) -> str:
     host = host.strip()
     if host.startswith("[") and host.endswith("]"):
         return host[1:-1]
-    return host.rstrip(".")
+    # Exactly one trailing dot (the DNS root label), like the allowlist side; rstrip let
+    # 'localhost..' pass as loopback while 'verify.local..' answered 421 (delta verification).
+    return host[:-1] if host.endswith(".") else host
 
 
 def _canonical_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
