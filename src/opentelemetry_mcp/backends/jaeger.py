@@ -285,6 +285,13 @@ class JaegerBackend(BaseBackend):
         # missing, not when the key is present with a null value, so `or []`
         # is needed to avoid iterating over None.
         services_raw = data.get("data") or []
+        if not isinstance(services_raw, list):
+            # A string here was iterated character by character and /ready counted the
+            # characters as services (delta verification); the type name is the only echo.
+            raise ValueError(
+                f"Jaeger /api/services returned {type(services_raw).__name__} for 'data', "
+                "expected a list"
+            )
         return [str(s) for s in services_raw]
 
     async def get_service_operations(self, service_name: str) -> list[str]:

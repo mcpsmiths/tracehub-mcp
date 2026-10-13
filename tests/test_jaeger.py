@@ -102,6 +102,20 @@ class TestListServicesNullData:
 
         assert await backend.list_services() == []
 
+    async def test_non_list_data_is_an_error_not_a_character_count(self) -> None:
+        # Delta verification: {"data": "notalist"} made /ready report 8 services - the
+        # characters of the string - and answer 200.
+        backend = JaegerBackend(url="http://localhost:16686")
+        fake_response = AsyncMock()
+        fake_response.raise_for_status = lambda: None
+        fake_response.json = lambda: {"data": "notalist"}
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock(return_value=fake_response)
+
+        with pytest.raises(ValueError, match="expected a list"):
+            await backend.list_services()
+
     async def test_populated_data_still_resolves_unchanged(self) -> None:
         backend = JaegerBackend(url="http://localhost:16686")
         fake_response = AsyncMock()
