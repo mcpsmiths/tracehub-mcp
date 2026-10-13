@@ -1675,7 +1675,10 @@ def _hostname_from_host_header(value: str) -> str:
     whole: it is then no loopback spelling and equals no allowlist entry
     (the startup validator refuses the shape), so the request answers 421
     like every other refused Host."""
-    value = value.strip().lower()
+    # ASCII whitespace only: str.strip() also removes a latin-1 NBSP (0xA0) or NEL (0x85)
+    # h11 decodes from the header bytes, which let 'verify.local\xa0' match the allowlist
+    # and '[::1]\xa0' pass as loopback (delta verification).
+    value = value.strip(" \t\r\n").lower()
     if not value:
         return ""
     if value.startswith("["):
@@ -1765,6 +1768,14 @@ def _validate_allowed_hosts_option(
     for entry in entries:
         if entry == "*":
             continue
+        if entry.endswith(".."):
+            # One trailing dot is the FQDN spelling; two passed here (one strip each in
+            # _hostname_from_host_header and _is_allowlist_hostname) and then matched no
+            # real Host at runtime (delta verification).
+            raise click.BadParameter(
+                f"{_bounded_repr(entry)} ends in more than one trailing dot; a hostname may "
+                "carry one"
+            )
         hostname = _hostname_from_host_header(entry)
         if not (_is_ip_literal(hostname) or _is_allowlist_hostname(hostname)):
             raise click.BadParameter(
@@ -2143,6 +2154,29 @@ def _cut_rendered_target_query(message: str) -> str:
     return "".join(pieces)
 
 
+# Where a request target stops being a path: the query string, a fragment (h11 accepts "#"
+# in the target and uvicorn quotes it as %23), a matrix parameter, and the percent-encoded
+# spellings of "?" and "#" - every place a client can put a token besides a path segment.
+_ACCESS_LOG_TARGET_CUT_RE = re.compile(r"[?#;]|%3[fF]|%23")
+_MAX_LOGGED_TARGET_CHARS = 2048
+
+
+def _cut_access_log_target(target: str) -> str:
+    """uvicorn's request target with everything after the path removed and the path bounded.
+
+    Runtime verification of PR #41 (delta probe P5b) placed a token in a fragment, a
+    percent-encoded "?", a matrix parameter and a 12 KiB path: nine access lines carried it
+    verbatim because only "?" was cut and the length bound applied to pre-rendered records
+    only. A token placed in a PATH SEGMENT is indistinguishable from a path and stays - the
+    README says so; the access log is off by default for exactly this class of leak."""
+    match = _ACCESS_LOG_TARGET_CUT_RE.search(target)
+    if match:
+        target = target[: match.start()]
+    if len(target) > _MAX_LOGGED_TARGET_CHARS:
+        target = target[:_MAX_LOGGED_TARGET_CHARS] + "...[cut]"
+    return target
+
+
 class AccessLogQueryStringFilter(logging.Filter):
     """Strips the query string from uvicorn's access-log request line.
 
@@ -2183,9 +2217,9 @@ class AccessLogQueryStringFilter(logging.Filter):
         """True to keep the (possibly rewritten) record, False to drop it."""
         args = record.args
         if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
-            target = args[2]
-            if "?" in target:
-                record.args = (*args[:2], target.partition("?")[0], *args[3:])
+            cut = _cut_access_log_target(args[2])
+            if cut != args[2]:
+                record.args = (*args[:2], cut, *args[3:])
             return True
         message = record.getMessage()
         if len(message) > _MAX_ACCESS_LOG_LINE_CHARS:

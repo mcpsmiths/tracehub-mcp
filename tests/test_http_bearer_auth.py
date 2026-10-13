@@ -338,6 +338,41 @@ class TestAccessLogQueryStringFilter:
         assert '"POST /mcp HTTP/1.1"' in rendered
         assert QUERY_DUMMY not in rendered
 
+    @pytest.mark.parametrize(
+        ("target", "kept"),
+        [
+            # uvicorn quotes the path, so a fragment or an encoded '?' arrives as %23 / %3F.
+            ("/health%23access_token%3D{tok}", "/health"),
+            ("/mcp%3Faccess_token%3D{tok}", "/mcp"),
+            ("/mcp#access_token={tok}", "/mcp"),
+            ("/health;access_token={tok}", "/health"),
+            ("/mcp?x=1#access_token={tok}", "/mcp"),
+        ],
+    )
+    def test_cuts_fragments_matrix_parameters_and_encoded_separators_too(
+        self, target: str, kept: str
+    ) -> None:
+        # Delta verification probe P5b: nine access lines carried a token placed in a
+        # fragment, a percent-encoded '?', or a matrix parameter because only '?' was cut.
+        record = _uvicorn_access_record(target.format(tok=QUERY_DUMMY))
+        AccessLogQueryStringFilter().filter(record)
+
+        assert isinstance(record.args, tuple)
+        assert record.args[2] == kept
+        assert QUERY_DUMMY not in record.getMessage()
+
+    def test_bounds_the_logged_path(self) -> None:
+        # A 12 KiB path produced a 12 KiB access line; the 8 KiB drop applied only to
+        # pre-rendered records.
+        record = _uvicorn_access_record("/health/" + "p" * 12000)
+        AccessLogQueryStringFilter().filter(record)
+
+        assert isinstance(record.args, tuple)
+        path = record.args[2]
+        assert isinstance(path, str)
+        assert len(path) <= 2048 + len("...[cut]")
+        assert path.endswith("...[cut]")
+
     def test_leaves_a_target_without_a_query_string_alone(self) -> None:
         record = _uvicorn_access_record("/mcp", status=200)
         AccessLogQueryStringFilter().filter(record)
