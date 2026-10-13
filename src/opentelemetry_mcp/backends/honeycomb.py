@@ -695,7 +695,10 @@ class HoneycombBackend(BaseBackend):
             return HealthCheckResponse(status="healthy", backend="honeycomb", url=self.url)
         except Exception as e:
             return HealthCheckResponse(
-                status="unhealthy", backend="honeycomb", url=self.url, error=str(e)
+                status="unhealthy",
+                backend="honeycomb",
+                url=self.url,
+                error=str(e) or type(e).__name__,
             )
 
     # -- internal helpers ---------------------------------------------------

@@ -536,7 +536,10 @@ class NewRelicBackend(BaseBackend):
             return HealthCheckResponse(status="healthy", backend="newrelic", url=self.url)
         except Exception as e:
             return HealthCheckResponse(
-                status="unhealthy", backend="newrelic", url=self.url, error=str(e)
+                status="unhealthy",
+                backend="newrelic",
+                url=self.url,
+                error=str(e) or type(e).__name__,
             )
 
     # -- internal helpers ---------------------------------------------------

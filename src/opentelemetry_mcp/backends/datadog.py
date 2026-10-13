@@ -403,7 +403,7 @@ class DatadogBackend(BaseBackend):
                 status="unhealthy",
                 backend="datadog",
                 url=self.url,
-                error=str(e),
+                error=str(e) or type(e).__name__,
             )
 
     # -- internal helpers ---------------------------------------------------

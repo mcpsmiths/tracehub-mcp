@@ -611,7 +611,7 @@ class SentryBackend(BaseBackend):
                 status="unhealthy",
                 backend="sentry",
                 url=self.url,
-                error=str(e),
+                error=str(e) or type(e).__name__,
             )
 
     # -- internal helpers ---------------------------------------------------

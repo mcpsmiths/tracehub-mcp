@@ -443,7 +443,7 @@ class XRayBackend(BaseBackend):
             return HealthCheckResponse(status="healthy", backend="xray", url=self.url)
         except Exception as e:
             return HealthCheckResponse(
-                status="unhealthy", backend="xray", url=self.url, error=str(e)
+                status="unhealthy", backend="xray", url=self.url, error=str(e) or type(e).__name__
             )
 
     # -- internal helpers: sampling fallback -----------------------------

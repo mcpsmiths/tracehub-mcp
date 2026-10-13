@@ -483,7 +483,7 @@ class TraceloopBackend(BaseBackend):
                 backend="traceloop",
                 url=self.url,
                 project_id=self.project_id,
-                error=str(e),
+                error=str(e) or type(e).__name__,
             )
 
     def _filter_to_traceloop(self, filter_obj: Filter) -> dict[str, Any] | None:

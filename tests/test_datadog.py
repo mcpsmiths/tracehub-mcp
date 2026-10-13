@@ -1284,3 +1284,14 @@ class TestHealthCheck:
         assert result.status == "unhealthy"
         assert result.backend == "datadog"
         assert result.error == "boom"
+
+    async def test_unhealthy_names_the_exception_class_when_its_text_is_empty(self) -> None:
+        # httpx timeouts stringify to '' so /ready logged "health_check=unhealthy ''" and the
+        # 'backend timeout' class was never produced on this path (delta verification, TA).
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(side_effect=httpx.ReadTimeout(""))  # type: ignore[method-assign]
+
+        result = await backend.health_check()
+
+        assert result.status == "unhealthy"
+        assert result.error == "ReadTimeout"

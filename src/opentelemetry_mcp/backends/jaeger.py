@@ -337,7 +337,7 @@ class JaegerBackend(BaseBackend):
                 status="unhealthy",
                 backend="jaeger",
                 url=self.url,
-                error=str(e),
+                error=str(e) or type(e).__name__,
             )
 
     def _parse_jaeger_trace(self, trace_data: dict[str, Any]) -> TraceData | None:

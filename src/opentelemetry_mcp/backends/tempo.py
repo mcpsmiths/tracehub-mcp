@@ -550,7 +550,7 @@ class TempoBackend(BaseBackend):
                 status="unhealthy",
                 backend="tempo",
                 url=self.url,
-                error=str(e),
+                error=str(e) or type(e).__name__,
             )
 
     def _build_traceql_from_filters(
