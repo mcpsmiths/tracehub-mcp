@@ -7,8 +7,11 @@
 #   run_server.sh print-config [extra flags...]
 #
 # Backend + knobs come from the caller's environment (DUMMY values only) and are copied into an
-# `env -i` allowlist, so nothing else from the shell (real BACKEND_* exports, .env values) can
-# reach the server. Defaults: BACKEND_TYPE=jaeger BACKEND_URL=http://127.0.0.1:18710 LOG_LEVEL=info.
+# `env -i` allowlist, so nothing else from the shell (stray exports, .env values) can reach the
+# server: every set, non-empty BACKEND_* SECONDARY_BACKEND_* MCP_* RATE_LIMIT_* QUERY_CACHE_* FASTMCP_*
+# variable (by prefix, like src/ reads them) plus the fixed names listed below. OTEL_* and AWS_* are
+# NOT globbed on purpose: OTEL_EXPORTER_OTLP_HEADERS / AWS_ACCESS_KEY_ID-class names carry credentials.
+# Defaults: BACKEND_TYPE=jaeger BACKEND_URL=http://127.0.0.1:18710 LOG_LEVEL=info.
 # Load a dummy token with:  set -a; . "$E/token.env"; set +a
 # GOTCHA: a variable that is set but EMPTY is dropped here (like every launcher). For the
 # empty-token gate call `env -i PATH=... MCP_HTTP_BEARER_TOKEN= "$BIN" ...` directly.
@@ -28,22 +31,15 @@ pass=(
   "HOME=${HOME:-/tmp}"
   "TMPDIR=$TMPDIR"
   "LANG=${LANG:-en_US.UTF-8}"
-  "BACKEND_TYPE=$BACKEND_TYPE"
-  "BACKEND_URL=$BACKEND_URL"
   "LOG_LEVEL=$LOG_LEVEL"
 )
-for v in BACKEND_API_KEY BACKEND_APP_KEY BACKEND_SENTRY_ORG BACKEND_SENTRY_PROJECT BACKEND_TEMPO_INSTANCE_ID \
-         BACKEND_AWS_REGION BACKEND_NEWRELIC_ACCOUNT_ID BACKEND_HONEYCOMB_DATASET BACKEND_ENVIRONMENTS \
-         BACKEND_TIMEOUT BACKEND_MAX_RESPONSE_BYTES \
-         SECONDARY_BACKEND_TYPE SECONDARY_BACKEND_URL SECONDARY_BACKEND_API_KEY SECONDARY_BACKEND_SENTRY_ORG \
-         SECONDARY_BACKEND_HONEYCOMB_DATASET SECONDARY_BACKEND_MAX_RESPONSE_BYTES SECONDARY_BACKEND_TIMEOUT \
-         MCP_HTTP_BEARER_TOKEN MCP_ACCESS_LOG MCP_ALLOW_UNAUTHENTICATED_HTTP MCP_ALLOWED_HOSTS FORWARDED_ALLOW_IPS \
-         MCP_PORT SESSION_IDLE_TIMEOUT_SECONDS MCP_STATELESS_HTTP READINESS_CACHE_SECONDS \
-         RATE_LIMIT_MAX_REQUESTS RATE_LIMIT_WINDOW_SECONDS QUERY_CACHE_TTL_SECONDS QUERY_CACHE_MAX_ENTRIES \
-         MAX_TRACES_PER_QUERY SLOW_REQUEST_THRESHOLD_MS MCP_TRUST_CLIENT_TRACE_CONTEXT MCP_INCLUDE_ARGS_IN_SPANS \
-         SHUTDOWN_DRAIN_SECONDS BACKEND_CLOSE_TIMEOUT_SECONDS GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS \
-         OTEL_EXPORTER_OTLP_ENDPOINT OTEL_SERVICE_NAME FASTMCP_CHECK_FOR_UPDATES FASTMCP_SHOW_SERVER_BANNER \
-         AWS_ENDPOINT_URL AWS_ENDPOINT_URL_XRAY AWS_DEFAULT_REGION SSL_CERT_FILE; do
+# "${!PREFIX@}" expands to every shell variable whose name starts with PREFIX (bash >= 2.04, incl. macOS 3.2);
+# the BACKEND_TYPE/BACKEND_URL defaults above are picked up by the first glob.
+for v in "${!BACKEND_@}" "${!SECONDARY_BACKEND_@}" "${!MCP_@}" "${!RATE_LIMIT_@}" "${!QUERY_CACHE_@}" "${!FASTMCP_@}" \
+         READINESS_CACHE_SECONDS MAX_TRACES_PER_QUERY FORWARDED_ALLOW_IPS SLOW_REQUEST_THRESHOLD_MS \
+         SESSION_IDLE_TIMEOUT_SECONDS SHUTDOWN_DRAIN_SECONDS GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS \
+         OTEL_EXPORTER_OTLP_ENDPOINT OTEL_SERVICE_NAME AWS_ENDPOINT_URL AWS_ENDPOINT_URL_XRAY AWS_DEFAULT_REGION \
+         SSL_CERT_FILE; do
   if [[ -n "${!v-}" ]]; then pass+=("$v=${!v}"); fi
 done
 
