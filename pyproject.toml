@@ -48,7 +48,7 @@ dependencies = [
     # the lockfile) could otherwise select an older 2.x point release this
     # project has never actually run against.
     "mcp>=2.2.0,<3",
-    "fastmcp>=4.0.5,<4.1",
+    "fastmcp>=4.0.5,<4.2",
     # Pinned directly (not just transitive via mcp/fastmcp/httpx/starlette) to
     # close CVE-2026-63374 (TLS cert-validation bypass via IDNA2003 hostname
     # encoding) and CVE-2026-64847 (process-pool stderr-pipe DoS), both fixed
