@@ -57,7 +57,7 @@ dependencies = [
     # tracks direct + lockfile-pinned versions, not "whatever the resolver
     # happens to pick" for a transitive dep with no floor here).
     "anyio>=4.14.2",
-    "pydantic>=2.12,<2.14",
+    "pydantic>=2.12,<2.15",
     "httpx~=0.28.0",
     "python-dotenv~=1.2.2",
     "click>=8.3,<8.6",
