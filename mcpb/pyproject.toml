@@ -1,10 +1,10 @@
 [project]
 name = "tracehub-mcp-mcpb-launcher"
-version = "0.12.3"
+version = "0.13.0"
 description = "MCPB launcher that resolves and runs the published tracehub-mcp PyPI package via uv"
 requires-python = ">=3.11"
 dependencies = [
     # Exact pin: the bundle labelled X must run tracehub-mcp==X. Rewritten
     # by `cz bump` (.cz.toml version_files) on every release.
-    "tracehub-mcp==0.12.3",
+    "tracehub-mcp==0.13.0",
 ]
