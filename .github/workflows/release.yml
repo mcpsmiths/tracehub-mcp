@@ -19,10 +19,21 @@ jobs:
   bump-version:
     name: Bump Version & Create Release
     runs-on: ubuntu-latest
+    # RELEASE_PAT is an org-admin credential. It lives in the `release`
+    # environment, whose deployment-branch policy admits only main, so GitHub
+    # refuses this job before any step runs when the workflow is dispatched
+    # from any other ref - including from a branch carrying an edited copy of
+    # this file. The `if` is defence in depth for an accidental off-main
+    # dispatch of the unmodified file; the environment is the boundary.
+    if: github.ref == 'refs/heads/main'
+    environment: release
     permissions:
       contents: write  # Required for pushing commits, tags, and creating releases
     outputs:
       new_version: ${{ steps.cz.outputs.version }}
+      # The exact commit cz created; build-and-publish builds this and nothing
+      # else (main may already have moved on by the time that job starts).
+      bump_sha: ${{ steps.bump_sha.outputs.sha }}
       already_released: ${{ steps.check_release.outputs.exists }}
     steps:
       - name: Checkout code
@@ -36,37 +47,98 @@ jobs:
           # RELEASE_PAT belongs to a real org-admin account the ruleset
           # already trusts, scoped to just this repo with Contents: read/write.
           token: ${{ secrets.RELEASE_PAT }}
+          # The token is needed for the clone only; do not leave it in
+          # .git/config where every later step in this job could read it.
+          persist-credentials: false
 
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.13"
 
-      - name: Install Commitizen
-        run: pip install commitizen
+      - name: Install Commitizen (hash-pinned)
+        # Every byte of `cz` that runs in this job comes from the reviewed,
+        # ==-pinned and sha256-bound .github/requirements-release.txt (kept
+        # current by Dependabot's pip entry for /.github). --require-hashes
+        # makes pip refuse any artifact whose hash is not listed there and
+        # --no-deps forbids any resolution outside the file.
+        #
+        # --only-binary=:all: closes the one gap those two leave: when an
+        # entry's WHEEL hash does not match but its sdist hash still does,
+        # pip falls back to the sdist and runs an isolated build whose
+        # backend (commitizen's uv_build, unpinned) it fetches from PyPI at
+        # that moment - exit 0, with freshly resolved code executing in the
+        # job that holds RELEASE_PAT (observed with pip 25.3). Wheels only:
+        # the same file then fails with "THESE PACKAGES DO NOT MATCH THE
+        # HASHES" and nothing is built here. Every pin in the file ships a
+        # wheel (uv pip compile --generate-hashes records them all).
+        run: |
+          pip install --require-hashes --no-deps --only-binary=:all: -r .github/requirements-release.txt
+
+      - name: Configure git identity for the bump commit
+        # commitizen-action used to do this unconditionally from its inputs;
+        # the runner-side `cz bump` below commits with whatever git has.
+        run: |
+          git config user.name "sairam0424"
+          git config user.email "uggesairam0000@gmail.com"
 
       - name: Bump version
         id: cz
-        uses: commitizen-tools/commitizen-action@338bbd841b75aaee6bf5340e1fa12f6ab58ff9ff  # master (no tagged releases; pinned snapshot, re-pin periodically)
-        with:
-          # Same reason as the checkout step above: this action does the
-          # actual `git push` of the bump commit, which needs a token the
-          # main-protection ruleset's bypass covers.
-          github_token: ${{ secrets.RELEASE_PAT }}
-          increment: ${{ github.event.inputs.increment }}
-          # Deliberately NOT using changelog_increment_filename: that makes the
-          # action run `cz bump --changelog-to-stdout > body.md`, and everything
-          # else cz prints to stdout lands in the file too - the `git commit`
-          # summary ("[main <sha>] bump: ..." / "N files changed") was the last
-          # two lines of every GitHub Release body from v0.2.0 to v0.12.3, and
-          # the pre_bump_hooks banner ("Running hook ...") would join it now.
-          # The notes are rendered by the step below instead.
-          # The action's own entrypoint runs `git config --local user.name/email`
-          # unconditionally using these inputs (default: github-actions[bot]) --
-          # a standalone `git config` step earlier in this job has no effect,
-          # since this overwrites it right before the bump commit is made.
-          git_name: "sairam0424"
-          git_email: "uggesairam0000@gmail.com"
+        # Runner-side replacement for commitizen-tools/commitizen-action: that
+        # action is `FROM python:3.10-alpine` (mutable tag) and ran
+        # `pip install commitizen` at step start, i.e. two run-time-resolved
+        # code sources inside the job that holds RELEASE_PAT. The `cz` used
+        # here is the hash-pinned one installed above; the pre_bump_hook from
+        # .cz.toml runs on this runner under setup-python 3.13.
+        #
+        # `--no-raise 21,3`: exit 21 (NO_INCREMENT) means a run with no
+        # bump-worthy commits (e.g. docs-only) and exit 3 (NO_COMMITS_FOUND)
+        # means a run with no commits at all since the current tag (a
+        # re-dispatch at the tag tip). Treat both as success and leave
+        # steps.cz.outputs.version pointing at the CURRENT (unchanged)
+        # version - the action's `no_raise: 21` covered only the first, so a
+        # re-dispatch used to fail this step although the comments promised
+        # a no-op - and the already-released check below turns the rest of
+        # the workflow into a no-op.
+        env:
+          INCREMENT: ${{ github.event.inputs.increment }}
+        run: |
+          args=(bump --yes)
+          if [[ -n "$INCREMENT" ]]; then
+            args+=(--increment "$INCREMENT")
+          fi
+          cz --no-raise 21,3 "${args[@]}"
+          echo "version=$(cz version --project)" >> "$GITHUB_OUTPUT"
+
+      - name: Record bump commit
+        id: bump_sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Push bump commit and tag
+        # The checkout did not persist RELEASE_PAT, so authenticate this one
+        # push with a per-step extraheader: the PAT is never written to
+        # .git/config or into a remote URL. Pushes HEAD and exactly the tag cz
+        # just created (never --tags). When nothing was bumped, HEAD and the
+        # tag v<current> already exist upstream and this is a no-op.
+        #
+        # Two cases fail closed by design rather than being papered over:
+        # - a no-increment run whose current version has no tag locally or
+        #   upstream (deleted, or never tagged): `git push` exits with
+        #   "src refspec refs/tags/v<current> does not match any" instead of
+        #   quietly pushing nothing; restore the tag (or land a bump-worthy
+        #   commit) and re-run;
+        # - a merge landing on main between this job's checkout and the push:
+        #   HEAD:main is then non-fast-forward and is rejected; re-run the
+        #   dispatch. There is deliberately no fetch/rebase here - rebasing
+        #   the bump commit onto a moved main would publish a tree nobody
+        #   reviewed as the release.
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+          NEW_VERSION: ${{ steps.cz.outputs.version }}
+        run: |
+          auth="$(printf 'x-access-token:%s' "$RELEASE_PAT" | base64 -w0)"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push origin HEAD:main "refs/tags/v${NEW_VERSION}"
 
       - name: Print version info
         run: |
@@ -78,12 +150,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # commitizen-action's no_raise: 21 means a run with no bump-worthy
-          # commits (e.g. docs-only) exits 0 rather than failing, but leaves
-          # steps.cz.outputs.version pointing at the CURRENT (unchanged)
-          # version, not a new one. Without this check, the next two steps
-          # tried to recreate and republish an already-existing release and
-          # crashed with a 422 instead of just doing nothing.
+          # `cz --no-raise 21,3` above means a run with no bump-worthy
+          # commits (e.g. docs-only; NO_INCREMENT) or with no commits at all
+          # since the tag (a re-dispatch; NO_COMMITS_FOUND) exits 0 rather
+          # than failing, but leaves steps.cz.outputs.version pointing at the
+          # CURRENT (unchanged) version, not a new one. Without this check,
+          # the next two steps tried to recreate and republish an
+          # already-existing release and crashed with a 422 instead of just
+          # doing nothing.
           if gh release view "v${{ steps.cz.outputs.version }}" >/dev/null 2>&1; then
             echo "No new version to release (already released as v${{ steps.cz.outputs.version }})."
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -119,20 +193,30 @@ jobs:
   build-and-publish:
     name: Build and Publish to PyPI
     needs: bump-version
-    if: needs.bump-version.outputs.already_released == 'false'
+    # The PyPI trusted publisher for tracehub-mcp is bound to the `release`
+    # environment: an OIDC token minted outside it carries no environment
+    # claim and PyPI rejects it, and GitHub grants the environment only to
+    # runs from main. The ref check is defence in depth (see bump-version).
+    if: needs.bump-version.outputs.already_released == 'false' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       id-token: write  # Required for PyPI OIDC
     steps:
-      - name: Checkout code (with new version)
+      - name: Checkout the bump commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
-          ref: main  # Get the version-bumped code
+          # Not `ref: main`: main is whatever it is when this job starts, so a
+          # merge landing between the bump push and this checkout would ship
+          # under the new version number. Build the bump commit itself.
+          ref: ${{ needs.bump-version.outputs.bump_sha }}
+          fetch-depth: 0  # tags are needed for the cross-check below
+          persist-credentials: false  # this job never pushes
 
       - name: Setup UV
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
-          version: "latest"
+          version: "0.12.23"  # same uv as Dockerfile; tests/test_build_toolchain.py
           enable-cache: true
 
       - name: Setup Python
@@ -140,9 +224,33 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Build package
+      - name: Verify checkout matches the release
+        # All three identities of the release must agree before anything is
+        # built: the tree checked out, the commit refs/tags/v<version> names
+        # (re-fetched so a re-pointed tag is noticed) and the version string
+        # hatchling will stamp on the artifact.
+        env:
+          NEW_VERSION: ${{ needs.bump-version.outputs.new_version }}
+          BUMP_SHA: ${{ needs.bump-version.outputs.bump_sha }}
         run: |
-          uv build --wheel --sdist
+          test "$(git rev-parse HEAD)" = "$BUMP_SHA"
+          git fetch origin "+refs/tags/v${NEW_VERSION}:refs/tags/v${NEW_VERSION}"
+          test "$(git rev-parse "refs/tags/v${NEW_VERSION}^{commit}")" = "$BUMP_SHA"
+          python3 - "$NEW_VERSION" <<'PY'
+          import sys, tomllib
+          with open("pyproject.toml", "rb") as f:
+              declared = tomllib.load(f)["project"]["version"]
+          if declared != sys.argv[1]:
+              print(f"::error::pyproject.toml declares {declared}, release is {sys.argv[1]}")
+              sys.exit(1)
+          PY
+
+      - name: Build package
+        # The build backend and its build-time dependencies come only from the
+        # ==-pinned, sha256-bound .github/requirements-build.txt; any artifact
+        # whose hash is not listed there fails the build instead of shipping.
+        run: |
+          uv build --wheel --sdist --build-constraints .github/requirements-build.txt --require-hashes
           ls -lh dist/
 
       - name: Publish to PyPI

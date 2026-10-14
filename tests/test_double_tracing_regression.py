@@ -160,6 +160,28 @@ class TestDoubleTracingRegression:
         assert attrs.get("gen_ai.operation.name") == "execute_tool"
         assert "mcp.session.id" in attrs
 
+    async def test_off_mode_also_leaves_exactly_one_span(
+        self, real_global_tracer_provider: InMemorySpanExporter, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """configure_tracing() now selects "off" for callers the operator has
+        not marked trusted (the HTTP default) - it must suppress FastMCP's
+        native spans exactly as propagation_only does."""
+        import fastmcp
+
+        monkeypatch.setattr(fastmcp.settings, "telemetry_mode", "off")
+
+        mw = McpServerTracingMiddleware(tracer=trace.get_tracer("opentelemetry_mcp"))
+        server.mcp.add_middleware(mw)
+        sentinel = SearchTracesResult(count=0, traces=[])
+
+        with patch.object(server.search, "search_traces", AsyncMock(return_value=sentinel)):
+            async with Client(server.mcp) as client:
+                await client.call_tool("search_traces", {"limit": 5}, raise_on_error=False)
+
+        spans = _tools_call_server_spans(real_global_tracer_provider)
+        assert len(spans) == 1
+        assert dict(spans[0].attributes or {}).get("gen_ai.tool.name") == "search_traces"
+
     async def test_with_the_fix_error_path_still_produces_exactly_one_span(
         self, real_global_tracer_provider: InMemorySpanExporter, monkeypatch: pytest.MonkeyPatch
     ) -> None:

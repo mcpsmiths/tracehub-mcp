@@ -58,6 +58,7 @@
         "BACKEND_HONEYCOMB_DATASET": "${user_config.backend_honeycomb_dataset}",
         "BACKEND_ENVIRONMENTS": "${user_config.backend_environments}",
         "BACKEND_TIMEOUT": "${user_config.backend_timeout}",
+        "BACKEND_MAX_RESPONSE_BYTES": "${user_config.backend_max_response_bytes}",
         "LOG_LEVEL": "${user_config.log_level}",
         "MAX_TRACES_PER_QUERY": "${user_config.max_traces_per_query}"
       }
@@ -152,6 +153,15 @@
       "default": 30,
       "min": 1,
       "max": 300,
+      "required": false
+    },
+    "backend_max_response_bytes": {
+      "type": "number",
+      "title": "Backend Max Response Bytes",
+      "description": "Ceiling on the decoded size of any single backend response, in bytes (1 to 1073741824; default 64 MiB). An oversized body is refused before it is buffered or parsed; raise it if legitimate large trace queries are rejected.",
+      "default": 67108864,
+      "min": 1,
+      "max": 1073741824,
       "required": false
     },
     "log_level": {

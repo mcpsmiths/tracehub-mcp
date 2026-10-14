@@ -8,6 +8,7 @@ elements) - not a Python list handed directly to the parser.
 """
 
 import base64
+import logging
 import re
 from collections.abc import Callable
 from datetime import timedelta
@@ -18,7 +19,7 @@ import httpx
 import pytest
 
 from opentelemetry_mcp.attributes import SpanAttributes
-from opentelemetry_mcp.backends.tempo import TempoBackend
+from opentelemetry_mcp.backends.tempo import TempoBackend, _render_traceql_scalar
 from opentelemetry_mcp.models import Filter, FilterOperator, FilterType, SpanQuery, TraceQuery
 
 FAKE_API_KEY = "dd-api1"
@@ -724,3 +725,298 @@ def test_parse_otlp_span_start_time_is_utc_aware() -> None:
     assert span is not None
     assert span.start_time.tzinfo is not None
     assert span.start_time.utcoffset() == timedelta(0)
+
+
+# -- Regression tests: non-string Filter operands spliced raw into TraceQL ----
+# Audit: src/opentelemetry_mcp/backends/tempo.py:TempoBackend._filter_to_traceql:unescaped-non-string-value-splice
+
+# A str that merely *claims* value_type number/boolean. Before the fix the
+# non-STRING EQUALS/NOT_EQUALS/IN branches and every GT/LT/GTE/LTE branch
+# f-string-spliced it verbatim, so it added a top-level OR to the query.
+_TRACEQL_PAYLOAD = '1 || resource.service.name =~ ".*"'
+
+
+def _raw_filter(
+    field: str,
+    operator: FilterOperator,
+    value_type: FilterType,
+    *,
+    value: object = None,
+    values: list[object] | None = None,
+) -> Filter:
+    """Build a Filter with the model-level operand normalisation bypassed,
+    so these tests exercise the TraceQL renderer's own type gate (the last
+    decision point before the splice) rather than the pydantic layer."""
+    return Filter.model_construct(
+        field=field, operator=operator, value=value, values=values, value_type=value_type
+    )
+
+
+class TestFilterToTraceqlNonStringOperands:
+    def _backend(self) -> TempoBackend:
+        return TempoBackend(url="http://localhost:3200")
+
+    @pytest.mark.parametrize("operator", [FilterOperator.EQUALS, FilterOperator.NOT_EQUALS])
+    @pytest.mark.parametrize("value_type", [FilterType.NUMBER, FilterType.BOOLEAN])
+    def test_equality_with_str_operand_claiming_non_string_type_is_not_spliced(
+        self, operator: FilterOperator, value_type: FilterType
+    ) -> None:
+        f = _raw_filter("gen_ai.usage.total_tokens", operator, value_type, value=_TRACEQL_PAYLOAD)
+
+        condition = self._backend()._filter_to_traceql(f)
+
+        # None -> _build_traceql_from_filters reclassifies the filter as
+        # client-side, where FilterEngine fails closed on the unparsable
+        # operand; the payload must never reach the query unquoted.
+        assert condition is None
+
+    @pytest.mark.parametrize(
+        "operator",
+        [FilterOperator.GT, FilterOperator.LT, FilterOperator.GTE, FilterOperator.LTE],
+    )
+    @pytest.mark.parametrize("field", ["gen_ai.usage.total_tokens", "duration", "duration_ms"])
+    def test_range_operator_with_str_operand_returns_none(
+        self, operator: FilterOperator, field: str
+    ) -> None:
+        f = _raw_filter(field, operator, FilterType.NUMBER, value=_TRACEQL_PAYLOAD)
+        assert self._backend()._filter_to_traceql(f) is None
+
+    @pytest.mark.parametrize(
+        "operator",
+        [FilterOperator.GT, FilterOperator.LT, FilterOperator.GTE, FilterOperator.LTE],
+    )
+    def test_range_operator_with_string_value_type_returns_none(
+        self, operator: FilterOperator
+    ) -> None:
+        f = Filter(field="duration", operator=operator, value="5", value_type=FilterType.STRING)
+        assert self._backend()._filter_to_traceql(f) is None
+
+    def test_range_operator_with_genuine_int_on_duration_renders_ms_literal(self) -> None:
+        f = Filter(
+            field="duration", operator=FilterOperator.GT, value=1, value_type=FilterType.NUMBER
+        )
+        assert self._backend()._filter_to_traceql(f) == "duration > 1ms"
+
+    def test_range_operator_with_genuine_number_on_attribute_renders_literal(self) -> None:
+        f = Filter(
+            field="gen_ai.usage.total_tokens",
+            operator=FilterOperator.GTE,
+            value=5000,
+            value_type=FilterType.NUMBER,
+        )
+        assert self._backend()._filter_to_traceql(f) == "span.gen_ai.usage.total_tokens >= 5000"
+
+    def test_in_number_with_a_str_payload_item_returns_none(self) -> None:
+        f = _raw_filter(
+            "gen_ai.usage.total_tokens",
+            FilterOperator.IN,
+            FilterType.NUMBER,
+            values=[1, _TRACEQL_PAYLOAD],
+        )
+        assert self._backend()._filter_to_traceql(f) is None
+
+    def test_in_number_with_genuine_numbers_renders_or_of_literals(self) -> None:
+        f = Filter(
+            field="x", operator=FilterOperator.IN, values=[1, 2], value_type=FilterType.NUMBER
+        )
+        assert self._backend()._filter_to_traceql(f) == "(span.x = 1 || span.x = 2)"
+
+    @pytest.mark.parametrize(
+        ("value", "value_type", "expected"),
+        [
+            (1, FilterType.NUMBER, "span.x = 1"),
+            (1.5, FilterType.NUMBER, "span.x = 1.5"),
+            (True, FilterType.BOOLEAN, "span.x = true"),
+            (False, FilterType.BOOLEAN, "span.x = false"),
+        ],
+    )
+    def test_equals_with_genuine_scalar_renders_literal(
+        self, value: object, value_type: FilterType, expected: str
+    ) -> None:
+        f = _raw_filter("x", FilterOperator.EQUALS, value_type, value=value)
+        assert self._backend()._filter_to_traceql(f) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [float("inf"), float("nan"), 10**400, True, "1"],
+        ids=["inf", "nan", "10**400", "bool", "numeric-string"],
+    )
+    def test_equals_number_with_non_renderable_operand_returns_none(self, value: object) -> None:
+        f = _raw_filter("x", FilterOperator.EQUALS, FilterType.NUMBER, value=value)
+        assert self._backend()._filter_to_traceql(f) is None
+
+    @pytest.mark.parametrize("value", [1, "true", "x"])
+    def test_equals_boolean_with_non_bool_operand_returns_none(self, value: object) -> None:
+        f = _raw_filter("x", FilterOperator.EQUALS, FilterType.BOOLEAN, value=value)
+        assert self._backend()._filter_to_traceql(f) is None
+
+    def test_render_traceql_scalar_returns_none_for_int_beyond_float_range(self) -> None:
+        """math.isfinite() raises OverflowError for an int >= 2**1024 rather
+        than answering; the helper's contract is "anything else returns None",
+        so the filter is reclassified as client-side instead of the
+        OverflowError escaping search_traces as a tool error."""
+        assert _render_traceql_scalar(10**400, FilterType.NUMBER) is None
+        # Boundary control: the largest power of two float() still holds.
+        assert _render_traceql_scalar(2**1023, FilterType.NUMBER) == repr(2**1023)
+
+
+async def test_tools_call_with_payload_filter_never_reaches_tempo_unquoted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end through the real FastMCP tools/call dispatcher: a filter
+    whose str value claims value_type number must not produce a GET
+    /api/search whose q parameter carries the payload's injected structure
+    (beside test_filter_to_traceql_escapes_quotes_in_string_value, which
+    covers the STRING branch). With the model-level normaliser the call is
+    rejected as a validation error before any request; the renderer gate
+    covers the model_construct bypass separately above."""
+    from unittest.mock import AsyncMock
+
+    from fastmcp import Client
+    from mcp.shared.exceptions import MCPError
+
+    import opentelemetry_mcp.server as server_module
+
+    async def call_is_rejected(client: Client[Any], name: str, arguments: dict[str, Any]) -> bool:
+        # The MCP SDK maps a pydantic ValidationError raised inside a tool to
+        # a JSON-RPC INVALID_PARAMS error (surfaced by the client as MCPError
+        # even with raise_on_error=False); any other failure is a
+        # CallToolResult(isError=True). Both mean the call never ran.
+        try:
+            result = await client.call_tool(name, arguments, raise_on_error=False)
+        except MCPError:
+            return True
+        return bool(result.is_error)
+
+    backend = TempoBackend(url="http://localhost:3200")
+    captured_queries: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/search":
+            captured_queries.append(request.url.params.get("q", ""))
+            return httpx.Response(200, json={"traces": []})
+        return httpx.Response(200, json=_minimal_otlp_trace("deadbeef", status_code=1))
+
+    backend._client = httpx.AsyncClient(
+        base_url=backend.url, transport=httpx.MockTransport(handler)
+    )
+    monkeypatch.setattr(server_module, "_get_backend", AsyncMock(return_value=backend))
+
+    equality_filter = {
+        "field": "gen_ai.usage.total_tokens",
+        "operator": "equals",
+        "value": _TRACEQL_PAYLOAD,
+        "value_type": "number",
+    }
+    range_filter = {
+        "field": "duration",
+        "operator": "gte",
+        "value": _TRACEQL_PAYLOAD,
+        "value_type": "number",
+    }
+
+    async with Client(server_module.mcp) as client:
+        traces_rejected = await call_is_rejected(
+            client, "search_traces", {"filters": [equality_filter]}
+        )
+        spans_rejected = await call_is_rejected(
+            client, "search_spans_tool", {"filters": [range_filter]}
+        )
+
+    assert traces_rejected
+    assert spans_rejected
+    assert all("resource.service.name =~" not in q for q in captured_queries)
+
+
+# -- Regression tests: dot-segment trace ids collapse the request path --------
+# Audit: src/opentelemetry_mcp/backends/sentry.py:SentryBackend.get_trace:dot-segment-trace-id
+
+
+def _wire_tempo_backend(
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> tuple[TempoBackend, list[str]]:
+    """TempoBackend terminating in a MockTransport that records every
+    emitted request's raw path (the string handed to a mocked client.get
+    cannot show httpx collapsing "." / ".." during the base_url merge)."""
+    backend = TempoBackend(url="http://localhost:3200")
+    raw_paths: list[str] = []
+
+    async def recording_handler(request: httpx.Request) -> httpx.Response:
+        raw_paths.append(request.url.raw_path.decode())
+        return handler(request)
+
+    backend._client = httpx.AsyncClient(
+        base_url=backend.url, transport=httpx.MockTransport(recording_handler)
+    )
+    return backend, raw_paths
+
+
+class TestTempoPathSegmentSafety:
+    @pytest.mark.parametrize("trace_id", ["..", ".", ""])
+    async def test_get_trace_with_dot_segment_id_raises_and_emits_no_request(
+        self, trace_id: str
+    ) -> None:
+        backend, raw_paths = _wire_tempo_backend(
+            lambda request: httpx.Response(200, json=_minimal_otlp_trace("abc", status_code=1))
+        )
+
+        with pytest.raises(ValueError, match="Invalid trace_id"):
+            await backend.get_trace(trace_id)
+
+        assert raw_paths == []
+
+    @pytest.mark.parametrize("search", ["search_traces", "search_spans"])
+    async def test_hydration_skips_dot_segment_ids_without_leaving_api_traces(
+        self, search: str
+    ) -> None:
+        """Both hydration loops read trace ids from Tempo's own /api/search
+        rows; a ".." or "." row must never produce a GET outside
+        /api/traces/, and the remaining row still hydrates."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/search":
+                return httpx.Response(
+                    200, json={"traces": [{"traceID": ".."}, {"traceID": "."}, {"traceID": "abc"}]}
+                )
+            return httpx.Response(200, json=_minimal_otlp_trace("abc", status_code=1))
+
+        backend, raw_paths = _wire_tempo_backend(handler)
+
+        if search == "search_traces":
+            results: list[Any] = await backend.search_traces(TraceQuery(limit=10))
+        else:
+            results = await backend.search_spans(SpanQuery(limit=10))
+
+        assert len(results) >= 1
+        fetches = [p for p in raw_paths if not p.startswith("/api/search")]
+        assert fetches == ["/api/traces/abc"]
+
+    @pytest.mark.parametrize("search", ["search_traces", "search_spans"])
+    async def test_rows_with_only_unusable_ids_are_not_reported_as_an_outage(
+        self, search: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A row whose traceID cannot be one URL path segment is skipped
+        before it counts as an attempted fetch. When every row is like that,
+        no GET /api/traces/{id} was ever tried, so the all-fetches-failed
+        RuntimeError (pinned for real fetch failures by
+        test_search_*_raises_when_all_trace_fetches_fail) must not fire: the
+        result is simply empty, and each skipped row is logged."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/search":
+                return httpx.Response(200, json={"traces": [{"traceID": ".."}, {"traceID": "."}]})
+            return httpx.Response(200, json=_minimal_otlp_trace("abc", status_code=1))
+
+        backend, raw_paths = _wire_tempo_backend(handler)
+
+        with caplog.at_level(logging.WARNING, logger="opentelemetry_mcp.backends.tempo"):
+            if search == "search_traces":
+                results: list[Any] = await backend.search_traces(TraceQuery(limit=10))
+            else:
+                results = await backend.search_spans(SpanQuery(limit=10))
+
+        assert results == []
+        assert [p for p in raw_paths if not p.startswith("/api/search")] == []
+        messages = [r.getMessage() for r in caplog.records]
+        assert sum("Skipping" in m for m in messages) == 2
+        assert not any("outage" in m for m in messages)

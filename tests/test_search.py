@@ -194,6 +194,66 @@ class TestSearchTracesInputValidation:
         backend.search_traces.assert_not_called()
 
 
+class TestSearchTracesCardinalityCaps:
+    """One search_traces call can only ever produce a backend query with a
+    bounded number of clauses (README "Generic Filter System": 100 IN
+    values per filter, 50 filters, 50 tags). The cap lives on the query
+    models both tools pass through, so an oversized request is rejected as
+    a ValidationError before the backend is ever awaited.
+
+    Audit: src/opentelemetry_mcp/models.py:Filter.values:unbounded-filter-cardinality-backend-query-clause-fanout
+    """
+
+    async def test_filter_with_101_in_values_raises_before_backend_call(self) -> None:
+        backend = _fake_backend()
+        too_many_values = {
+            "field": "gen_ai.request.model",
+            "operator": "in",
+            "values": [f"model-{i}" for i in range(101)],
+            "value_type": "string",
+        }
+
+        with pytest.raises(ValidationError):
+            await search_traces(backend, filters=[too_many_values])
+        backend.search_traces.assert_not_awaited()
+
+    async def test_51_filters_raise_before_backend_call(self) -> None:
+        backend = _fake_backend()
+        filters = [
+            {"field": f"attr.{i}", "operator": "equals", "value": "x", "value_type": "string"}
+            for i in range(51)
+        ]
+
+        with pytest.raises(ValidationError):
+            await search_traces(backend, filters=filters)
+        backend.search_traces.assert_not_awaited()
+
+    async def test_51_tags_raise_before_backend_call(self) -> None:
+        backend = _fake_backend()
+
+        with pytest.raises(ValidationError):
+            await search_traces(backend, tags={f"k{i}": "v" for i in range(51)})
+        backend.search_traces.assert_not_awaited()
+
+    async def test_at_the_caps_the_backend_is_called(self) -> None:
+        backend = _fake_backend()
+        backend.search_traces.return_value = []
+        filters = [
+            {"field": f"attr.{i}", "operator": "equals", "value": "x", "value_type": "string"}
+            for i in range(49)
+        ] + [
+            {
+                "field": "gen_ai.request.model",
+                "operator": "in",
+                "values": [f"model-{i}" for i in range(100)],
+                "value_type": "string",
+            }
+        ]
+
+        await search_traces(backend, filters=filters, tags={f"k{i}": "v" for i in range(50)})
+        backend.search_traces.assert_awaited_once()
+
+
 class TestSearchTracesBackendExceptionHandling:
     """A raising backend must let the exception propagate, so the MCP
     server reports CallToolResult(isError=True) per SEP-2140."""

@@ -264,11 +264,12 @@ class TestBuildDatadogQuery:
         assert backend._filter_to_dd_query(f) == '@gen_ai.system:"a\\" OR *:*"'
 
     def test_range_operator_rejects_non_numeric_value(self) -> None:
-        """Filter.value_type isn't enforced against the actual Python type,
-        so a range operator with a string value must be rejected rather than
-        interpolated unchecked into a numeric range expression."""
+        """The Filter model now normalises NUMBER operands (a non-numeric str
+        is a ValidationError), so model_construct bypasses it here to prove
+        the builder's own type gate still rejects a string operand rather
+        than interpolating it unchecked into a numeric range expression."""
         backend = _backend()
-        f = Filter(
+        f = Filter.model_construct(
             field="duration",
             operator=FilterOperator.GT,
             value="1000 TO *} OR @duration:{0",
@@ -277,9 +278,10 @@ class TestBuildDatadogQuery:
         assert backend._filter_to_dd_query(f) is None
 
     def test_range_operator_rejects_bool_value(self) -> None:
-        """bool is an int subclass in Python but not a sensible range operand."""
+        """bool is an int subclass in Python but not a sensible range operand
+        (model_construct: the Filter model itself rejects a bool for NUMBER)."""
         backend = _backend()
-        f = Filter(
+        f = Filter.model_construct(
             field="duration", operator=FilterOperator.GTE, value=True, value_type=FilterType.NUMBER
         )
         assert backend._filter_to_dd_query(f) is None
@@ -1282,3 +1284,14 @@ class TestHealthCheck:
         assert result.status == "unhealthy"
         assert result.backend == "datadog"
         assert result.error == "boom"
+
+    async def test_unhealthy_names_the_exception_class_when_its_text_is_empty(self) -> None:
+        # httpx timeouts stringify to '' so /ready logged "health_check=unhealthy ''" and the
+        # 'backend timeout' class was never produced on this path (delta verification, TA).
+        backend = _backend()
+        backend._search_spans_raw = AsyncMock(side_effect=httpx.ReadTimeout(""))  # type: ignore[method-assign]
+
+        result = await backend.health_check()
+
+        assert result.status == "unhealthy"
+        assert result.error == "ReadTimeout"

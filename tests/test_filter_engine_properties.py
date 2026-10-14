@@ -8,8 +8,10 @@ built from hand-picked examples are unlikely to stumble onto.
 
 import math
 from datetime import datetime
+from typing import Any
+from unittest.mock import patch
 
-from hypothesis import assume, given
+from hypothesis import assume, example, given, settings
 from hypothesis import strategies as st
 
 from opentelemetry_mcp.attributes import SpanAttributes
@@ -45,6 +47,17 @@ SINGLE_VALUE_OPERATORS = [
 ]
 
 
+def _raw_filter(**fields: Any) -> Filter:
+    """Build a Filter with the model-level operand normalisation bypassed.
+
+    The Filter model now rejects/coerces operands that disagree with their
+    declared value_type, so a validated Filter can no longer carry e.g. a
+    str under NUMBER. The engine's never-raises contract must still hold for
+    such un-normalised filters (fail closed), so these property tests feed
+    them in via model_construct."""
+    return Filter.model_construct(**fields)
+
+
 def _make_span(index: int, attrs: dict[str, object] | None = None) -> SpanData:
     return SpanData(
         trace_id="t1",
@@ -75,6 +88,10 @@ def _make_trace(spans_attrs: list[dict[str, object]]) -> TraceData:
     actual=ARBITRARY_VALUE,
     expected=NON_NONE_VALUE,
 )
+# st.integers() all but never reaches 2**1024, where float() raises
+# OverflowError rather than ValueError; pin that case on both sides.
+@example(value_type=FilterType.NUMBER, operator=FilterOperator.GT, actual=10**400, expected=1)
+@example(value_type=FilterType.NUMBER, operator=FilterOperator.GT, actual=1, expected=10**400)
 def test_compare_value_never_raises_for_single_value_operators(
     value_type: FilterType,
     operator: FilterOperator,
@@ -86,7 +103,7 @@ def test_compare_value_never_raises_for_single_value_operators(
     input shape must come back as a plain bool, for every operator/type
     combination, including ones that are semantically mismatched
     (e.g. CONTAINS against value_type=NUMBER)."""
-    filt = Filter(field="x", operator=operator, value=expected, value_type=value_type)
+    filt = _raw_filter(field="x", operator=operator, value=expected, value_type=value_type)
     result = FilterEngine._compare_value(actual, filt)
     assert isinstance(result, bool)
 
@@ -101,7 +118,7 @@ def test_compare_value_never_raises_for_in_operators(
     actual: str | int | float | bool | None,
     values: list[str | int | float | bool],
 ) -> None:
-    filt = Filter(field="x", operator=FilterOperator.IN, values=values, value_type=value_type)
+    filt = _raw_filter(field="x", operator=FilterOperator.IN, values=values, value_type=value_type)
     result = FilterEngine._compare_value(actual, filt)
     assert isinstance(result, bool)
 
@@ -116,7 +133,9 @@ def test_compare_value_never_raises_for_between(
     actual: str | int | float | bool | None,
     values: list[str | int | float | bool],
 ) -> None:
-    filt = Filter(field="x", operator=FilterOperator.BETWEEN, values=values, value_type=value_type)
+    filt = _raw_filter(
+        field="x", operator=FilterOperator.BETWEEN, values=values, value_type=value_type
+    )
     result = FilterEngine._compare_value(actual, filt)
     assert isinstance(result, bool)
 
@@ -138,10 +157,13 @@ def test_gt_lte_both_reject_nan_actual() -> None:
 
 
 def test_gt_lte_both_reject_nan_expected() -> None:
-    gt_filter = Filter(
+    """The Filter model now rejects a non-finite NUMBER operand itself, so
+    build these via model_construct to keep the engine's own compile-time
+    NaN gate under test for callers that bypass the model."""
+    gt_filter = _raw_filter(
         field="x", operator=FilterOperator.GT, value=math.nan, value_type=FilterType.NUMBER
     )
-    lte_filter = Filter(
+    lte_filter = _raw_filter(
         field="x", operator=FilterOperator.LTE, value=math.nan, value_type=FilterType.NUMBER
     )
     assert FilterEngine._compare_value(5.0, gt_filter) is False
@@ -210,3 +232,109 @@ def test_negative_operator_does_not_vacuously_match_when_field_absent(
         value_type=FilterType.STRING,
     )
     assert FilterEngine._matches_filter(trace, filt) is False
+
+
+# -- Compile-once expected values ---------------------------------------------
+# Audit: src/opentelemetry_mcp/backends/filter_engine.py:FilterEngine._compare_value:per-call-expected-values-rebuild-linear-scan
+#
+# apply_filters must cost O(items x filters) comparisons plus one O(values)
+# normalisation per filter: expected values are converted once per
+# apply_filters call and IN/NOT_IN membership is O(1), instead of rebuilding
+# and linearly scanning the converted values list for every compared span.
+
+MEMBER_STRING_VALUE = st.one_of(
+    st.text(),
+    st.integers(min_value=-(2**63), max_value=2**63),
+    st.floats(allow_nan=False, allow_infinity=True),
+    st.booleans(),
+)
+MEMBER_NUMBER_VALUE = st.one_of(
+    st.integers(min_value=-(2**63), max_value=2**63),
+    st.floats(allow_nan=False, allow_infinity=True),
+)
+
+
+def test_compile_runs_once_per_filter_per_apply_filters_call() -> None:
+    """F filters over N items compile exactly F times (not N x F), for both
+    the SpanData and the TraceData (span-level field) paths."""
+    spans = [_make_span(i, {"custom.n": i}) for i in range(100)]
+    filters = [
+        Filter(
+            field="custom.n", operator=FilterOperator.GTE, value=0, value_type=FilterType.NUMBER
+        ),
+        Filter(
+            field="custom.n",
+            operator=FilterOperator.IN,
+            values=list(range(100)),
+            value_type=FilterType.NUMBER,
+        ),
+        Filter(
+            field="service.name",
+            operator=FilterOperator.EQUALS,
+            value="svc",
+            value_type=FilterType.STRING,
+        ),
+    ]
+
+    with patch.object(FilterEngine, "_compile", wraps=FilterEngine._compile) as compile_spy:
+        matched_spans = FilterEngine.apply_filters(spans, filters)
+    assert len(matched_spans) == 100
+    assert compile_spy.call_count == len(filters)
+
+    trace = _make_trace([{"custom.n": i} for i in range(100)])
+    with patch.object(FilterEngine, "_compile", wraps=FilterEngine._compile) as compile_spy:
+        matched_traces = FilterEngine.apply_filters([trace], filters)
+    assert matched_traces == [trace]
+    assert compile_spy.call_count == len(filters)
+
+
+@settings(deadline=None, derandomize=True)
+@given(
+    actual=MEMBER_STRING_VALUE,
+    values=st.lists(MEMBER_STRING_VALUE, min_size=1, max_size=8),
+    negate=st.booleans(),
+)
+def test_string_in_membership_matches_linear_reference(
+    actual: str | int | float | bool, values: list[str | int | float | bool], negate: bool
+) -> None:
+    """The set-based IN/NOT_IN must agree with the old linear scan's
+    semantics: str()-coerce both sides and compare for equality."""
+    operator = FilterOperator.NOT_IN if negate else FilterOperator.IN
+    filt = _raw_filter(field="x", operator=operator, values=values, value_type=FilterType.STRING)
+    reference = any(str(actual) == str(v) for v in values)
+    assert FilterEngine._compare_value(actual, filt) is (reference != negate)
+
+
+@settings(deadline=None, derandomize=True)
+@given(
+    actual=MEMBER_NUMBER_VALUE,
+    values=st.lists(MEMBER_NUMBER_VALUE, min_size=1, max_size=8),
+    negate=st.booleans(),
+)
+def test_number_in_membership_matches_linear_reference(
+    actual: int | float, values: list[int | float], negate: bool
+) -> None:
+    operator = FilterOperator.NOT_IN if negate else FilterOperator.IN
+    filt = _raw_filter(field="x", operator=operator, values=values, value_type=FilterType.NUMBER)
+    reference = any(float(actual) == float(v) for v in values)
+    assert FilterEngine._compare_value(actual, filt) is (reference != negate)
+
+
+def test_invalid_expected_value_yields_no_matches_without_raising() -> None:
+    """A filter whose expected values cannot be converted to its declared
+    type fails closed for every item (as the per-call engine did) instead of
+    raising, and a BOOLEAN IN stays on the unknown-operator False path."""
+    spans = [_make_span(i, {"custom.n": i}) for i in range(5)]
+
+    bad_number_in = _raw_filter(
+        field="custom.n",
+        operator=FilterOperator.IN,
+        values=["not-a-number"],
+        value_type=FilterType.NUMBER,
+    )
+    assert FilterEngine.apply_filters(spans, [bad_number_in]) == []
+
+    boolean_in = _raw_filter(
+        field="custom.n", operator=FilterOperator.IN, values=[True], value_type=FilterType.BOOLEAN
+    )
+    assert FilterEngine.apply_filters(spans, [boolean_in]) == []

@@ -3,14 +3,15 @@
 import base64
 import json
 import logging
+import math
 import re
 from datetime import UTC, datetime
 from typing import Any, Literal
-from urllib.parse import quote
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes, SpanEvent
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
+from opentelemetry_mcp.backends.url_path import safe_path_segment
 from opentelemetry_mcp.models import (
     Filter,
     FilterOperator,
@@ -33,6 +34,44 @@ logger = logging.getLogger(__name__)
 # instead (mirrors datadog.py's `_VALID_DD_FIELD_RE` / sentry.py's
 # `_VALID_SENTRY_FIELD_RE`).
 _VALID_TRACEQL_FIELD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+
+_TRACEQL_RANGE_OPERATORS = {
+    FilterOperator.GT: ">",
+    FilterOperator.LT: "<",
+    FilterOperator.GTE: ">=",
+    FilterOperator.LTE: "<=",
+}
+
+
+def _render_traceql_scalar(value: object, value_type: FilterType) -> str | None:
+    """Render a NUMBER/BOOLEAN Filter operand as an unquoted TraceQL literal.
+
+    Only a genuine, finite, float-representable int/float (not a bool)
+    renders as a numeric literal and only a genuine bool renders as
+    ``true``/``false``. Anything else - notably a str that merely *claims*
+    value_type number/boolean - returns None, so the caller reclassifies the
+    filter as client-side (where FilterEngine fails closed on an unparsable
+    operand) instead of f-string-splicing the raw value into the query. This
+    is the non-string counterpart of ``_escape_traceql_value``: a model-chosen
+    filter value may select a literal to compare against but must never add
+    query structure.
+    """
+    if value_type == FilterType.NUMBER:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        try:
+            if not math.isfinite(value):
+                return None
+        except OverflowError:
+            # An int >= 2**1024 has no float value: math.isfinite raises
+            # instead of answering, and no consumer downstream could take it.
+            return None
+        return repr(value)
+    if value_type == FilterType.BOOLEAN:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return None
+    return None
 
 
 class TempoBackend(BaseBackend):
@@ -101,6 +140,27 @@ class TempoBackend(BaseBackend):
             FilterOperator.EXISTS,  # Via != nil
             FilterOperator.NOT_EXISTS,  # Via = nil
         }
+
+    @staticmethod
+    def _search_row_trace_id(trace_result: dict[str, Any]) -> tuple[str, str] | None:
+        """Return ``(trace_id, encoded path segment)`` for one /api/search row,
+        or None when the row carries no usable traceID.
+
+        A row whose id is empty, ".", "..", over-long or not a string cannot
+        be fetched as ``/api/traces/{id}`` at all; it is malformed search
+        output, not evidence of a /api/traces outage, so the hydration loops
+        skip it (logged) without counting it as an attempted fetch -
+        otherwise a result set made only of such rows would raise the
+        all-fetches-failed RuntimeError although no request was ever sent.
+        """
+        trace_id = trace_result.get("traceID")
+        if not trace_id:
+            return None
+        try:
+            return trace_id, safe_path_segment(trace_id, "trace_id")
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Skipping /api/search row with an unusable traceID: {e}")
+            return None
 
     async def search_traces(self, query: TraceQuery) -> list[TraceData]:
         """Search traces using TraceQL with hybrid filtering.
@@ -181,22 +241,22 @@ class TempoBackend(BaseBackend):
         last_fetch_error: Exception | None = None
 
         for trace_result in trace_results[:max_traces_to_fetch]:
-            trace_id = trace_result.get("traceID")
-            if trace_id:
-                attempted_fetches += 1
-                try:
-                    trace_response = await self.client.get(
-                        f"/api/traces/{quote(trace_id, safe='')}"
-                    )
-                    trace_response.raise_for_status()
-                    trace_data = trace_response.json()
-                    trace = self._parse_tempo_trace(trace_data, trace_id_hex=trace_id)
-                    if trace:
-                        traces.append(trace)
-                except Exception as e:
-                    failed_fetches += 1
-                    last_fetch_error = e
-                    logger.warning(f"Failed to fetch trace {trace_id}: {e}")
+            row = self._search_row_trace_id(trace_result)
+            if row is None:
+                continue
+            trace_id, encoded_trace_id = row
+            attempted_fetches += 1
+            try:
+                trace_response = await self.client.get(f"/api/traces/{encoded_trace_id}")
+                trace_response.raise_for_status()
+                trace_data = trace_response.json()
+                trace = self._parse_tempo_trace(trace_data, trace_id_hex=trace_id)
+                if trace:
+                    traces.append(trace)
+            except Exception as e:
+                failed_fetches += 1
+                last_fetch_error = e
+                logger.warning(f"Failed to fetch trace {trace_id}: {e}")
 
         # A total outage of /api/traces/{id} (while /api/search still works)
         # must not look identical to a genuine "no traces matched" result -
@@ -269,7 +329,11 @@ class TempoBackend(BaseBackend):
             min_duration_ms=query.min_duration_ms,
             max_duration_ms=query.max_duration_ms,
             tags=query.tags,
-            limit=query.limit * 2,  # Fetch more traces to ensure we get enough spans
+            # Fetch more traces to ensure we get enough spans, but cap at
+            # TraceQuery.limit's own le=1000 constraint (as jaeger.py does):
+            # a query.limit above 500 would otherwise raise a pydantic
+            # ValidationError here instead of issuing a request.
+            limit=min(query.limit * 2, 1000),
             has_error=query.has_error,
             gen_ai_system=query.gen_ai_system,
             gen_ai_request_model=query.gen_ai_request_model,
@@ -331,22 +395,22 @@ class TempoBackend(BaseBackend):
         last_fetch_error: Exception | None = None
 
         for trace_result in trace_results[:max_traces_to_fetch]:
-            trace_id = trace_result.get("traceID")
-            if trace_id:
-                attempted_fetches += 1
-                try:
-                    trace_response = await self.client.get(
-                        f"/api/traces/{quote(trace_id, safe='')}"
-                    )
-                    trace_response.raise_for_status()
-                    trace_data = trace_response.json()
-                    trace = self._parse_tempo_trace(trace_data, trace_id_hex=trace_id)
-                    if trace:
-                        all_spans.extend(trace.spans)
-                except Exception as e:
-                    failed_fetches += 1
-                    last_fetch_error = e
-                    logger.warning(f"Failed to fetch trace {trace_id}: {e}")
+            row = self._search_row_trace_id(trace_result)
+            if row is None:
+                continue
+            trace_id, encoded_trace_id = row
+            attempted_fetches += 1
+            try:
+                trace_response = await self.client.get(f"/api/traces/{encoded_trace_id}")
+                trace_response.raise_for_status()
+                trace_data = trace_response.json()
+                trace = self._parse_tempo_trace(trace_data, trace_id_hex=trace_id)
+                if trace:
+                    all_spans.extend(trace.spans)
+            except Exception as e:
+                failed_fetches += 1
+                last_fetch_error = e
+                logger.warning(f"Failed to fetch trace {trace_id}: {e}")
 
         # See search_traces for why an all-failed per-trace hydration must
         # raise rather than silently returning an empty span list.
@@ -367,10 +431,10 @@ class TempoBackend(BaseBackend):
     async def get_trace(self, trace_id: str) -> TraceData:
         """Get a specific trace by ID from Tempo."""
         # trace_id is an unvalidated MCP tool argument and is a URL *path*
-        # segment here - path-escape it before interpolating (mirrors
-        # sentry.py's identical quote(trace_id, safe="") at its own
-        # /trace/{id}/ path-segment call site).
-        response = await self.client.get(f"/api/traces/{quote(trace_id, safe='')}")
+        # segment here - safe_path_segment path-escapes it and rejects the
+        # "" / "." / ".." values httpx would otherwise collapse into a
+        # different endpoint (see backends/url_path.py).
+        response = await self.client.get(f"/api/traces/{safe_path_segment(trace_id, 'trace_id')}")
         response.raise_for_status()
         data = response.json()
         # Pass trace_id_hex to ensure consistent trace ID format (hex instead of base64)
@@ -486,7 +550,7 @@ class TempoBackend(BaseBackend):
                 status="unhealthy",
                 backend="tempo",
                 url=self.url,
-                error=str(e),
+                error=str(e) or type(e).__name__,
             )
 
     def _build_traceql_from_filters(
@@ -604,38 +668,38 @@ class TempoBackend(BaseBackend):
                 return None
             traceql_field = f"span.{field}"
 
-        # Build condition based on operator
+        # Build condition based on operator. Non-STRING operands go through
+        # _render_traceql_scalar: a None result means the operand is not a
+        # genuine number/bool, and returning None here lets
+        # _build_traceql_from_filters reclassify the filter as client-side
+        # rather than splicing the raw value into the query.
         if operator == FilterOperator.EQUALS:
             if filter_obj.value_type == FilterType.STRING:
                 return f'{traceql_field} = "{self._escape_traceql_value(str(value))}"'
-            else:
-                return f"{traceql_field} = {value}"
+            scalar = _render_traceql_scalar(value, filter_obj.value_type)
+            if scalar is None:
+                return None
+            return f"{traceql_field} = {scalar}"
 
         elif operator == FilterOperator.NOT_EQUALS:
             if filter_obj.value_type == FilterType.STRING:
                 return f'{traceql_field} != "{self._escape_traceql_value(str(value))}"'
-            else:
-                return f"{traceql_field} != {value}"
+            scalar = _render_traceql_scalar(value, filter_obj.value_type)
+            if scalar is None:
+                return None
+            return f"{traceql_field} != {scalar}"
 
-        elif operator == FilterOperator.GT:
-            if field == "duration":
-                return f"{traceql_field} > {value}ms"
-            return f"{traceql_field} > {value}"
-
-        elif operator == FilterOperator.LT:
-            if field == "duration":
-                return f"{traceql_field} < {value}ms"
-            return f"{traceql_field} < {value}"
-
-        elif operator == FilterOperator.GTE:
-            if field == "duration":
-                return f"{traceql_field} >= {value}ms"
-            return f"{traceql_field} >= {value}"
-
-        elif operator == FilterOperator.LTE:
-            if field == "duration":
-                return f"{traceql_field} <= {value}ms"
-            return f"{traceql_field} <= {value}"
+        elif operator in _TRACEQL_RANGE_OPERATORS:
+            # Range comparisons are only meaningful against a numeric
+            # literal; a STRING-typed operand (or one that fails to render)
+            # is applied client-side instead.
+            if filter_obj.value_type != FilterType.NUMBER:
+                return None
+            scalar = _render_traceql_scalar(value, FilterType.NUMBER)
+            if scalar is None:
+                return None
+            unit = "ms" if field == "duration" else ""
+            return f"{traceql_field} {_TRACEQL_RANGE_OPERATORS[operator]} {scalar}{unit}"
 
         elif operator == FilterOperator.CONTAINS:
             # Use regex for contains. Escape regex metacharacters in the
@@ -657,7 +721,14 @@ class TempoBackend(BaseBackend):
                     f'{traceql_field} = "{self._escape_traceql_value(str(v))}"' for v in values
                 ]
             else:
-                or_conditions = [f"{traceql_field} = {v}" for v in values]
+                or_conditions = []
+                for v in values:
+                    scalar = _render_traceql_scalar(v, filter_obj.value_type)
+                    if scalar is None:
+                        # One non-renderable item disqualifies the whole OR
+                        # group: apply the filter client-side instead.
+                        return None
+                    or_conditions.append(f"{traceql_field} = {scalar}")
             return "(" + " || ".join(or_conditions) + ")"
 
         elif operator == FilterOperator.EXISTS:

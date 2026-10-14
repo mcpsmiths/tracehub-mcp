@@ -91,7 +91,8 @@ def _spawn_server(port: int, backend_url: str, **extra_flags: str) -> subprocess
         backend_url,
     ]
     for flag, value in extra_flags.items():
-        args.extend([flag, value])
+        # An empty value means a bare boolean flag (e.g. --access-log).
+        args.extend([flag, value] if value else [flag])
     # All args are this file's own hardcoded literals plus sys.executable -
     # nothing here originates from external/untrusted input.
     return subprocess.Popen(  # noqa: S603
@@ -123,6 +124,14 @@ class TestShutdownDrainSignal:
                 "--shutdown-drain-seconds": "3",
                 "--backend-close-timeout-seconds": "2",
                 "--graceful-shutdown-timeout-seconds": "10",
+                # The "/api/traces" evidence below is httpx's own per-request
+                # INFO line, which the server quiets to WARNING unless the
+                # operator asks for DEBUG (it prints the full request URL).
+                "--log-level": "DEBUG",
+                # The '"POST /mcp HTTP/1.1" 200 OK' evidence is uvicorn's access
+                # line, off by default since the round-2 hardening (a token in the
+                # query string would be logged); this test opts back in.
+                "--access-log": "",
             },
         )
         try:
@@ -132,13 +141,20 @@ class TestShutdownDrainSignal:
             client = Client(transport)
             await client.__aenter__()  # type: ignore[no-untyped-call]
             try:
-                # Fire the call and hand control back immediately (no
-                # await here) so SIGTERM below is provably sent while the
-                # 1.5s-delayed backend call is genuinely in flight, not
-                # after it already returned.
+                # Fire the call without awaiting it, then wait until the stub is
+                # inside its 1.5 s-delayed /api/traces handler before sending
+                # SIGTERM, so the backend call is provably in flight at the signal.
+                # Signalling right after ensure_future() only *scheduled* the call:
+                # the POST left when this coroutine next yielded, and on a slow CI
+                # runner that was after uvicorn had already closed the idle
+                # keep-alive connection, so the call never reached the backend and
+                # "/api/traces" never appeared (reproduced locally by blocking this
+                # task for 0.5 s after the signal).
                 call_task = asyncio.ensure_future(
                     client.call_tool("search_traces", {"service_name": "stub-service", "limit": 5})
                 )
+                in_flight = await asyncio.to_thread(slow_backend.traces_started.wait, 5.0)
+                assert in_flight, "the backend never received /api/traces within 5 s"
                 proc.send_signal(signal.SIGTERM)
                 sigterm_sent_at = time.monotonic()
                 # See module docstring: the connection-closure interaction

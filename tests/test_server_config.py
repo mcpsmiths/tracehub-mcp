@@ -10,7 +10,7 @@ ServerConfig-level fields at all, only BackendConfig ones.
 import logging
 
 import pytest
-from pydantic import HttpUrl
+from pydantic import HttpUrl, ValidationError
 
 from opentelemetry_mcp.config import BackendConfig, ServerConfig
 
@@ -258,3 +258,99 @@ class TestApplyCliOverridesSlowRequestThreshold:
         config.apply_cli_overrides(slow_request_threshold_ms=None)
 
         assert config.slow_request_threshold_ms == 200.0
+
+
+class TestFromEnvQueryCache:
+    """QUERY_CACHE_TTL_SECONDS used to accept any positive float (inf, 1e12)
+    and the cache had no entry bound; both are now bounded at the config
+    layer, with the same warn-and-default parse pattern the sibling fields
+    use for unparsable text and a ValidationError for out-of-range values
+    (exactly like MAX_TRACES_PER_QUERY=5000 today)."""
+
+    def test_max_entries_defaults_to_1024(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("QUERY_CACHE_MAX_ENTRIES", raising=False)
+
+        config = ServerConfig.from_env()
+
+        assert config.query_cache_max_entries == 1024
+
+    def test_max_entries_parses_a_valid_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("QUERY_CACHE_MAX_ENTRIES", "256")
+
+        config = ServerConfig.from_env()
+
+        assert config.query_cache_max_entries == 256
+
+    def test_max_entries_invalid_text_warns_and_keeps_the_default(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("QUERY_CACHE_MAX_ENTRIES", "lots")
+
+        with caplog.at_level(logging.WARNING):
+            config = ServerConfig.from_env()
+
+        assert config.query_cache_max_entries == 1024
+        assert any("QUERY_CACHE_MAX_ENTRIES" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("value", ["0", "100001"])
+    def test_max_entries_out_of_range_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("QUERY_CACHE_MAX_ENTRIES", value)
+
+        with pytest.raises(ValidationError):
+            ServerConfig.from_env()
+
+    @pytest.mark.parametrize("value", ["inf", "1e12", "86401", "nan"])
+    def test_ttl_non_finite_or_above_one_day_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("QUERY_CACHE_TTL_SECONDS", value)
+
+        with pytest.raises(ValidationError):
+            ServerConfig.from_env()
+
+    def test_ttl_at_the_one_day_ceiling_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("QUERY_CACHE_TTL_SECONDS", "86400")
+
+        config = ServerConfig.from_env()
+
+        assert config.query_cache_ttl_seconds == 86400.0
+
+
+class TestApplyCliOverridesQueryCache:
+    @pytest.mark.parametrize("ttl", [1e12, float("inf"), float("nan"), 86400.5])
+    def test_ttl_non_finite_or_above_one_day_raises(self, ttl: float) -> None:
+        config = _server_config()
+
+        with pytest.raises(ValueError, match="Invalid query_cache_ttl_seconds"):
+            config.apply_cli_overrides(query_cache_ttl_seconds=ttl)
+
+    def test_ttl_within_bounds_is_applied(self) -> None:
+        config = _server_config()
+
+        config.apply_cli_overrides(query_cache_ttl_seconds=86400.0)
+
+        assert config.query_cache_ttl_seconds == 86400.0
+
+    def test_max_entries_is_applied(self) -> None:
+        config = _server_config()
+
+        config.apply_cli_overrides(query_cache_max_entries=50)
+
+        assert config.query_cache_max_entries == 50
+
+    @pytest.mark.parametrize("max_entries", [0, -1, 100_001])
+    def test_max_entries_out_of_range_raises(self, max_entries: int) -> None:
+        config = _server_config()
+
+        with pytest.raises(ValueError, match="Invalid query_cache_max_entries"):
+            config.apply_cli_overrides(query_cache_max_entries=max_entries)
+
+    def test_none_leaves_max_entries_unchanged(self) -> None:
+        config = _server_config()
+        config.query_cache_max_entries = 99
+
+        config.apply_cli_overrides(query_cache_max_entries=None)
+
+        assert config.query_cache_max_entries == 99

@@ -1,20 +1,28 @@
 """Opentelemetry MCP Server - Main entry point."""
 
 import asyncio
+import hmac
+import ipaddress
 import json
 import logging
+import math
+import os
 import re
 import sys
 import time
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal, NoReturn
 
 import click
+import httpx
 import uvicorn
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.auth.auth import AccessToken, TokenVerifier
 from fastmcp.server.http import StarletteWithLifespan
 from mcp.types import ToolAnnotations
+from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -22,6 +30,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from opentelemetry_mcp import __version__
+from opentelemetry_mcp.attributes import HealthCheckResponse
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.datadog import DatadogBackend
 from opentelemetry_mcp.backends.honeycomb import HoneycombBackend
@@ -45,6 +54,12 @@ from opentelemetry_mcp.observability import (
     configure_tracing,
     install_trace_context_log_filter,
 )
+from opentelemetry_mcp.security import (
+    UserinfoRedactingFilter,
+    is_loopback_host,
+    redact_url_userinfo,
+    redact_userinfo_in_text,
+)
 from opentelemetry_mcp.tools import (
     compare,
     correlate,
@@ -65,11 +80,33 @@ from opentelemetry_mcp.tools import (
     usage,
 )
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+# Set up logging. The root stderr handler is built explicitly (rather than
+# left to basicConfig) so the userinfo-redacting filter sits on the one
+# HANDLER every record passes through - a filter on the root *logger* is
+# never consulted for records propagated from child loggers (httpx, fastmcp,
+# opentelemetry_mcp.*). basicConfig is a no-op when the root already has
+# handlers (pytest), so tests drive _ROOT_LOG_HANDLER directly.
+_ROOT_LOG_HANDLER = logging.StreamHandler()
+_ROOT_LOG_HANDLER.setFormatter(
+    logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 )
+_ROOT_LOG_HANDLER.addFilter(UserinfoRedactingFilter())
+logging.basicConfig(level=logging.INFO, handlers=[_ROOT_LOG_HANDLER])
 logger = logging.getLogger(__name__)
+
+
+def _apply_log_level(level: str) -> None:
+    """Set the root level and, unless the operator asked for DEBUG, quiet
+    httpx's per-request INFO line ("HTTP Request: GET <url> ..."), which
+    prints the full request URL - the one URL sink that cannot be redacted
+    at creation time. LOG_LEVEL=DEBUG keeps that line for connectivity
+    debugging; it then passes through the redacting handler filter like
+    every other record."""
+    root = logging.getLogger()
+    root.setLevel(level)
+    httpx_level = logging.NOTSET if root.getEffectiveLevel() <= logging.DEBUG else logging.WARNING
+    logging.getLogger("httpx").setLevel(httpx_level)
+
 
 # All 19 tools below only ever query trace/span backends and never mutate
 # backend state, so the same read-only/destructive/idempotent/open-world
@@ -84,6 +121,68 @@ _READ_ONLY_TOOL_ANNOTATIONS = ToolAnnotations(
 )
 
 
+def _exception_chain(error: BaseException) -> Iterator[BaseException]:
+    """`error` followed by its __cause__ / implicit __context__ links, in
+    the order a traceback prints them. Cycle-safe."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__suppress_context__:
+            current = None
+        else:
+            current = current.__context__
+
+
+# What an unauthenticated GET /ready peer learns about a failed probe: one
+# of these classes per failing half, never the backend's own text, which
+# embeds the internal URL (host:port) and httpx's error phrasing (runtime
+# verification probe-4 P1-P3). The redacted detail goes to the server log.
+_STATUS_IN_ERROR_TEXT_RE = re.compile(r"(?:error|status(?: code)?)\s+'?([45]\d\d)\b", re.IGNORECASE)
+_TIMEOUT_IN_ERROR_TEXT_RE = re.compile(r"time[d]?[ -]?out", re.IGNORECASE)
+_UNREACHABLE_IN_ERROR_TEXT_RE = re.compile(
+    r"connect|refused|unreachable|resolve|name or service|network|reset by peer|broken pipe",
+    re.IGNORECASE,
+)
+# Upper bound on how much of a probe's error text reaches the log line:
+# httpx's status-error text with its documentation link is ~200 chars.
+_MAX_LOGGED_PROBE_ERROR_CHARS = 256
+
+
+def _classify_backend_error_text(text: str | None) -> str:
+    """Short class for a backend error that only exists as text (every
+    backend's health_check catches its exception and returns str(e))."""
+    if not text:
+        return "backend unhealthy"
+    if _TIMEOUT_IN_ERROR_TEXT_RE.search(text):
+        return "backend timeout"
+    status = _STATUS_IN_ERROR_TEXT_RE.search(text)
+    if status:
+        return f"backend error {status.group(1)}"
+    if _UNREACHABLE_IN_ERROR_TEXT_RE.search(text):
+        return "backend unreachable"
+    return "backend unhealthy"
+
+
+def _classify_backend_error(error: BaseException) -> str:
+    """Short class for a backend exception, judged on the exception chain's
+    types first (httpx timeouts, status errors, transport/OS errors) and on
+    the text only as a fallback."""
+    chain = list(_exception_chain(error))
+    if any(isinstance(link, httpx.TimeoutException | TimeoutError) for link in chain):
+        return "backend timeout"
+    for link in chain:
+        if isinstance(link, httpx.HTTPStatusError):
+            return f"backend error {link.response.status_code}"
+    if any(isinstance(link, httpx.TransportError | OSError) for link in chain):
+        return "backend unreachable"
+    classified = _classify_backend_error_text(str(error))
+    return "backend error" if classified == "backend unhealthy" else classified
+
+
 def _handle_tool_error(tool_name: str, error: Exception) -> NoReturn:
     """Centralized error handler for tool functions.
 
@@ -93,12 +192,31 @@ def _handle_tool_error(tool_name: str, error: Exception) -> NoReturn:
     CallToolResult(isError=True), per SEP-2140 - a plain successful return
     would leave isError=False even though the tool call failed.
 
+    The one exception to the identity re-raise: when the error text - or that
+    of any exception chained beneath it (__cause__/__context__) - embeds a
+    URL userinfo (httpx's HTTPStatusError message carries the request URL
+    verbatim, so a credential a bypassed config left in BACKEND_URL would
+    otherwise reach the MCP client as tool-error content), a ToolError with
+    the redacted text is raised from it instead - still isError=True. The
+    chain matters because the identity path ends in fastmcp's generic
+    `except Exception`, whose logger.exception() prints every chained cause
+    through the 'fastmcp' logger's own RichHandler - that logger does not
+    propagate to the root handler, so UserinfoRedactingFilter never sees it.
+    fastmcp logs a ToolError with exc_info=False, so nothing re-prints the
+    chain.
+
     Args:
         tool_name: Name of the tool that encountered the error
         error: The exception that was raised
     """
-    logger.error(f"Error executing {tool_name}: {error}", exc_info=True)
-    raise error
+    messages = [str(link) for link in _exception_chain(error)]
+    if all(redact_userinfo_in_text(text) == text for text in messages):
+        logger.error(f"Error executing {tool_name}: {error}", exc_info=True)
+        raise error
+    redacted = redact_userinfo_in_text(messages[0])
+    # The traceback's final line would repeat the raw message: log without it.
+    logger.error(f"Error executing {tool_name}: {redacted}")
+    raise ToolError(redacted) from error
 
 
 # Global backend instance
@@ -114,14 +232,18 @@ mcp = FastMCP("tracehub-mcp", version=__version__)
 
 def _clamp_limit(limit: int) -> int:
     """Cap a tool's requested limit at the server-wide ceiling
-    (--max-traces-per-query / MAX_TRACES_PER_QUERY), so a single query can
-    never fetch more traces/spans than the operator has allowed, regardless
-    of what the calling agent requests. _config is only None before startup
-    has finished (in practice, _get_backend() already fails first in that
-    case), so there is nothing to clamp against yet.
+    (--max-traces-per-query / MAX_TRACES_PER_QUERY). This is the per-tool
+    contract (the advertised `limit` is honoured up to the ceiling); the
+    enforcement point is the backend boundary - BaseBackend.max_query_limit,
+    set from the same field in _create_backend/_get_secondary_backend -
+    which clamps every search_traces/search_spans query however a tool or
+    helper re-expanded or chose its limit. _config is only None before
+    startup has finished (every handler calls _get_backend() first, which
+    raises the same error), so fail closed rather than forward an unbounded
+    limit.
     """
     if _config is None:
-        return limit
+        raise RuntimeError("Server configuration not set")
     return min(limit, _config.max_traces_per_query)
 
 
@@ -139,14 +261,14 @@ def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
     backend: BaseBackend
 
     if backend_config.type == "jaeger":
-        logger.info(f"Initializing Jaeger backend: {backend_config.url}")
+        logger.info(f"Initializing Jaeger backend: {redact_url_userinfo(backend_config.url)}")
         backend = JaegerBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
             timeout=backend_config.timeout,
         )
     elif backend_config.type == "tempo":
-        logger.info(f"Initializing Tempo backend: {backend_config.url}")
+        logger.info(f"Initializing Tempo backend: {redact_url_userinfo(backend_config.url)}")
         backend = TempoBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
@@ -154,7 +276,7 @@ def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
             tempo_instance_id=backend_config.tempo_instance_id,
         )
     elif backend_config.type == "traceloop":
-        logger.info(f"Initializing Traceloop backend: {backend_config.url}")
+        logger.info(f"Initializing Traceloop backend: {redact_url_userinfo(backend_config.url)}")
         backend = TraceloopBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
@@ -162,7 +284,7 @@ def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
             environments=backend_config.environments,
         )
     elif backend_config.type == "datadog":
-        logger.info(f"Initializing Datadog backend: {backend_config.url}")
+        logger.info(f"Initializing Datadog backend: {redact_url_userinfo(backend_config.url)}")
         backend = DatadogBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
@@ -170,7 +292,7 @@ def _build_backend_from_config(backend_config: BackendConfig) -> BaseBackend:
             timeout=backend_config.timeout,
         )
     elif backend_config.type == "sentry":
-        logger.info(f"Initializing Sentry backend: {backend_config.url}")
+        logger.info(f"Initializing Sentry backend: {redact_url_userinfo(backend_config.url)}")
         backend = SentryBackend(
             url=str(backend_config.url),
             api_key=backend_config.api_key,
@@ -222,8 +344,18 @@ def _create_backend(config: ServerConfig) -> BaseBackend:
     # several backend subclasses override __init__ with their own named
     # params, so this is applied uniformly here instead.
     backend.slow_request_threshold_ms = config.slow_request_threshold_ms
-    backend.configure_query_cache(config.query_cache_ttl_seconds)
+    backend.max_response_bytes = config.backend.max_response_bytes
+    backend.max_query_limit = config.max_traces_per_query
+    backend.configure_query_cache(config.query_cache_ttl_seconds, config.query_cache_max_entries)
     return backend
+
+
+def _describe_health(health: HealthCheckResponse) -> str:
+    """status plus the redacted error, never the model repr (which carries
+    the backend URL and the raw error text)."""
+    if health.error:
+        return f"{health.status} ({redact_userinfo_in_text(health.error)})"
+    return health.status
 
 
 async def _get_backend() -> BaseBackend:
@@ -251,11 +383,13 @@ async def _get_backend() -> BaseBackend:
         # Perform health check on first initialization
         try:
             health = await _backend.health_check()
-            logger.info(f"Backend health check: {health}")
+            logger.info(f"Backend health check: {_describe_health(health)}")
             if health.status != "healthy":
                 logger.warning("Backend is not healthy, but continuing...")
         except Exception as e:
-            logger.error(f"Backend health check failed: {e}")
+            logger.error(
+                f"Backend health check failed: {redact_userinfo_in_text(str(e) or type(e).__name__)}"
+            )
             logger.warning("Continuing anyway, requests may fail...")
 
     return _backend
@@ -291,18 +425,126 @@ async def _get_secondary_backend() -> BaseBackend:
         logger.info("Creating secondary backend in current event loop")
         _secondary_backend = _build_backend_from_config(_config.secondary_backend)
         _secondary_backend.slow_request_threshold_ms = _config.slow_request_threshold_ms
-        _secondary_backend.configure_query_cache(_config.query_cache_ttl_seconds)
+        _secondary_backend.max_response_bytes = _config.secondary_backend.max_response_bytes
+        _secondary_backend.max_query_limit = _config.max_traces_per_query
+        _secondary_backend.configure_query_cache(
+            _config.query_cache_ttl_seconds, _config.query_cache_max_entries
+        )
 
         try:
             health = await _secondary_backend.health_check()
-            logger.info(f"Secondary backend health check: {health}")
+            logger.info(f"Secondary backend health check: {_describe_health(health)}")
             if health.status != "healthy":
                 logger.warning("Secondary backend is not healthy, but continuing...")
         except Exception as e:
-            logger.error(f"Secondary backend health check failed: {e}")
+            logger.error(
+                f"Secondary backend health check failed: {redact_userinfo_in_text(str(e) or type(e).__name__)}"
+            )
             logger.warning("Continuing anyway, requests may fail...")
 
     return _secondary_backend
+
+
+# GET /ready is unauthenticated and every probe costs the backend one
+# health_check plus one list_services - on Honeycomb a slot of the process-
+# wide 10/min Create Query Result budget that every session's tool calls
+# queue behind, on X-Ray up to 222 operator-paid API calls. The route
+# therefore memoizes the probe result for a window (success) or a shorter
+# one (failure, so recovery is noticed quickly), shares one in-flight check
+# between concurrent probes, and answers 503 instead of hanging on a parked
+# backend. The window matches the Dockerfile HEALTHCHECK interval;
+# READINESS_CACHE_SECONDS / --readiness-cache-seconds tunes it (0 disables
+# the memo but keeps the timeout and the single-flight).
+_READINESS_MEMO_TTL_SECONDS = 30.0
+_READINESS_FAILURE_MEMO_TTL_SECONDS = 5.0
+_READINESS_CHECK_TIMEOUT_SECONDS = 10.0
+
+_readiness_cache_seconds: float = _READINESS_MEMO_TTL_SECONDS
+_readiness_clock: Callable[[], float] = time.monotonic
+# (backend, expires_at, all_ok, details, generation). Keyed on the backend
+# object's identity so a recreated or test-patched backend invalidates it;
+# `generation` counts completed probes so a caller that queued on the lock
+# while a probe ran reuses that probe's result even when the memo window
+# is 0 (single-flight without a shared future to cancel).
+_readiness_memo: tuple[BaseBackend, float, bool, dict[str, Any], int] | None = None
+_readiness_generation = 0
+# Stored with the loop it was created in: a contended asyncio.Lock binds to
+# its loop and raises RuntimeError when re-acquired under another one (one
+# TestClient per test), so a lock from a previous loop is replaced.
+_readiness_lock: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
+
+
+def _configure_readiness_cache(
+    seconds: float, *, clock: Callable[[], float] = time.monotonic
+) -> None:
+    """Set the /ready memo window (0 disables the memo) and its clock; main()
+    applies the operator's value before the HTTP app is built."""
+    global _readiness_cache_seconds, _readiness_clock
+    _readiness_cache_seconds = seconds
+    _readiness_clock = clock
+    _reset_readiness_memo()
+
+
+def _reset_readiness_memo() -> None:
+    """Drop the memo AND the lazily created lock - tests drive /ready from a
+    fresh event loop each, and a lock contended under a previous loop
+    cannot be reused under the next one."""
+    global _readiness_memo, _readiness_lock, _readiness_generation
+    _readiness_memo = None
+    _readiness_lock = None
+    _readiness_generation = 0
+
+
+def _get_readiness_lock() -> asyncio.Lock:
+    global _readiness_lock
+    loop = asyncio.get_running_loop()
+    if _readiness_lock is None or _readiness_lock[0] is not loop:
+        _readiness_lock = (loop, asyncio.Lock())
+    return _readiness_lock[1]
+
+
+async def _run_backend_checks_memoized(backend: BaseBackend) -> tuple[bool, dict[str, Any]]:
+    """/ready's view of _run_backend_checks: at most one probe per memo
+    window per process, one in-flight probe shared by every concurrent
+    caller, and a hard deadline that turns a parked backend into a 503.
+
+    Stores and returns the details exactly as _run_backend_checks produced
+    them (already redacted there); `doctor` keeps calling the live helper.
+    """
+    global _readiness_memo, _readiness_generation
+    queued_at_generation = _readiness_generation
+    async with _get_readiness_lock():
+        memo = _readiness_memo
+        if memo is not None and memo[0] is backend:
+            _, expires_at, all_ok, details, generation = memo
+            if expires_at > _readiness_clock() or generation > queued_at_generation:
+                return all_ok, details
+
+        try:
+            async with asyncio.timeout(_READINESS_CHECK_TIMEOUT_SECONDS):
+                all_ok, details = await _run_backend_checks(backend)
+        except TimeoutError:
+            all_ok = False
+            details = {
+                "error": f"readiness check timed out after {_READINESS_CHECK_TIMEOUT_SECONDS:g} s"
+            }
+        if not all_ok:
+            _log_readiness_failure(details)
+
+        ttl = (
+            _readiness_cache_seconds
+            if all_ok
+            else min(_readiness_cache_seconds, _READINESS_FAILURE_MEMO_TTL_SECONDS)
+        )
+        _readiness_generation += 1
+        _readiness_memo = (
+            backend,
+            _readiness_clock() + ttl,
+            all_ok,
+            details,
+            _readiness_generation,
+        )
+        return all_ok, details
 
 
 async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any]]:
@@ -311,27 +553,86 @@ async def _run_backend_checks(backend: BaseBackend) -> tuple[bool, dict[str, Any
     lifecycle (construct/close) - this never closes it, so it is safe to
     call against the server's own cached _get_backend() instance without
     disrupting subsequent real tool calls that share it.
+
+    Every error string is redacted HERE, not by the callers: doctor prints
+    them and /ready logs them, and httpx error text embeds the request URL
+    (userinfo included) verbatim. An exception whose text is empty
+    (httpx.ReadTimeout("")) is presented by its class name, so neither half
+    can report '' - the final verification pass saw `list_services=error ''`
+    in the log and doctor print nothing after its colon. Each failing half also carries an
+    "error_class" - the only error text _readiness_body copies into the
+    unauthenticated /ready response.
+
+    The list_services half goes through BaseBackend.list_services_uncached,
+    never the cache-wrapped public method: with QUERY_CACHE_TTL_SECONDS set
+    a warmed entry would otherwise report "ready" with zero backend requests
+    for a whole TTL after the backend failed.
     """
     all_ok = True
     details: dict[str, Any] = {}
 
     try:
         health = await backend.health_check()
-        details["health_check"] = {"status": health.status, "error": health.error}
+        details["health_check"] = {
+            "status": health.status,
+            "error": redact_userinfo_in_text(health.error),
+        }
         if health.status != "healthy":
+            details["health_check"]["error_class"] = _classify_backend_error_text(health.error)
             all_ok = False
     except Exception as e:
-        details["health_check"] = {"status": "error", "error": str(e)}
+        details["health_check"] = {
+            "status": "error",
+            "error": redact_userinfo_in_text(str(e) or type(e).__name__),
+            "error_class": _classify_backend_error(e),
+        }
         all_ok = False
 
     try:
-        services_found = await backend.list_services()
+        services_found = await backend.list_services_uncached()
         details["list_services"] = {"count": len(services_found)}
     except Exception as e:
-        details["list_services"] = {"error": str(e)}
+        details["list_services"] = {
+            "error": redact_userinfo_in_text(str(e) or type(e).__name__),
+            "error_class": _classify_backend_error(e),
+        }
         all_ok = False
 
     return all_ok, details
+
+
+def _readiness_body(all_ok: bool, details: dict[str, Any]) -> dict[str, Any]:
+    """The /ready response body: status and service count as before, and for
+    a failing half only its error class. The route's own deadline message
+    (details["error"], no backend text) passes through unchanged."""
+    body: dict[str, Any] = {"status": "ready" if all_ok else "not_ready"}
+    for key in ("health_check", "list_services"):
+        half = details.get(key)
+        if not isinstance(half, dict):
+            continue
+        public = {field: half[field] for field in ("status", "count") if field in half}
+        if "error" in half:
+            public["error"] = half.get("error_class")
+        body[key] = public
+    if "error" in details:
+        body["error"] = details["error"]
+    return body
+
+
+def _log_readiness_failure(details: dict[str, Any]) -> None:
+    """One WARNING per fresh failed probe (the memo bounds how often this
+    runs) carrying the redacted detail, cut to _MAX_LOGGED_PROBE_ERROR_CHARS
+    and repr()-quoted so the line can never carry a raw control character -
+    the same bound-and-quote shape as the Host/Origin rejection lines."""
+    parts: list[str] = []
+    for key in ("health_check", "list_services"):
+        half = details.get(key)
+        if isinstance(half, dict) and half.get("error") is not None:
+            text = str(half["error"])[:_MAX_LOGGED_PROBE_ERROR_CHARS]
+            parts.append(f"{key}={half.get('status', 'error')} {text!r}")
+    if details.get("error") is not None:
+        parts.append(f"error={str(details['error'])[:_MAX_LOGGED_PROBE_ERROR_CHARS]!r}")
+    logger.warning(f"Readiness probe failed: {'; '.join(parts) or 'no detail'}")
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -347,17 +648,23 @@ async def health_route(request: Request) -> Response:
 async def ready_route(request: Request) -> Response:
     """Readiness - reuses the server's own cached _get_backend() instance
     (never constructs or closes a separate one, unlike `doctor`), so this
-    can never break a real tool call that shares the same backend."""
+    can never break a real tool call that shares the same backend. The
+    probe result is memoized and single-flighted by
+    _run_backend_checks_memoized because this route is unauthenticated and
+    each probe costs the backend real, budgeted work. The body names only
+    an error class per failing half (_readiness_body); the redacted detail,
+    which embeds the backend's internal host:port, goes to the log."""
     try:
         backend = await _get_backend()
     except Exception as e:
-        return JSONResponse({"status": "not_ready", "error": str(e)}, status_code=503)
+        detail = redact_userinfo_in_text(str(e) or type(e).__name__)[:_MAX_LOGGED_PROBE_ERROR_CHARS]
+        logger.warning(f"Readiness probe could not obtain a backend: {detail!r}")
+        return JSONResponse(
+            {"status": "not_ready", "error": _classify_backend_error(e)}, status_code=503
+        )
 
-    all_ok, details = await _run_backend_checks(backend)
-    return JSONResponse(
-        {"status": "ready" if all_ok else "not_ready", **details},
-        status_code=200 if all_ok else 503,
-    )
+    all_ok, details = await _run_backend_checks_memoized(backend)
+    return JSONResponse(_readiness_body(all_ok, details), status_code=200 if all_ok else 503)
 
 
 @mcp.tool(title="Search Traces", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
@@ -533,7 +840,15 @@ async def correlate_trace(trace_id: str) -> CorrelationResult:
     try:
         backend = await _get_backend()
         secondary = await _get_secondary_backend()
-        result = await correlate.correlate_trace(backend, secondary, trace_id=trace_id)
+        # The heuristic fallback's per-service candidate count is a helper-
+        # internal limit with no caller-facing argument; it still goes
+        # through the operator ceiling like every other search limit.
+        result = await correlate.correlate_trace(
+            backend,
+            secondary,
+            trace_id=trace_id,
+            max_candidates_per_service=_clamp_limit(correlate.MAX_CANDIDATES_PER_SERVICE_QUERY),
+        )
         return result
     except Exception as e:
         return _handle_tool_error("correlate_trace", e)
@@ -674,6 +989,7 @@ async def get_llm_model_stats(
     start_time: str | None = None,
     end_time: str | None = None,
     service_name: str | None = None,
+    limit: int = 1000,
 ) -> str:
     """Get detailed performance statistics for a specific LLM model.
 
@@ -685,6 +1001,7 @@ async def get_llm_model_stats(
         start_time: Start time in ISO 8601 format (e.g., 2024-01-01T00:00:00Z)
         end_time: End time in ISO 8601 format
         service_name: Filter by service name
+        limit: Maximum traces to analyze (default: 1000, capped by MAX_TRACES_PER_QUERY / --max-traces-per-query)
 
     Returns:
         JSON string with comprehensive model statistics including duration/token percentiles
@@ -697,6 +1014,7 @@ async def get_llm_model_stats(
             start_time=start_time,
             end_time=end_time,
             service_name=service_name,
+            limit=_clamp_limit(limit),
         )
         return result
     except Exception as e:
@@ -1242,11 +1560,302 @@ def _apply_tool_gating(disable_tools: str | None, enabled_tools: str | None) -> 
         logger.info(f"Tools disabled via --disable-tools: {sorted(disable)}")
 
 
+_MIN_HTTP_BEARER_TOKEN_CHARS = 32
+# Printable ASCII with no whitespace (0x21-0x7E): a superset of RFC 6750's
+# token68 alphabet, and exactly what a client can carry byte-for-byte in an
+# Authorization header - h11 trims surrounding whitespace and header bytes
+# are latin-1, so a value outside this set is accepted at startup but can
+# never be presented: auth "enabled", every client locked out.
+_HTTP_BEARER_TOKEN_CHARS_RE = re.compile(r"[\x21-\x7e]+")
+
+
+class OperatorTokenVerifier(TokenVerifier):
+    """Binds every /mcp request on the HTTP transport to the operator's own
+    shared bearer token.
+
+    fastmcp 4.0.5 only installs RequireAuthMiddleware around the /mcp route
+    when ``FastMCP.auth`` is set (fastmcp/server/http.py, the ``if auth:``
+    branch of create_streamable_http_app); with it unset every network peer
+    that can reach the port runs all 19 tools under the operator's backend
+    credential. This is the smallest AuthProvider that closes that gap for
+    the shared-secret case: no OAuth routes, no metadata endpoints, one
+    constant-time comparison. fastmcp's own StaticTokenVerifier is
+    deliberately not used - its docstring says it must never be used in
+    production (it keeps a plaintext token table and compares with ``==``).
+
+    JWT/OIDC resource-server mode (fastmcp's JWTVerifier / RemoteAuthProvider)
+    is additive through the same ``mcp.auth`` seam if ever wanted.
+    """
+
+    def __init__(self, token: str) -> None:
+        super().__init__()
+        self._expected = token.encode()
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if hmac.compare_digest(token.encode(), self._expected):
+            return AccessToken(token=token, client_id="operator", scopes=[])
+        return None
+
+
+def _validate_http_listener_auth(
+    *, host: str, http_bearer_token: str | None, allow_unauthenticated_http: bool
+) -> None:
+    """Startup gate for ``--transport http``: serving on a non-loopback
+    interface without caller authentication requires an explicit operator
+    acknowledgement. Raises click.UsageError (exit code 2, message on
+    stderr) - called from main() *before* its ``try:`` so the catch-all
+    ``except Exception`` there can never swallow the usage error into a
+    logged 'Server error' and exit 1."""
+    if http_bearer_token is not None:
+        if len(http_bearer_token) < _MIN_HTTP_BEARER_TOKEN_CHARS:
+            raise click.UsageError(
+                "MCP_HTTP_BEARER_TOKEN / --http-bearer-token must be at least "
+                f"{_MIN_HTTP_BEARER_TOKEN_CHARS} characters (got {len(http_bearer_token)}); "
+                "generate one with `openssl rand -hex 32`."
+            )
+        if not _HTTP_BEARER_TOKEN_CHARS_RE.fullmatch(http_bearer_token):
+            # Static text: the value is a credential and is never echoed.
+            raise click.UsageError(
+                "MCP_HTTP_BEARER_TOKEN / --http-bearer-token must consist of printable "
+                "ASCII characters with no whitespace (RFC 6750 token68 characters such as "
+                "the output of `openssl rand -hex 32`); the value given contains other "
+                "characters and no client could present it in an Authorization header."
+            )
+        return
+    if is_loopback_host(host) or allow_unauthenticated_http:
+        return
+    raise click.UsageError(
+        f"--transport http on a non-loopback host ({host}) exposes every tool to any "
+        "network peer with no authentication. Either set MCP_HTTP_BEARER_TOKEN (preferred; "
+        "clients then send `Authorization: Bearer <token>`), bind loopback with "
+        "`--host 127.0.0.1` behind an authenticating reverse proxy, or pass "
+        "--allow-unauthenticated-http (MCP_ALLOW_UNAUTHENTICATED_HTTP=true) to accept "
+        "that risk explicitly."
+    )
+
+
 _LOCAL_ORIGIN_PATTERN = re.compile(r"^https?://(127\.0\.0\.1|localhost)(:\d+)?$", re.IGNORECASE)
+
+# Upper bound on how much of a rejected Host/Origin header value reaches the
+# log. OriginValidationMiddleware logs before RateLimitMiddleware runs, so
+# without a bound one unauthenticated peer could write header-sized,
+# attacker-chosen text to the log on every request.
+_MAX_LOGGED_HEADER_CHARS = 128
+
+
+def _parse_csv_option(value: str | None) -> list[str] | None:
+    """Comma-separated CLI/env value -> trimmed, non-empty items; None stays None
+    so callers can tell "not configured" from "configured empty"."""
+    if value is None:
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _canonical_hostname(host: str) -> str:
+    """One normal form per name so the allowlist and the Host header compare
+    equal however each was spelled: one trailing dot (the FQDN spelling)
+    removed, and an IPv6 literal in its RFC 5952 compressed form. Before
+    this, is_loopback_host accepted ``localhost.`` while an allowlisted
+    ``verify.local`` rejected ``verify.local.``, and an allowlisted IPv6
+    literal was compared as text, so its expanded spelling answered 421
+    (runtime verification prober-1 F7). IPv4 spellings are deliberately
+    not canonicalised: ``127.1`` / ``0x7f000001`` stay refused."""
+    if host.endswith("."):
+        if host.endswith(".."):
+            # Two or more trailing dots name nothing. Return the value untouched so neither
+            # is_loopback_host (whose normaliser strips one dot itself) nor an allowlist entry
+            # (which may carry at most one) can match it: with one strip here and one there,
+            # 'localhost..' answered 200 on a loopback bind (final-pass verification).
+            return host
+        host = host[:-1]
+    if ":" in host:
+        with suppress(ValueError):
+            return str(ipaddress.IPv6Address(host))
+    return host
+
+
+def _hostname_from_host_header(value: str) -> str:
+    """Lower-cased, canonical (see _canonical_hostname) host part of a Host
+    header value: ``[v6]:port`` -> ``v6``, ``name:port`` -> ``name``, a
+    missing/blank header -> ``""``. Used for the allowlist entries and the
+    bound address as well as for every request, so both sides of the
+    comparison take the same path. A malformed bracketed value - an unclosed
+    ``[``, or anything after the ``]`` other than ``:<port>`` or the end of
+    the value (``[::1]evil.example``, runtime verification prober-1 F7, which
+    used to pass as ``::1`` because the tail was ignored) - is returned
+    whole: it is then no loopback spelling and equals no allowlist entry
+    (the startup validator refuses the shape), so the request answers 421
+    like every other refused Host."""
+    # ASCII whitespace only: str.strip() also removes a latin-1 NBSP (0xA0) or NEL (0x85)
+    # h11 decodes from the header bytes, which let 'verify.local\xa0' match the allowlist
+    # and '[::1]\xa0' pass as loopback (delta verification).
+    value = value.strip(" \t\r\n").lower()
+    if not value:
+        return ""
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            return value
+        tail = value[end + 1 :]
+        if tail and not (tail.startswith(":") and tail[1:].isascii() and tail[1:].isdigit()):
+            return value
+        return _canonical_hostname(value[1:end])
+    if value.count(":") > 1:
+        # Bare IPv6 literal (not valid in a Host header, but never a port).
+        return _canonical_hostname(value)
+    host, _, port = value.rpartition(":")
+    if host and port.isdigit():
+        return _canonical_hostname(host)
+    return _canonical_hostname(value)
+
+
+def _is_unspecified_address(hostname: str) -> bool:
+    """True for the wildcard binds 0.0.0.0 / :: - a listener bound there has
+    no single legitimate name to add to a Host allowlist."""
+    try:
+        return ipaddress.ip_address(hostname).is_unspecified
+    except ValueError:
+        return False
+
+
+# Upper bound on how much of a rejected option value a startup usage error
+# echoes back: enough to recognise a typo, never a whole pasted document.
+_MAX_OPTION_VALUE_REPR_CHARS = 64
+
+# One hostname label as the Host allowlist accepts it: RFC 1123's letters,
+# digits and hyphens (no leading or trailing hyphen, 1-63 characters) plus
+# "_" anywhere in the label - a deliberate superset, because Docker Compose
+# service names and other internal resolvers accept underscores (trace_hub,
+# _svc._tcp.example) and browsers send them in Host unchanged; refusing
+# them at startup only locked operators out of names that resolve (round-2
+# review of the validator). Whitespace, "!" and every other character stay
+# refused, as do empty labels.
+_HOSTNAME_LABEL_RE = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?")
+
+
+def _bounded_repr(value: str) -> str:
+    text = repr(value)
+    if len(text) > _MAX_OPTION_VALUE_REPR_CHARS:
+        text = text[: _MAX_OPTION_VALUE_REPR_CHARS - 3] + "..."
+    return text
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_allowlist_hostname(name: str) -> bool:
+    """Dot-separated labels per _HOSTNAME_LABEL_RE (RFC 1123 plus "_"), at
+    most 253 characters, one optional trailing dot (the FQDN spelling)."""
+    if name.endswith("."):
+        name = name[:-1]
+    if not name or len(name) > 253:
+        return False
+    return all(_HOSTNAME_LABEL_RE.fullmatch(label) for label in name.split("."))
+
+
+def _validate_allowed_hosts_option(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> str | None:
+    """Option callback for --allowed-hosts / MCP_ALLOWED_HOSTS. Startup used
+    to accept '*,example.test' (the listed name silently ignored, because
+    '*' disables Host validation) and 'bad host!' (an entry no Host header
+    can ever equal, so a 421 for every request). Each entry must parse as
+    an IP literal or a hostname (RFC 1123 labels, underscores allowed - see
+    _HOSTNAME_LABEL_RE) after the port is stripped, and '*' may only stand
+    alone."""
+    if value is None:
+        return None
+    entries = _parse_csv_option(value) or []
+    if "*" in entries and len(entries) > 1:
+        raise click.BadParameter(
+            "'*' disables Host validation entirely and must be the only entry; list the "
+            "accepted hostnames instead, or pass '*' alone to opt out"
+        )
+    for entry in entries:
+        if entry == "*":
+            continue
+        if entry.endswith(".."):
+            # One trailing dot is the FQDN spelling; two passed here (one strip each in
+            # _hostname_from_host_header and _is_allowlist_hostname) and then matched no
+            # real Host at runtime (delta verification).
+            raise click.BadParameter(
+                f"{_bounded_repr(entry)} ends in more than one trailing dot; a hostname may "
+                "carry one"
+            )
+        hostname = _hostname_from_host_header(entry)
+        if not (_is_ip_literal(hostname) or _is_allowlist_hostname(hostname)):
+            raise click.BadParameter(
+                f"{_bounded_repr(entry)} is not a hostname or IP literal; entries are "
+                "comma-separated names, IPv4 literals or [IPv6] literals, each with an "
+                "optional :port, or the single value '*'"
+            )
+    return value
+
+
+def _validate_forwarded_allow_ips_option(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> str | None:
+    """Option callback for --forwarded-allow-ips / FORWARDED_ALLOW_IPS.
+    uvicorn's ProxyHeadersMiddleware keeps an entry it cannot parse as an
+    IP network ('not-an-ip', '999.1.1.1', a CIDR with host bits set) as a
+    literal compared against the peer address, so the proxy the operator
+    meant to trust silently never was. Entries must parse with
+    ipaddress.ip_network (strict, as uvicorn parses them); '*' may only
+    stand alone."""
+    if value is None:
+        return None
+    entries = _parse_csv_option(value) or []
+    if "*" in entries and len(entries) > 1:
+        raise click.BadParameter(
+            "'*' trusts X-Forwarded-For from every peer and must be the only entry"
+        )
+    for entry in entries:
+        if entry == "*":
+            continue
+        try:
+            ipaddress.ip_network(entry)
+        except ValueError:
+            raise click.BadParameter(
+                f"{_bounded_repr(entry)} is not an IP address or CIDR network; entries are "
+                "comma-separated IPv4/IPv6 addresses or networks, or the single value '*'"
+            ) from None
+    return value
 
 
 class OriginValidationMiddleware(BaseHTTPMiddleware):
-    """Validate the Origin header on requests to the streamable-http transport.
+    """Validate the Host and Origin headers on requests to the streamable-http
+    transport.
+
+    Host rule (DNS-rebinding defence proper). A page served from
+    ``attacker.example`` whose name is then re-pointed at 127.0.0.1 issues a
+    same-origin GET that carries ``Host: attacker.example:8000`` and - per
+    the Fetch standard for same-origin GET/HEAD - no Origin header at all,
+    so an Origin-only check lets it reach /ready and /mcp. When the
+    legitimate names are known the Host header is therefore checked *first*:
+    automatically for a loopback bind (``--host 127.0.0.1`` / ``localhost`` /
+    ``::1``, main()'s default), and for any deployment that sets
+    ``--allowed-hosts``. Accepted names are every loopback spelling, the
+    bound address itself when it is a specific (non-wildcard) address, and
+    the ``--allowed-hosts`` entries, compared case-insensitively with the
+    port stripped; anything else answers ``421 Misdirected Request`` before
+    any route runs. A wildcard bind (``0.0.0.0`` / ``::``, the Dockerfile
+    CMD) has no single legitimate name, so it performs no Host validation
+    unless ``--allowed-hosts`` names the public hostnames; ``--allowed-hosts
+    '*'`` is the explicit opt-out. Constructed with no kwargs (bind_host and
+    allowed_hosts both None) the middleware keeps its pre-existing
+    Origin-only contract.
+
+    Origin rule. fastmcp 3.2.0 built its StreamableHTTPSessionManager without
+    passing security_settings through at all, leaving the upstream mcp SDK's
+    own DNS-rebinding/Origin protection (mcp.server.transport_security)
+    disabled by omission. Re-verified against the real installed fastmcp
+    4.0.5 (fastmcp/server/http.py:668-682, not assumed unchanged from
+    3.2.0): the gap is now an explicit, unconditional
 
     fastmcp 3.2.0 built its StreamableHTTPSessionManager without passing
     security_settings through at all, leaving the upstream mcp SDK's own
@@ -1264,10 +1873,14 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     `mcp.http_app(transport=..., middleware=[...])` call never sets it - so
     fastmcp's own native alternative is never actually inserted for this
     deployment, and the underlying SDK protection stays disabled either way.
-    This middleware remains fully necessary, unchanged, satisfying the MCP
-    spec's (2025-06-18 basic/transports) MUST-requirement for Streamable HTTP
+    This middleware remains fully necessary, satisfying the MCP spec's
+    (2025-06-18 basic/transports) MUST-requirement for Streamable HTTP
     servers to validate the Origin header regardless of which fastmcp
-    version is running.
+    version is running. fastmcp's guard was deliberately not adopted for the
+    Host rule either: once given an explicit allowlist it also enforces its
+    own Origin policy, which rejects the local-dev Origin allowance below
+    whenever the Host is a non-loopback name - the in-repo check keeps one
+    allowlist and the Origin semantics byte-for-byte.
 
     A request with no Origin header is allowed through unmodified: Origin can
     be absent for same-origin requests, and most MCP HTTP clients are not
@@ -1290,12 +1903,49 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     _LOCAL_ORIGIN_PATTERN above - either would widen exactly the
     DNS-rebinding/cross-origin attack surface this middleware exists to
     close.
+
+    Both rejection paths log at WARNING so a misconfigured MCP_ALLOWED_HOSTS
+    or client Origin is diagnosable from the server log. This middleware runs
+    before RateLimitMiddleware (Starlette applies the middleware list
+    outermost-first and main() places this class first), so an
+    unauthenticated peer can trigger one such line per request. Accepted
+    limitation, bounded rather than reordered: the logged value is cut to
+    _MAX_LOGGED_HEADER_CHARS and repr()-escaped, so each line carries at most
+    that much attacker-chosen text and can never contain a raw newline.
     """
 
+    def __init__(
+        self,
+        app: Any,
+        bind_host: str | None = None,
+        allowed_hosts: Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(app)
+        self._validate_host = allowed_hosts is not None or is_loopback_host(bind_host)
+        self._host_wildcard = allowed_hosts is not None and "*" in allowed_hosts
+        allowlist: set[str] = set()
+        if bind_host:
+            bound = _hostname_from_host_header(bind_host)
+            if bound and not _is_unspecified_address(bound):
+                allowlist.add(bound)
+        for name in allowed_hosts or ():
+            normalized = _hostname_from_host_header(name)
+            if normalized and normalized != "*":
+                allowlist.add(normalized)
+        self._host_allowlist = frozenset(allowlist)
+
+    def _host_is_allowed(self, request: Request) -> bool:
+        hostname = _hostname_from_host_header(request.headers.get("host", ""))
+        return is_loopback_host(hostname) or hostname in self._host_allowlist
+
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        if self._validate_host and not self._host_wildcard and not self._host_is_allowed(request):
+            host = request.headers.get("host", "")[:_MAX_LOGGED_HEADER_CHARS]
+            logger.warning(f"Unexpected Host header: {host!r}")
+            return Response("Misdirected Request", status_code=421)
         origin = request.headers.get("origin")
         if origin and not _LOCAL_ORIGIN_PATTERN.match(origin):
-            logger.warning(f"Invalid Origin header: {origin}")
+            logger.warning(f"Invalid Origin header: {origin[:_MAX_LOGGED_HEADER_CHARS]!r}")
             return Response("Invalid Origin header", status_code=403)
         return await call_next(request)
 
@@ -1337,13 +1987,16 @@ class _FixedWindowRateLimiter:
 
         Known, accepted limitation (see RateLimitMiddleware's own
         docstring for the full rationale): this sweep - like the limiter
-        as a whole - is keyed on request.client.host only. A source
-        rotating its IP on every request always starts a brand-new,
-        never-before-seen bucket at count 0, so the per-IP cap never
-        engages against that source's aggregate volume. That is a
-        structural limitation of pure per-IP fixed-window limiting, not
-        something this sweep (or a bigger one) can fix - it would need
-        additional infra (e.g. a WAF) to address.
+        as a whole - is keyed on request.client.host, i.e. the TCP peer
+        address (or, only for connections from a proxy listed in
+        --forwarded-allow-ips, the right-most untrusted X-Forwarded-For
+        entry uvicorn substitutes for it). A source rotating its address
+        on every request always starts a brand-new, never-before-seen
+        bucket at count 0, so the per-peer cap never engages against that
+        source's aggregate volume. That is a structural limitation of pure
+        per-peer fixed-window limiting, not something this sweep (or a
+        bigger one) can fix - it would need additional infra (e.g. a WAF)
+        to address.
         """
         if now - self._last_swept < self._window_seconds:
             return
@@ -1371,21 +2024,27 @@ class _FixedWindowRateLimiter:
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Per-client-IP fixed-window rate limiter for the streamable-http
+    """Per-peer fixed-window rate limiter for the streamable-http
     transport. Bare 429 on breach.
 
-    Known v1 limitation: keys on request.client.host only, with no
-    X-Forwarded-For parsing - this codebase has no trusted-proxy allowlist
-    anywhere to validate that header against, and trusting a client-
-    supplied header without one would make the limiter trivially
-    bypassable. A direct consequence: a source rotating its IP on every
-    request is never capped, since each never-before-seen IP always
-    starts its own bucket at count 0 - the per-IP cap only ever bounds a
-    single, stable IP's own volume, never a rotating source's aggregate
-    volume. This is a known, accepted structural limitation of pure
-    per-IP fixed-window limiting, not something fixable at this layer -
-    mitigating it would need additional infra (e.g. a WAF) in front of
-    this server.
+    The key is request.client.host - the TCP peer address as the served
+    process sees it. This middleware parses no X-Forwarded-For itself, but
+    uvicorn's ProxyHeadersMiddleware (defaulted ON by uvicorn, trusting
+    127.0.0.1 or FORWARDED_ALLOW_IPS implicitly) rewrites scope["client"]
+    from that header for connections it trusts *before* this code runs,
+    which would let any loopback peer - a pass-through proxy, an ssh -L /
+    socat tunnel, another local user - pick its own key. main() therefore
+    builds the uvicorn.Config with proxy_headers disabled unless the
+    operator names the proxies via --forwarded-allow-ips /
+    FORWARDED_ALLOW_IPS (see _build_uvicorn_config); only then, and only
+    for connections from those addresses, does the right-most untrusted
+    X-Forwarded-For entry replace the TCP peer as the key.
+
+    Known structural limitation: a source rotating its address on every
+    request is never capped, since each never-before-seen address starts
+    its own bucket at count 0 - the per-peer cap bounds a single, stable
+    peer's own volume, never a rotating source's aggregate. Mitigating
+    that would need additional infra (e.g. a WAF) in front of this server.
     """
 
     def __init__(
@@ -1404,6 +2063,240 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             logger.warning(f"Rate limit exceeded for client {client_ip}")
             return Response("Rate limit exceeded", status_code=429)
         return await call_next(request)
+
+
+# Parity with the mcp SDK's own DEFAULT_SESSION_IDLE_TIMEOUT (30 min), which
+# every other mcp-based streamable-HTTP server already applies; fastmcp 4.0.5
+# is the odd one out in overriding it to "never" (see _build_http_app).
+_DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS = 1800.0
+
+
+def _require_finite_seconds(ctx: click.Context, param: click.Parameter, value: float) -> float:
+    """Option callback for the duration options (--session-idle-timeout-seconds,
+    --readiness-cache-seconds, --rate-limit-window-seconds).
+    click.FloatRange(min=0, ...) still admits
+    ``inf`` (``inf > 0`` holds) and ``nan``
+    (every comparison against it is False), and the mcp SDK's
+    StreamableHTTPSessionManager raises ValueError for both only at lifespan
+    start - the same late, cryptic 'Server error' / exit 1 the range check
+    exists to prevent. Rejecting them here keeps every bad value a usage error
+    with exit code 2 before the app is built."""
+    if not math.isfinite(value):
+        raise click.BadParameter("must be a finite number of seconds")
+    return value
+
+
+def _build_http_app(
+    middleware: list[Middleware], *, session_idle_timeout_seconds: float, stateless_http: bool
+) -> StarletteWithLifespan:
+    """The one place main() turns `mcp` into the streamable-HTTP Starlette app.
+
+    fastmcp 4.0.5's http_app() resolves an unset session_idle_timeout from
+    its own ``settings.http_session_idle_timeout``, whose default is None -
+    "sessions never expire from inactivity" - and forwards that None into
+    the mcp SDK's StreamableHTTPSessionManager, overriding the SDK's own
+    1800 s default. With the SDK's 10,000-session cap left in place, one
+    peer could then fill the shared session table with bare initialize
+    POSTs and make every new client's initialize answer 503 until restart.
+    Always passing a finite bound here restores the SDK behaviour; an idle
+    session's id answers 404 and spec-compliant clients re-initialize.
+
+    In stateless mode no per-peer state exists, so the timeout is passed as
+    None (the SDK ignores it there anyway).
+    """
+    return mcp.http_app(
+        transport="streamable-http",
+        middleware=middleware,
+        stateless_http=stateless_http,
+        session_idle_timeout=None if stateless_http else session_idle_timeout_seconds,
+    )
+
+
+# Longest already-rendered access line AccessLogQueryStringFilter rewrites.
+# uvicorn's own five-tuple records never reach this path (and their target is
+# bounded by h11's request-line limit); a differently configured access
+# logger that hands over a longer pre-rendered line is not logging a request
+# line any HTTP parser accepted, so the record is dropped rather than scanned.
+_MAX_ACCESS_LOG_LINE_CHARS = 8 * 1024
+# The ASCII whitespace an access line can contain between its tokens.
+_WHITESPACE_CHARS = " \t\r\n\x0b\x0c"
+
+
+def _cut_rendered_target_query(message: str) -> str:
+    """`message` with everything after the path of its quoted request line(s)
+    removed - the separators of _ACCESS_LOG_TARGET_CUT_RE
+    ('... "POST /mcp?x=1 HTTP/1.1" 401' -> '... "POST /mcp HTTP/1.1" 401').
+
+    Anchored on the request line, not on the first "?": every "HTTP/" that is
+    preceded by whitespace ends a request target, the target is the
+    whitespace-free token right before that whitespace, and a separator is cut
+    only inside such a token. A custom access format that puts a referer (with its
+    own "?") or a user agent (even one reading "HTTP/1.1") before the request
+    line therefore still loses the target's query string (round-2 review of
+    the first linear scan, which cut at the first "?" of the line). Every
+    step advances or is a bounded str.find/rfind, so the cost stays linear in
+    the line - the regex this replaced, r"\\?\\S*(?=\\s+HTTP/)", re-scanned
+    the rest of the line from every "?" and took 2.2 s on 16 KiB of "?".
+    Anything else is returned unchanged."""
+    pieces: list[str] = []
+    copied_to = 0  # start of the not-yet-emitted remainder
+    floor = 0  # tokens before this index were already examined
+    search_from = 0
+    while True:
+        marker = message.find("HTTP/", search_from)
+        if marker == -1:
+            break
+        search_from = marker + 1
+        if marker == 0 or not message[marker - 1].isspace():
+            continue
+        target_end = marker
+        while target_end > floor and message[target_end - 1].isspace():
+            target_end -= 1
+        token_start = max(message.rfind(ch, floor, target_end) for ch in _WHITESPACE_CHARS) + 1
+        token_start = max(token_start, floor)
+        floor = marker
+        cut = _ACCESS_LOG_TARGET_CUT_RE.search(message, token_start, target_end)
+        if cut is None:
+            continue
+        pieces.append(message[copied_to : cut.start()])
+        copied_to = target_end
+    if not pieces:
+        return message
+    pieces.append(message[copied_to:])
+    return "".join(pieces)
+
+
+# Where a request target stops being a path: the query string, a fragment (h11 accepts "#"
+# in the target and uvicorn quotes it as %23), a matrix parameter (uvicorn quotes its ";" as
+# %3B, so a raw ";" only ever arrives from a custom access format that logs the unquoted
+# target - the final verification pass found the ";" branch alone never matched a real
+# request), and the percent-encoded spellings of "?" and "#" - every place a client can
+# put a token besides a path segment.
+_ACCESS_LOG_TARGET_CUT_RE = re.compile(r"[?#;]|%3[fF]|%23|%3[bB]")
+_MAX_LOGGED_TARGET_CHARS = 2048
+
+
+def _cut_access_log_target(target: str) -> str:
+    """uvicorn's request target with everything after the path removed and the path bounded.
+
+    Runtime verification of PR #41 (delta probe P5b) placed a token in a fragment, a
+    percent-encoded "?", a matrix parameter and a 12 KiB path: nine access lines carried it
+    verbatim because only "?" was cut and the length bound applied to pre-rendered records
+    only. A token placed in a PATH SEGMENT is indistinguishable from a path and stays - the
+    README says so; the access log is off by default for exactly this class of leak."""
+    match = _ACCESS_LOG_TARGET_CUT_RE.search(target)
+    if match:
+        target = target[: match.start()]
+    if len(target) > _MAX_LOGGED_TARGET_CHARS:
+        target = target[:_MAX_LOGGED_TARGET_CHARS] + "...[cut]"
+    return target
+
+
+class AccessLogQueryStringFilter(logging.Filter):
+    """Strips the query string from uvicorn's access-log request line.
+
+    uvicorn's default access log (INFO, on by default, written to stdout)
+    records the full request target. A client that presents the operator
+    bearer token in the query string (?access_token=..., ?token=...) is
+    refused with 401 and the token is never echoed in a body or header,
+    but that one line put it verbatim in the server log (runtime
+    verification prober-1 L01). main() therefore serves with
+    access_log=False - this project logs rejected Host/Origin values,
+    rate-limit breaches, slow backend requests and tool errors itself, and
+    exports per-call spans when OTel is configured - and this filter sits
+    on the ``uvicorn.access`` logger so an access log an operator turns
+    back on (any handler on that logger re-enables it) cannot leak either.
+
+    uvicorn 0.40 logs ``'%s - "%s %s HTTP/%s" %d'`` with the five-tuple
+    (client_addr, method, target, http_version, status); its
+    AccessFormatter unpacks ``record.args`` positionally, so the target is
+    replaced inside a same-shaped tuple rather than by pre-rendering the
+    message. Any other record shape is stripped on the rendered text by a
+    linear scan (_cut_rendered_target_query), and a rendered line longer
+    than _MAX_ACCESS_LOG_LINE_CHARS is dropped instead - no request line
+    that long was ever accepted by an HTTP parser, and the filter runs in
+    the logging caller, so it spends neither time nor output on one. Never
+    raises: a logger-level filter runs inside the logging caller (uvicorn's
+    protocol code), where an exception would abort the request; a record
+    the filter cannot read passes through unmodified.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return self._strip_query_string(record)
+        except Exception:
+            return True
+
+    @staticmethod
+    def _strip_query_string(record: logging.LogRecord) -> bool:
+        """True to keep the (possibly rewritten) record, False to drop it."""
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            cut = _cut_access_log_target(args[2])
+            if cut != args[2]:
+                record.args = (*args[:2], cut, *args[3:])
+            return True
+        message = record.getMessage()
+        if len(message) > _MAX_ACCESS_LOG_LINE_CHARS:
+            return False
+        stripped = _cut_rendered_target_query(message)
+        if stripped != message:
+            record.msg = stripped
+            record.args = None
+        return True
+
+
+_ACCESS_LOG_QUERY_FILTER = AccessLogQueryStringFilter()
+
+
+def _build_uvicorn_config(
+    app: Any,
+    *,
+    host: str,
+    port: int,
+    graceful_shutdown_timeout_seconds: int,
+    forwarded_allow_ips: str | None,
+    access_log: bool = False,
+) -> uvicorn.Config:
+    """The uvicorn.Config main() serves the HTTP app with.
+
+    uvicorn 0.40.0 defaults ``proxy_headers=True`` and, when
+    ``forwarded_allow_ips`` is None, resolves the trusted set from the
+    FORWARDED_ALLOW_IPS environment variable or "127.0.0.1" - so by default
+    any loopback peer's X-Forwarded-For rewrote request.client.host, the
+    RateLimitMiddleware key. Passing ``proxy_headers=forwarded_allow_ips is
+    not None`` means uvicorn's implicit fallback is never consulted: the
+    header is honoured only for connections from the proxies the operator
+    named (the CLI option deliberately reuses uvicorn's FORWARDED_ALLOW_IPS
+    env var name, so operators who already set it see identical behaviour).
+
+    ``access_log`` defaults to False: uvicorn's access line carries the full
+    request target, query string included, so a token a client put there was
+    logged verbatim (see AccessLogQueryStringFilter). Operators who want
+    request lines opt in with --access-log / MCP_ACCESS_LOG. The filter is
+    attached to the ``uvicorn.access`` logger after Config.__init__ has run
+    its dictConfig (which resets that logger's handlers, not its filters;
+    addFilter is idempotent for the same instance), so a re-enabled access
+    log is stripped of query strings too.
+    """
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        lifespan="on",
+        # Preserves run_http_async's own default (lost by bypassing it) for
+        # the connection/task-draining wait uvicorn does BEFORE dispatching
+        # lifespan.shutdown - unrelated to the drain feature itself, which
+        # fires after this. Exposed as --graceful-shutdown-timeout-seconds
+        # so a real signal-timing test can widen it deterministically
+        # instead of relying on this project's own default margin.
+        timeout_graceful_shutdown=graceful_shutdown_timeout_seconds,
+        proxy_headers=forwarded_allow_ips is not None,
+        forwarded_allow_ips=forwarded_allow_ips,
+        access_log=access_log,
+    )
+    logging.getLogger("uvicorn.access").addFilter(_ACCESS_LOG_QUERY_FILTER)
+    return config
 
 
 _BACKEND_CLOSE_TIMEOUT_SECONDS = 5.0
@@ -1507,6 +2400,86 @@ def _install_shutdown_drain(
     app.router.lifespan_context = combined_lifespan
 
 
+# The CLI flag that overrides a configuration field, by the field name
+# pydantic reports in a ValidationError's loc. The env var needs no table: it
+# is the upper-cased, "_"-joined loc (BACKEND_URL, MAX_TRACES_PER_QUERY),
+# because config.py names every variable after its field. The secondary
+# backend has env vars only.
+_CONFIG_FIELD_FLAGS: dict[str, str] = {
+    "type": "--backend",
+    "url": "--url",
+    "api_key": "--api-key",
+    "app_key": "--app-key",
+    "sentry_org": "--sentry-org",
+    "sentry_project": "--sentry-project",
+    "tempo_instance_id": "--tempo-instance-id",
+    "aws_region": "--aws-region",
+    "newrelic_account_id": "--newrelic-account-id",
+    "honeycomb_dataset": "--honeycomb-dataset",
+    "environments": "--environments",
+    "log_level": "--log-level",
+    "max_traces_per_query": "--max-traces-per-query",
+    "slow_request_threshold_ms": "--slow-request-threshold-ms",
+    "query_cache_ttl_seconds": "--query-cache-ttl-seconds",
+    "query_cache_max_entries": "--query-cache-max-entries",
+}
+# A bare TypeAdapter error is titled after pydantic's internal validator
+# wrapper, "function-wrap[wrap_val()]", and may prefix its messages the same
+# way; operator text names options, never pydantic internals.
+_PYDANTIC_WRAPPER_RE = re.compile(r"function-[a-z]+\[[^\]]*\]")
+_PYDANTIC_WRAPPER_PREFIX_RE = re.compile(r"^(?:function-[a-z]+\[[^\]]*\]:\s*)+")
+
+
+def _config_error_name(title: str, loc: tuple[int | str, ...]) -> str:
+    """The operator-facing spelling of a ValidationError location: the env
+    var and, where one exists, the CLI flag ("BACKEND_URL (--url)",
+    "BACKEND_TIMEOUT"); "configuration" for an error pydantic reports with
+    no location at all."""
+    parts = [str(part) for part in loc]
+    if not parts:
+        return "configuration"
+    if title == "BackendConfig":
+        # Validated on its own (not as ServerConfig's `backend` field), the
+        # model's fields are still the primary backend's variables.
+        parts = ["backend", *parts]
+    name = "_".join(parts).upper()
+    flag = _CONFIG_FIELD_FLAGS.get(parts[-1]) if parts[0] != "secondary_backend" else None
+    return f"{name} ({flag})" if flag else name
+
+
+def _format_config_error(error: Exception) -> str:
+    """The text main() and doctor report for a failed configuration load.
+
+    A pydantic ValidationError's str() appends input_value=<the raw value>
+    to every error, truncated by pydantic-core to 24 + "..." + 23
+    characters. For a credentialed URL that cut removed the "@"
+    redact_userinfo_in_text keys on, so the password prefix was printed
+    (runtime verification P7b). config._reject_url_userinfo now keeps such
+    a URL out of pydantic altogether; this is the second half: only each
+    error's location and message are reported - never input_value, never
+    str(exc) - and the result passes through the redaction once more in
+    case a message itself quotes a URL. The location is rendered as the
+    option the operator set (_config_error_name) and pydantic's internal
+    validator names are dropped: a bare TypeAdapter error used to render as
+    "function-wrap[wrap_val()]: function-wrap[wrap_val()]: Input should be
+    a valid URL ..." with no option name (round-2 review).
+    """
+    if isinstance(error, ValidationError):
+        problems = "; ".join(
+            f"{_config_error_name(error.title, err['loc'])}: "
+            f"{_PYDANTIC_WRAPPER_PREFIX_RE.sub('', err['msg'])}"
+            for err in error.errors(include_url=False, include_input=False)
+        )
+        text = (
+            problems
+            if _PYDANTIC_WRAPPER_RE.fullmatch(error.title)
+            else f"{error.title}: {problems}"
+        )
+    else:
+        text = str(error)
+    return redact_userinfo_in_text(text)
+
+
 def _print_config_backend_dict(backend_config: BackendConfig) -> dict[str, Any]:
     """Shape shared by --print-config's "backend"/"secondary_backend" keys.
     Built by hand, not model_dump(): sentry_org/sentry_project/
@@ -1514,9 +2487,10 @@ def _print_config_backend_dict(backend_config: BackendConfig) -> dict[str, Any]:
     they are not secrets (only api_key/app_key are)."""
     return {
         "type": backend_config.type,
-        "url": str(backend_config.url),
+        "url": redact_url_userinfo(backend_config.url),
         "environments": backend_config.environments,
         "timeout": backend_config.timeout,
+        "max_response_bytes": backend_config.max_response_bytes,
         "sentry_org": backend_config.sentry_org,
         "sentry_project": backend_config.sentry_project,
         "tempo_instance_id": backend_config.tempo_instance_id,
@@ -1624,10 +2598,12 @@ def _backend_config_options(f: Any) -> Any:
 @click.option(
     "--host",
     type=str,
-    default="0.0.0.0",  # noqa: S104 - HTTP transport is documented for network/Docker deployment, where binding only to loopback would make the exposed port unreachable; pass --host 127.0.0.1 explicitly for a loopback-only server.
+    default="127.0.0.1",
     envvar="MCP_HOST",
     help="Host to bind HTTP server to (only for --transport http, default: "
-    "0.0.0.0, overrides MCP_HOST env var)",
+    "127.0.0.1 per the MCP spec's loopback guidance; a non-loopback host such "
+    "as 0.0.0.0 additionally requires MCP_HTTP_BEARER_TOKEN or "
+    "--allow-unauthenticated-http, overrides MCP_HOST env var)",
 )
 @click.option(
     "--port",
@@ -1636,6 +2612,55 @@ def _backend_config_options(f: Any) -> Any:
     envvar="MCP_PORT",
     help="Port for HTTP server (only for --transport http, default: 8000, "
     "overrides MCP_PORT env var)",
+)
+@click.option(
+    "--http-bearer-token",
+    type=str,
+    default=None,
+    envvar="MCP_HTTP_BEARER_TOKEN",
+    help="Shared bearer token every /mcp request must present as "
+    "`Authorization: Bearer <token>` (only for --transport http; at least "
+    f"{_MIN_HTTP_BEARER_TOKEN_CHARS} printable ASCII characters with no whitespace, "
+    "e.g. `openssl rand -hex 32`; an empty value, set or passed, is refused). "
+    "Prefer the MCP_HTTP_BEARER_TOKEN env var over this flag: argv is visible "
+    "to every local user via `ps`. /health and /ready stay unauthenticated.",
+)
+@click.option(
+    "--allow-unauthenticated-http",
+    is_flag=True,
+    default=False,
+    envvar="MCP_ALLOW_UNAUTHENTICATED_HTTP",
+    help="Acknowledge serving --transport http on a non-loopback --host with "
+    "no MCP_HTTP_BEARER_TOKEN, i.e. every network peer runs every tool under "
+    "the operator's backend credential (default: refuse to start; overrides "
+    "MCP_ALLOW_UNAUTHENTICATED_HTTP env var)",
+)
+@click.option(
+    "--allowed-hosts",
+    type=str,
+    default=None,
+    callback=_validate_allowed_hosts_option,
+    envvar="MCP_ALLOWED_HOSTS",
+    show_envvar=True,
+    help="Comma-separated hostnames/IP literals accepted in the Host header "
+    "besides loopback names and the bound address; any other Host answers 421 "
+    "(DNS-rebinding defence). A loopback --host validates Host automatically; "
+    "a network bind only validates when this is set; the single value '*' "
+    "disables Host validation (only for --transport http, overrides "
+    "MCP_ALLOWED_HOSTS env var)",
+)
+@click.option(
+    "--forwarded-allow-ips",
+    type=str,
+    default=None,
+    callback=_validate_forwarded_allow_ips_option,
+    envvar="FORWARDED_ALLOW_IPS",
+    show_envvar=True,
+    help="Comma-separated proxy IPs/CIDRs (or '*') whose X-Forwarded-For may "
+    "replace the TCP peer address as the rate-limit key. Unset (default): the "
+    "header is never trusted, not even from 127.0.0.1 - uvicorn's own implicit "
+    "default is deliberately not applied. Same env var uvicorn honours (only "
+    "for --transport http, overrides FORWARDED_ALLOW_IPS env var)",
 )
 @click.option(
     "--include-args-in-spans",
@@ -1647,6 +2672,18 @@ def _backend_config_options(f: Any) -> Any:
     "contain sensitive data - overrides MCP_INCLUDE_ARGS_IN_SPANS env var)",
 )
 @click.option(
+    "--trust-client-trace-context/--no-trust-client-trace-context",
+    default=None,
+    envvar="MCP_TRUST_CLIENT_TRACE_CONTEXT",
+    help="When OTel self-instrumentation is enabled, adopt the W3C trace "
+    "context a caller places under a request's params._meta as the parent "
+    "of this server's own spans (default: on for stdio, whose only caller is "
+    "the trusted parent process; off for --transport http, where any peer "
+    "could otherwise choose the trace identity the server's spans and "
+    "correlated log lines are filed under - overrides "
+    "MCP_TRUST_CLIENT_TRACE_CONTEXT env var)",
+)
+@click.option(
     "--log-level",
     type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
     default=None,
@@ -1656,8 +2693,9 @@ def _backend_config_options(f: Any) -> Any:
     "--max-traces-per-query",
     type=click.IntRange(1, 1000),
     default=None,
-    help="Maximum traces returned per query, 1-1000 (overrides "
-    "MAX_TRACES_PER_QUERY env var, default: 500)",
+    help="Maximum traces/spans a single backend query may fetch, 1-1000 - "
+    "caps every tool's limit, including tool-internal over-fetch, at the "
+    "backend boundary (overrides MAX_TRACES_PER_QUERY env var, default: 500)",
 )
 @click.option(
     "--disable-tools",
@@ -1683,21 +2721,62 @@ def _backend_config_options(f: Any) -> Any:
 )
 @click.option(
     "--rate-limit-max-requests",
-    type=int,
+    type=click.IntRange(min=0),
     default=100,
     envvar="RATE_LIMIT_MAX_REQUESTS",
+    show_envvar=True,
     help="Max requests per client IP per --rate-limit-window-seconds on the "
     "HTTP transport (only for --transport http, default: 100, set to 0 "
     "to disable, overrides RATE_LIMIT_MAX_REQUESTS env var)",
 )
 @click.option(
     "--rate-limit-window-seconds",
-    type=float,
+    # min_open: see --session-idle-timeout-seconds for the types-click note.
+    type=click.FloatRange(min=0, min_open=True),  # type: ignore[call-arg]
+    callback=_require_finite_seconds,
     default=60.0,
     envvar="RATE_LIMIT_WINDOW_SECONDS",
+    show_envvar=True,
     help="Fixed window size in seconds for --rate-limit-max-requests (only "
-    "for --transport http, default: 60.0, overrides "
-    "RATE_LIMIT_WINDOW_SECONDS env var)",
+    "for --transport http, must be a finite number > 0, default: 60.0, "
+    "overrides RATE_LIMIT_WINDOW_SECONDS env var)",
+)
+@click.option(
+    "--readiness-cache-seconds",
+    type=click.FloatRange(min=0),
+    callback=_require_finite_seconds,
+    default=_READINESS_MEMO_TTL_SECONDS,
+    envvar="READINESS_CACHE_SECONDS",
+    help="Memoize GET /ready results for this many seconds (a failed probe "
+    f"for at most {_READINESS_FAILURE_MEMO_TTL_SECONDS:g} s) so any number "
+    "of unauthenticated probes cost the backend at most one health_check + "
+    "list_services per window; concurrent probes share one in-flight check "
+    f"and a check answers 503 after {_READINESS_CHECK_TIMEOUT_SECONDS:g} s "
+    f"(only for --transport http, default: {_READINESS_MEMO_TTL_SECONDS:g}, "
+    "set to 0 to disable the memo, overrides READINESS_CACHE_SECONDS env var)",
+)
+@click.option(
+    "--session-idle-timeout-seconds",
+    # min_open exists on click 8.x's FloatRange (verified at runtime); the
+    # pinned types-click 7.1.8 stubs predate it, hence the targeted ignore.
+    type=click.FloatRange(min=0, min_open=True),  # type: ignore[call-arg]
+    callback=_require_finite_seconds,
+    default=_DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS,
+    envvar="SESSION_IDLE_TIMEOUT_SECONDS",
+    help="Close a streamable-HTTP session that has had no request for this "
+    "many seconds; its id then answers 404 and the client re-initializes "
+    "(only for --transport http, must be a finite number > 0, default: "
+    f"{_DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS:g} - the mcp SDK's own default, "
+    "overrides SESSION_IDLE_TIMEOUT_SECONDS env var)",
+)
+@click.option(
+    "--stateless-http/--no-stateless-http",
+    default=False,
+    envvar="MCP_STATELESS_HTTP",
+    help="Serve each /mcp request on a fresh transport with no session "
+    "tracking at all, so no per-peer state outlives a request - at the cost "
+    "of the GET SSE stream used for server-initiated notifications (only for "
+    "--transport http, default: stateful, overrides MCP_STATELESS_HTTP env var)",
 )
 @click.option(
     "--query-cache-ttl-seconds",
@@ -1705,8 +2784,16 @@ def _backend_config_options(f: Any) -> Any:
     default=None,
     help="Cache backend query results (search_traces/search_spans/get_trace/"
     "list_services/get_service_operations) for this many seconds, with "
-    "in-flight request coalescing (unset: disabled, overrides "
-    "QUERY_CACHE_TTL_SECONDS env var)",
+    "in-flight request coalescing; must be finite, > 0 and at most 86400 "
+    "(unset: disabled, overrides QUERY_CACHE_TTL_SECONDS env var)",
+)
+@click.option(
+    "--query-cache-max-entries",
+    type=click.IntRange(1, 100_000),
+    default=None,
+    help="Upper bound on the number of cached backend query results held at "
+    "once; the least-recently-used entry is evicted first, independent of "
+    "the TTL (overrides QUERY_CACHE_MAX_ENTRIES env var, default: 1024)",
 )
 @click.option(
     "--shutdown-drain-seconds",
@@ -1741,6 +2828,17 @@ def _backend_config_options(f: Any) -> Any:
     "which only accepts whole seconds (only for --transport http, "
     "default: 2, overrides GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS env var)",
 )
+@click.option(
+    "--access-log/--no-access-log",
+    default=False,
+    envvar="MCP_ACCESS_LOG",
+    show_envvar=True,
+    help="On HTTP transport, write uvicorn's per-request access line for every "
+    "request. Off by default: the line carries the full request target, so a token a "
+    "misconfigured client puts in the query string would be logged; when enabled, the "
+    "query string is stripped from every access line (only for --transport http, "
+    "default: off)",
+)
 def main(
     ctx: click.Context,
     backend: str | None,
@@ -1758,7 +2856,12 @@ def main(
     transport: str,
     host: str,
     port: int,
+    http_bearer_token: str | None,
+    allow_unauthenticated_http: bool,
+    allowed_hosts: str | None,
+    forwarded_allow_ips: str | None,
     include_args_in_spans: bool,
+    trust_client_trace_context: bool | None,
     log_level: str | None,
     max_traces_per_query: int | None,
     disable_tools: str | None,
@@ -1766,10 +2869,15 @@ def main(
     slow_request_threshold_ms: float | None,
     rate_limit_max_requests: int,
     rate_limit_window_seconds: float,
+    readiness_cache_seconds: float,
+    session_idle_timeout_seconds: float,
+    stateless_http: bool,
     query_cache_ttl_seconds: float | None,
+    query_cache_max_entries: int | None,
     shutdown_drain_seconds: float,
     backend_close_timeout_seconds: float,
     graceful_shutdown_timeout_seconds: int,
+    access_log: bool,
 ) -> None:
     """Opentelemetry MCP Server - Query OpenTelemetry traces from LLM applications.
 
@@ -1785,11 +2893,12 @@ def main(
       # Run with stdio transport (default, for Claude Desktop)
       tracehub-mcp --backend traceloop
 
-      # Run with HTTP transport for network access
+      # Run with HTTP transport on loopback (the default host)
       tracehub-mcp --transport http --port 8000
 
-      # Run with HTTP on specific host/port
-      tracehub-mcp --transport http --host 127.0.0.1 --port 9000
+      # Run with HTTP on every interface - requires a caller token
+      MCP_HTTP_BEARER_TOKEN=$(openssl rand -hex 32) \\
+        tracehub-mcp --transport http --host 0.0.0.0 --port 9000
 
       # Validate a candidate config without starting the server
       tracehub-mcp doctor --backend jaeger --url http://localhost:16686
@@ -1802,49 +2911,83 @@ def main(
 
     global _config
 
+    if http_bearer_token is None:
+        # click resolves an environment variable whose value is empty as
+        # unset (Parameter.resolve_envvar_value returns None for ""), so
+        # `MCP_HTTP_BEARER_TOKEN=` in a compose file or .env started a
+        # loopback listener with no auth while `--http-bearer-token ''`
+        # exited 2. Read it back so both spellings take the same path; a
+        # non-empty value never reaches here (click already consumed it).
+        http_bearer_token = os.environ.get("MCP_HTTP_BEARER_TOKEN")
+
+    # Before the try: a click.UsageError raised here reaches click's own
+    # handler (exit 2, message on stderr) instead of the catch-all below.
+    if transport == "http":
+        _validate_http_listener_auth(
+            host=host,
+            http_bearer_token=http_bearer_token,
+            allow_unauthenticated_http=allow_unauthenticated_http,
+        )
+    elif http_bearer_token is not None:
+        logger.warning(
+            "MCP_HTTP_BEARER_TOKEN is set but --transport is stdio: the token only "
+            "guards the HTTP listener and is ignored for stdio"
+        )
+    if trust_client_trace_context is None:
+        # stdio's only caller is the trusted parent process; an HTTP peer is not.
+        trust_client_trace_context = transport == "stdio"
+
     try:
-        # Load configuration from environment
-        _config = ServerConfig.from_env()
+        try:
+            # Load configuration from environment
+            _config = ServerConfig.from_env()
 
-        # Set logging level
-        logging.getLogger().setLevel(_config.log_level)
+            # Set logging level
+            _apply_log_level(_config.log_level)
 
-        # Apply CLI overrides
-        if (
-            backend
-            or url
-            or api_key
-            or app_key
-            or tempo_instance_id
-            or sentry_org
-            or sentry_project
-            or environments
-            or aws_region
-            or newrelic_account_id
-            or honeycomb_dataset
-            or log_level
-            or max_traces_per_query is not None
-            or slow_request_threshold_ms is not None
-            or query_cache_ttl_seconds is not None
-        ):
-            _config.apply_cli_overrides(
-                backend_type=backend,
-                backend_url=url,
-                api_key=api_key,
-                app_key=app_key,
-                sentry_org=sentry_org,
-                sentry_project=sentry_project,
-                tempo_instance_id=tempo_instance_id,
-                aws_region=aws_region,
-                newrelic_account_id=newrelic_account_id,
-                honeycomb_dataset=honeycomb_dataset,
-                environments=environments,
-                log_level=log_level,
-                max_traces_per_query=max_traces_per_query,
-                slow_request_threshold_ms=slow_request_threshold_ms,
-                query_cache_ttl_seconds=query_cache_ttl_seconds,
-            )
-            logging.getLogger().setLevel(_config.log_level)
+            # Apply CLI overrides
+            if (
+                backend
+                or url
+                or api_key
+                or app_key
+                or tempo_instance_id
+                or sentry_org
+                or sentry_project
+                or environments
+                or aws_region
+                or newrelic_account_id
+                or honeycomb_dataset
+                or log_level
+                or max_traces_per_query is not None
+                or slow_request_threshold_ms is not None
+                or query_cache_ttl_seconds is not None
+                or query_cache_max_entries is not None
+            ):
+                _config.apply_cli_overrides(
+                    backend_type=backend,
+                    backend_url=url,
+                    api_key=api_key,
+                    app_key=app_key,
+                    sentry_org=sentry_org,
+                    sentry_project=sentry_project,
+                    tempo_instance_id=tempo_instance_id,
+                    aws_region=aws_region,
+                    newrelic_account_id=newrelic_account_id,
+                    honeycomb_dataset=honeycomb_dataset,
+                    environments=environments,
+                    log_level=log_level,
+                    max_traces_per_query=max_traces_per_query,
+                    slow_request_threshold_ms=slow_request_threshold_ms,
+                    query_cache_ttl_seconds=query_cache_ttl_seconds,
+                    query_cache_max_entries=query_cache_max_entries,
+                )
+                _apply_log_level(_config.log_level)
+        except (ValidationError, ValueError) as e:
+            # pydantic's ValidationError echoes input_value='<the URL>' and a
+            # traceback would print it again: location and message only.
+            logger.error(f"Configuration error: {_format_config_error(e)}")
+            sys.exit(1)
 
         if print_config:
             # Built by hand, not model_dump(): sentry_org/sentry_project/
@@ -1864,14 +3007,23 @@ def main(
                 "max_traces_per_query": _config.max_traces_per_query,
                 "slow_request_threshold_ms": _config.slow_request_threshold_ms,
                 "query_cache_ttl_seconds": _config.query_cache_ttl_seconds,
+                "query_cache_max_entries": _config.query_cache_max_entries,
                 "transport": transport,
                 "host": host,
                 "port": port,
+                "http_bearer_token_set": http_bearer_token is not None,
+                "allow_unauthenticated_http": allow_unauthenticated_http,
+                "allowed_hosts": allowed_hosts,
+                "forwarded_allow_ips": forwarded_allow_ips,
                 "include_args_in_spans": include_args_in_spans,
+                "trust_client_trace_context": trust_client_trace_context,
                 "disable_tools": disable_tools,
                 "enabled_tools": enabled_tools,
                 "rate_limit_max_requests": rate_limit_max_requests,
                 "rate_limit_window_seconds": rate_limit_window_seconds,
+                "readiness_cache_seconds": readiness_cache_seconds,
+                "session_idle_timeout_seconds": session_idle_timeout_seconds,
+                "stateless_http": stateless_http,
                 "shutdown_drain_seconds": shutdown_drain_seconds,
                 "backend_close_timeout_seconds": backend_close_timeout_seconds,
                 "graceful_shutdown_timeout_seconds": graceful_shutdown_timeout_seconds,
@@ -1891,7 +3043,7 @@ def main(
         # runs before the middleware is constructed so metrics.get_meter()
         # resolves against the real provider immediately, mirroring the
         # existing tracer-resolution ordering.
-        tracing_enabled = configure_tracing()
+        tracing_enabled = configure_tracing(trust_client_trace_context=trust_client_trace_context)
         configure_metrics()
         if tracing_enabled:
             mcp.add_middleware(McpServerTracingMiddleware(include_args=include_args_in_spans))
@@ -1902,7 +3054,27 @@ def main(
             logger.info(f"Starting MCP server with HTTP transport on {host}:{port}")
             logger.info("Using streamable-http transport for better compatibility")
             logger.info(f"Connect clients to: http://{host}:{port}/mcp")
-            middleware = [Middleware(OriginValidationMiddleware)]
+            if http_bearer_token is not None:
+                # FastMCP.http_app forwards self.auth at call time, so
+                # setting it here is enough for RequireAuthMiddleware to
+                # wrap /mcp; /health and /ready are plain custom routes.
+                mcp.auth = OperatorTokenVerifier(http_bearer_token)
+                logger.info("Bearer-token authentication enabled for /mcp")
+            else:
+                logger.warning(
+                    "Serving /mcp with NO caller authentication on %s:%d - every peer that "
+                    "can reach this port runs every tool under the configured backend "
+                    "credential",
+                    host,
+                    port,
+                )
+            middleware = [
+                Middleware(
+                    OriginValidationMiddleware,
+                    bind_host=host,
+                    allowed_hosts=_parse_csv_option(allowed_hosts),
+                )
+            ]
             if rate_limit_max_requests > 0:
                 middleware.append(
                     Middleware(
@@ -1911,36 +3083,40 @@ def main(
                         window_seconds=rate_limit_window_seconds,
                     )
                 )
-            app = mcp.http_app(transport="streamable-http", middleware=middleware)
+            _configure_readiness_cache(readiness_cache_seconds)
+            app = _build_http_app(
+                middleware,
+                session_idle_timeout_seconds=session_idle_timeout_seconds,
+                stateless_http=stateless_http,
+            )
             _install_shutdown_drain(
                 app,
                 drain_seconds=shutdown_drain_seconds,
                 close_timeout_seconds=backend_close_timeout_seconds,
             )
-            uvicorn_config = uvicorn.Config(
+            uvicorn_config = _build_uvicorn_config(
                 app,
                 host=host,
                 port=port,
-                lifespan="on",
-                # Preserves run_http_async's own default (lost by bypassing
-                # it) for the connection/task-draining wait uvicorn does
-                # BEFORE dispatching lifespan.shutdown - unrelated to the
-                # drain feature itself, which fires after this. Exposed as
-                # --graceful-shutdown-timeout-seconds so a real signal-timing
-                # test can widen it deterministically instead of relying on
-                # this project's own default margin.
-                timeout_graceful_shutdown=graceful_shutdown_timeout_seconds,
+                graceful_shutdown_timeout_seconds=graceful_shutdown_timeout_seconds,
+                forwarded_allow_ips=forwarded_allow_ips,
+                access_log=access_log,
             )
             asyncio.run(uvicorn.Server(uvicorn_config).serve())
         else:
             logger.info(
-                f"Starting MCP server with stdio transport using Backend: {_config.backend.type} connected to: {_config.backend.url}"
+                f"Starting MCP server with stdio transport using Backend: {_config.backend.type} "
+                f"connected to: {redact_url_userinfo(_config.backend.url)}"
             )
             mcp.run(transport="stdio")
 
     except KeyboardInterrupt:
         logger.info("Server stopped by user")
         sys.exit(0)
+    except click.ClickException:
+        # click.UsageError is an Exception subclass: let click render it
+        # (exit 2, message on stderr) rather than logging 'Server error'.
+        raise
     except Exception as e:
         logger.error(f"Server error: {e}", exc_info=True)
         sys.exit(1)
@@ -2000,9 +3176,14 @@ def doctor(
     Unlike the server's own lazy backend initialization (which deliberately
     swallows a failed health check and keeps running so requests may still
     work later), doctor surfaces every failure explicitly.
+
+    The resolved LOG_LEVEL is applied exactly as main() applies it (doctor
+    has no --log-level flag), so httpx's per-request INFO line - which
+    prints the full backend URL - is emitted by doctor only at DEBUG too.
     """
     try:
         config = ServerConfig.from_env()
+        _apply_log_level(config.log_level)
         if (
             backend
             or url
@@ -2031,16 +3212,22 @@ def doctor(
             )
         click.secho("[OK] Configuration loaded and validated", fg="green")
     except Exception as e:
-        click.secho(f"[FAIL] Configuration: {e}", fg="red")
+        # pydantic's ValidationError echoes the raw input URL (see main()).
+        click.secho(f"[FAIL] Configuration: {_format_config_error(e)}", fg="red")
         sys.exit(1)
 
     try:
         backend_instance = _create_backend(config)
         click.secho(
-            f"[OK] Backend constructed: {config.backend.type} @ {config.backend.url}", fg="green"
+            f"[OK] Backend constructed: {config.backend.type} @ "
+            f"{redact_url_userinfo(config.backend.url)}",
+            fg="green",
         )
     except Exception as e:
-        click.secho(f"[FAIL] Backend construction: {e}", fg="red")
+        click.secho(
+            f"[FAIL] Backend construction: {redact_userinfo_in_text(str(e) or type(e).__name__)}",
+            fg="red",
+        )
         sys.exit(1)
 
     async def _run_checks() -> int:
@@ -2063,11 +3250,14 @@ def doctor(
                 secondary_instance = _build_backend_from_config(config.secondary_backend)
                 click.secho(
                     f"[OK] Secondary backend constructed: {config.secondary_backend.type} "
-                    f"@ {config.secondary_backend.url}",
+                    f"@ {redact_url_userinfo(config.secondary_backend.url)}",
                     fg="green",
                 )
             except Exception as e:
-                click.secho(f"[FAIL] Secondary backend construction: {e}", fg="red")
+                click.secho(
+                    f"[FAIL] Secondary backend construction: {redact_userinfo_in_text(str(e) or type(e).__name__)}",
+                    fg="red",
+                )
                 return 1
 
             try:

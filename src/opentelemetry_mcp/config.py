@@ -1,18 +1,87 @@
 """Configuration management for Opentelemetry MCP Server."""
 
 import logging
+import math
 import os
+import re
 from typing import Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, field_validator
+from pydantic import BaseModel, Field, HttpUrl, TypeAdapter, ValidationError, field_validator
 
-from opentelemetry_mcp.security import is_cloud_metadata_host, is_loopback_host
+from opentelemetry_mcp.backends.base import DEFAULT_MAX_RESPONSE_BYTES
+from opentelemetry_mcp.backends.cache import DEFAULT_QUERY_CACHE_MAX_ENTRIES
+from opentelemetry_mcp.security import (
+    is_cloud_metadata_host,
+    is_loopback_host,
+    redact_userinfo_in_text,
+)
 
 logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
+
+
+def _reject_url_userinfo(raw_url: str, *, source: str) -> None:
+    """Refuse a URL carrying a userinfo component BEFORE pydantic parses it.
+
+    BackendConfig.validate_url rejects the same URLs, but by then the raw
+    string is pydantic's input: a ValidationError's str() appends
+    input_value=<the URL> truncated by pydantic-core to 24 + "..." + 23
+    characters, and for a URL longer than ~50 characters that cut removes
+    the "@" the textual redaction (security.redact_userinfo_in_text) keys
+    on - so the password's leading characters survived in the startup error
+    on every surface (runtime verification P7b). Judging the raw env/CLI
+    string here means a credentialed URL never becomes a ValidationError
+    input at all; the only text that leaves is the redacted URL. `source`
+    names the variable or flag the value came from.
+    """
+    try:
+        parts = urlsplit(raw_url)
+        has_userinfo = bool(parts.username or parts.password)
+    except ValueError:
+        # Malformed authority (an unbalanced IPv6 bracket): pydantic would
+        # echo it too, so fall through to the textual shape check alone.
+        parts = None
+        has_userinfo = False
+    redacted = redact_userinfo_in_text(raw_url)
+    if has_userinfo or redacted != raw_url:
+        if has_userinfo and parts is not None:
+            # Rebuilt from the parsed parts, never from the text: the textual redactor
+            # keys on a whitespace-free userinfo run, so a password containing a space
+            # left the raw URL unchanged and the full credential was echoed on every
+            # surface (runtime verification of PR #41, delta probe P1b). Only the scheme,
+            # the host:port after the last '@', the path, query and fragment are shown.
+            shown = (
+                f"{parts.scheme}://[REDACTED]@{parts.netloc.rsplit('@', 1)[-1]}{parts.path}"
+                f"{'?' + parts.query if parts.query else ''}"
+                f"{'#' + parts.fragment if parts.fragment else ''}"
+            )
+        else:
+            shown = redacted
+        raise ValueError(
+            f"{source} must not embed credentials (user:password@host); got {shown!r}. "
+            "Use BACKEND_API_KEY (Bearer) or BACKEND_TEMPO_INSTANCE_ID + BACKEND_API_KEY "
+            "(Basic) so the secret is never stringified"
+        )
+
+
+_PRIMARY_BACKEND_PREFIX = "BACKEND_"
+# pydantic prefixes some messages with its validator wrapper names ("function-wrap[wrap_val()]: ");
+# they carry no information for an operator.
+_PYDANTIC_WRAPPER_PREFIX_RE = re.compile(r"^(?:function-[a-z]+\[[^\]]*\]:\s*)+")
+
+
+def _describe_validation_error(exc: ValidationError, prefix: str) -> str:
+    """'<PREFIX><FIELD>: <message>' per error, joined by '; ' - the env var the operator set,
+    pydantic's message with its wrapper names dropped, and never the input value."""
+    return "; ".join(
+        f"{prefix}{'_'.join(str(part) for part in err['loc']).upper()}: "
+        f"{_PYDANTIC_WRAPPER_PREFIX_RE.sub('', err['msg'])}"
+        for err in exc.errors(include_url=False, include_input=False)
+    )
 
 
 class BackendConfig(BaseModel):
@@ -22,9 +91,12 @@ class BackendConfig(BaseModel):
         "jaeger", "tempo", "traceloop", "datadog", "sentry", "xray", "newrelic", "honeycomb"
     ]
     url: HttpUrl
-    api_key: str | None = Field(default=None, exclude=True)
+    api_key: str | None = Field(default=None, exclude=True, repr=False)
     app_key: str | None = Field(
-        default=None, exclude=True, description="Datadog Application key (Datadog backend only)"
+        default=None,
+        exclude=True,
+        repr=False,
+        description="Datadog Application key (Datadog backend only)",
     )
     sentry_org: str | None = Field(
         default=None, exclude=True, description="Sentry organization slug (Sentry backend only)"
@@ -57,6 +129,13 @@ class BackendConfig(BaseModel):
         "dataset-scoped (Honeycomb backend only)",
     )
     timeout: float = Field(default=30.0, gt=0, le=300)
+    max_response_bytes: int = Field(
+        default=DEFAULT_MAX_RESPONSE_BYTES,
+        ge=1,
+        le=1024**3,
+        description="Ceiling on the decoded size of any single backend response, in bytes; "
+        "an oversized body is refused at the transport before it is buffered or parsed",
+    )
     environments: list[str] = Field(default_factory=lambda: ["prd"])
 
     @field_validator("url")
@@ -74,16 +153,26 @@ class BackendConfig(BaseModel):
         """
         if v.scheme not in ["http", "https"]:
             raise ValueError("URL must use http or https scheme")
+        if v.username or v.password:
+            # Never keep a credential inside the URL: str(url) is logged at
+            # startup, printed by --print-config and doctor, and echoed by
+            # httpx's own error text into /ready bodies and tool errors.
+            # Checked first so neither message below can stringify it.
+            raise ValueError(
+                "BACKEND_URL must not embed credentials (user:password@host). Use "
+                "BACKEND_API_KEY (Bearer) or BACKEND_TEMPO_INSTANCE_ID + BACKEND_API_KEY "
+                "(Basic) so the secret is never stringified"
+            )
         if is_cloud_metadata_host(v.host):
             raise ValueError(
-                f"BACKEND_URL '{v}' points at a cloud instance-metadata endpoint. "
+                f"BACKEND_URL host '{v.host}' is a cloud instance-metadata endpoint. "
                 "This is never a legitimate trace-backend location and is blocked "
                 "to prevent SSRF-based credential theft."
             )
         if v.scheme == "http" and not is_loopback_host(v.host):
             logger.warning(
-                f"BACKEND_URL '{v}' uses plain HTTP to a non-local host. "
-                "This is vulnerable to network interception (see CVE-2025-6514). "
+                f"BACKEND_URL host '{v.host}' is reached over plain HTTP from a non-local "
+                "host. This is vulnerable to network interception (see CVE-2025-6514). "
                 "Use https:// unless this backend is only reachable over a "
                 "trusted private network (e.g. a VPC or Docker Compose network)."
             )
@@ -142,6 +231,7 @@ class BackendConfig(BaseModel):
             )
         if not backend_url:
             raise ValueError(f"{prefix}URL is required when {prefix}TYPE is set")
+        _reject_url_userinfo(backend_url, source=f"{prefix}URL")
 
         # Parse environments from comma-separated string
         environments_str = os.getenv(f"{prefix}ENVIRONMENTS", "prd")
@@ -155,20 +245,51 @@ class BackendConfig(BaseModel):
             logger.warning(f"Invalid {prefix}TIMEOUT value '{timeout_str}': {e}. Using default: 30")
             timeout = 30.0
 
-        return cls(
-            type=backend_type,  # type: ignore
-            url=backend_url,  # type: ignore
-            api_key=os.getenv(f"{prefix}API_KEY"),
-            app_key=os.getenv(f"{prefix}APP_KEY"),
-            sentry_org=os.getenv(f"{prefix}SENTRY_ORG"),
-            sentry_project=os.getenv(f"{prefix}SENTRY_PROJECT"),
-            tempo_instance_id=os.getenv(f"{prefix}TEMPO_INSTANCE_ID"),
-            aws_region=os.getenv(f"{prefix}AWS_REGION"),
-            newrelic_account_id=os.getenv(f"{prefix}NEWRELIC_ACCOUNT_ID"),
-            honeycomb_dataset=os.getenv(f"{prefix}HONEYCOMB_DATASET"),
-            timeout=timeout,
-            environments=environments,
-        )
+        # Parse max_response_bytes with validation (optional; range-checked by
+        # the Field so an out-of-range value fails fast like a bad timeout)
+        max_response_bytes = DEFAULT_MAX_RESPONSE_BYTES
+        max_response_bytes_str = os.getenv(f"{prefix}MAX_RESPONSE_BYTES")
+        if max_response_bytes_str:
+            try:
+                max_response_bytes = int(max_response_bytes_str)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Invalid {prefix}MAX_RESPONSE_BYTES value '{max_response_bytes_str}': {e}. "
+                    f"Using default: {DEFAULT_MAX_RESPONSE_BYTES}"
+                )
+
+        try:
+            return cls(
+                type=backend_type,  # type: ignore
+                url=backend_url,  # type: ignore
+                api_key=os.getenv(f"{prefix}API_KEY"),
+                app_key=os.getenv(f"{prefix}APP_KEY"),
+                sentry_org=os.getenv(f"{prefix}SENTRY_ORG"),
+                sentry_project=os.getenv(f"{prefix}SENTRY_PROJECT"),
+                tempo_instance_id=os.getenv(f"{prefix}TEMPO_INSTANCE_ID"),
+                aws_region=os.getenv(f"{prefix}AWS_REGION"),
+                newrelic_account_id=os.getenv(f"{prefix}NEWRELIC_ACCOUNT_ID"),
+                honeycomb_dataset=os.getenv(f"{prefix}HONEYCOMB_DATASET"),
+                timeout=timeout,
+                max_response_bytes=max_response_bytes,
+                environments=environments,
+            )
+        except ValidationError as exc:
+            if prefix == _PRIMARY_BACKEND_PREFIX:
+                raise
+            # The secondary backend is configured by env vars only, yet pydantic titles the
+            # standalone model 'BackendConfig' and the server rendered its errors as the
+            # PRIMARY backend's variables ('BACKEND_TIMEOUT: ...' for SECONDARY_BACKEND_TIMEOUT=-5
+            # - runtime verification of PR #41, delta round). Name the variables the operator
+            # actually set; location and message only, never input_value.
+            raise ValueError(_describe_validation_error(exc, prefix)) from None
+
+
+# Ceilings for the opt-in query cache. One day mirrors BACKEND_TIMEOUT's own
+# `le` pattern; 100000 entries is far above any deployment's distinct query
+# count but still a bound a single peer cannot push past.
+MAX_QUERY_CACHE_TTL_SECONDS = 86400.0
+MAX_QUERY_CACHE_MAX_ENTRIES = 100_000
 
 
 class ServerConfig(BaseModel):
@@ -184,7 +305,18 @@ class ServerConfig(BaseModel):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     max_traces_per_query: int = Field(default=500, ge=1, le=1000)
     slow_request_threshold_ms: float | None = Field(default=None, gt=0)
-    query_cache_ttl_seconds: float | None = Field(default=None, gt=0)
+    # Bounded above (one day) and finite: an inf TTL meant "never expire"
+    # and never opened the cache's expiry sweep, so nothing was ever evicted
+    # from the process-wide cache every MCP session shares.
+    query_cache_ttl_seconds: float | None = Field(
+        default=None, gt=0, le=MAX_QUERY_CACHE_TTL_SECONDS, allow_inf_nan=False
+    )
+    # LRU entry bound on the query cache, independent of the TTL - the
+    # aggregate cap on what distinct tool arguments can make the process
+    # retain (backends/cache.py's DEFAULT_QUERY_CACHE_MAX_ENTRIES).
+    query_cache_max_entries: int = Field(
+        default=DEFAULT_QUERY_CACHE_MAX_ENTRIES, ge=1, le=MAX_QUERY_CACHE_MAX_ENTRIES
+    )
 
     @classmethod
     def from_env(cls) -> "ServerConfig":
@@ -229,6 +361,20 @@ class ServerConfig(BaseModel):
                     f"'{query_cache_ttl_str}': {e}. Query caching disabled."
                 )
 
+        # Parse query_cache_max_entries with validation (same warn-and-default
+        # pattern; out-of-range values are rejected by the field bounds below)
+        query_cache_max_entries = DEFAULT_QUERY_CACHE_MAX_ENTRIES
+        query_cache_max_entries_str = os.getenv("QUERY_CACHE_MAX_ENTRIES")
+        if query_cache_max_entries_str:
+            try:
+                query_cache_max_entries = int(query_cache_max_entries_str)
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Invalid QUERY_CACHE_MAX_ENTRIES value "
+                    f"'{query_cache_max_entries_str}': {e}. "
+                    f"Using default: {DEFAULT_QUERY_CACHE_MAX_ENTRIES}"
+                )
+
         return cls(
             backend=BackendConfig.from_env(),
             secondary_backend=BackendConfig.from_env_optional(),
@@ -236,6 +382,7 @@ class ServerConfig(BaseModel):
             max_traces_per_query=max_traces_per_query,
             slow_request_threshold_ms=slow_request_threshold_ms,
             query_cache_ttl_seconds=query_cache_ttl_seconds,
+            query_cache_max_entries=query_cache_max_entries,
         )
 
     def apply_cli_overrides(
@@ -255,6 +402,7 @@ class ServerConfig(BaseModel):
         max_traces_per_query: int | None = None,
         slow_request_threshold_ms: float | None = None,
         query_cache_ttl_seconds: float | None = None,
+        query_cache_max_entries: int | None = None,
     ) -> None:
         """Apply CLI argument overrides to configuration."""
         if slow_request_threshold_ms is not None:
@@ -266,12 +414,25 @@ class ServerConfig(BaseModel):
             self.slow_request_threshold_ms = slow_request_threshold_ms
 
         if query_cache_ttl_seconds is not None:
-            if query_cache_ttl_seconds <= 0:
+            # isfinite first: nan compares False against every bound below.
+            if (
+                not math.isfinite(query_cache_ttl_seconds)
+                or query_cache_ttl_seconds <= 0
+                or query_cache_ttl_seconds > MAX_QUERY_CACHE_TTL_SECONDS
+            ):
                 raise ValueError(
                     f"Invalid query_cache_ttl_seconds: {query_cache_ttl_seconds}. "
-                    "Must be greater than 0"
+                    f"Must be greater than 0 and at most {MAX_QUERY_CACHE_TTL_SECONDS:g}"
                 )
             self.query_cache_ttl_seconds = query_cache_ttl_seconds
+
+        if query_cache_max_entries is not None:
+            if not (1 <= query_cache_max_entries <= MAX_QUERY_CACHE_MAX_ENTRIES):
+                raise ValueError(
+                    f"Invalid query_cache_max_entries: {query_cache_max_entries}. "
+                    f"Must be between 1 and {MAX_QUERY_CACHE_MAX_ENTRIES}"
+                )
+            self.query_cache_max_entries = query_cache_max_entries
 
         if log_level:
             log_level_upper = log_level.upper()
@@ -312,7 +473,21 @@ class ServerConfig(BaseModel):
             # bypassing validate_url's scheme/metadata/CVE-2025-6514 checks
             # entirely, since direct attribute assignment on an already
             # constructed model does not re-run field validators here.
-            parsed = TypeAdapter(HttpUrl).validate_python(backend_url)
+            # The userinfo check runs on the raw string first: the TypeAdapter's
+            # own ValidationError would echo a malformed credentialed URL.
+            _reject_url_userinfo(backend_url, source="--url")
+            try:
+                parsed = TypeAdapter(HttpUrl).validate_python(backend_url)
+            except ValidationError as exc:
+                # A bare TypeAdapter error carries no field location, so the
+                # generic rendering could only name pydantic's validator
+                # wrapper ("function-wrap[wrap_val()]"), not the option the
+                # operator typed; its str() would also echo the value. Name
+                # the flag and keep the messages, which say what was wrong.
+                reasons = "; ".join(
+                    err["msg"] for err in exc.errors(include_url=False, include_input=False)
+                )
+                raise ValueError(f"--url: {reasons}") from None
             self.backend.url = BackendConfig.validate_url(parsed)
 
         if api_key:

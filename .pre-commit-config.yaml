@@ -11,8 +11,13 @@
 # not found" on every PR to this repo regardless of what changed (confirmed
 # on #20 and #21, neither of which touch Python). Real type-checking still
 # happens via the project's own `uv run mypy .` step in GitHub Actions CI.
+#
+# gitleaks is skipped on pre-commit.ci too: it is a `language: golang` hook
+# that pre-commit.ci's sandbox cannot build. Secret detection in CI is the
+# TruffleHog workflow (.github/workflows/secret-scan.yml); this hook is the
+# local, pre-commit-time counterpart with the same custom rule (.gitleaks.toml).
 ci:
-  skip: [mypy]
+  skip: [mypy, gitleaks]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -39,6 +44,15 @@ repos:
         args:
           - "--skip=uv.lock,tests/integration/cassettes/**"
           - "--ignore-words-list=unparseable,fo"
+
+  # Secret detection before a commit exists. The pre-commit hook needs no
+  # license (unlike gitleaks-action for org-owned repos) and reads
+  # .gitleaks.toml from the repo root: every default rule plus the Traceloop
+  # `tl_` key rule, the credential class this repo already leaked once.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e  # frozen: v8.30.1
+    hooks:
+      - id: gitleaks
 
   # mypy needs pydantic (for its BaseModel plugin) and the rest of this
   # project's real dependency graph to type-check correctly - the mirrors-mypy

@@ -1,11 +1,12 @@
 """Data models for OpenTelemetry traces and Opentelemetry conventions."""
 
+import math
 from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .attributes import SpanAttributes, SpanEvent
 from .constants import Fields, GenAI, Service
@@ -45,18 +46,158 @@ class FilterType(StrEnum):
     BOOLEAN = "boolean"
 
 
-class Filter(BaseModel):
-    """A single filter condition for trace queries."""
+# Cardinality caps on the generic filter system. Every backend builder renders
+# one query clause per IN/NOT_IN value, per explicit filter and per tag, and
+# Jaeger JSON-encodes every tag into one URL parameter, so without a bound a
+# single search_traces/search_spans call could emit an arbitrarily wide
+# backend query under the operator's credential (and feed an arbitrarily
+# large list into the client-side FilterEngine). The caps are enforced here,
+# on the query models both tools pass through, and documented in README
+# "Generic Filter System"; no documented query shape comes near them.
+MAX_FILTER_VALUES = 100
+MAX_FILTERS_PER_QUERY = 50
+MAX_TAGS_PER_QUERY = 50
+MAX_FILTER_FIELD_CHARS = 256
 
-    field: str = Field(..., description="Field name in dotted notation (e.g., 'gen_ai.system')")
+
+def _check_number_operand(number: int | float) -> int | float:
+    """Return ``number`` if it is finite and representable as a float, else
+    raise ValueError.
+
+    Every consumer of a NUMBER operand goes through float() - TraceQL
+    rendering via math.isfinite, FilterEngine via float(value) - and for an
+    int >= 2**1024 that raises OverflowError (not ValueError), so such an
+    operand is rejected here, at the model boundary, instead of crashing a
+    backend later. int("9" * 400) and a JSON integer literal of that size
+    are both genuine ints that reach this check.
+    """
+    try:
+        as_float = float(number)
+    except OverflowError:
+        raise ValueError(
+            "value_type 'number' requires a numeric operand within float range"
+        ) from None
+    if not math.isfinite(as_float):
+        raise ValueError("value_type 'number' requires a finite numeric operand")
+    return number
+
+
+def _parse_number_operand(text: str) -> int | float:
+    """Parse a string-encoded NUMBER operand ("5000", "1.5", "1e3") into a
+    genuine int/float that passes _check_number_operand; anything else is
+    rejected."""
+    number: int | float
+    try:
+        number = int(text)
+    except ValueError:
+        try:
+            number = float(text)
+        except ValueError:
+            raise ValueError(
+                "value_type 'number' requires a numeric operand, got a non-numeric string"
+            ) from None
+    return _check_number_operand(number)
+
+
+def _normalize_filter_operand(value: Any, value_type: FilterType) -> Any:
+    """Coerce one Filter operand to the Python type its declared value_type
+    promises, or raise ValueError when it cannot be.
+
+    NUMBER keeps a genuine finite, float-representable int/float, parses a
+    numeric string to one, and rejects a bool (an int subclass, but not a
+    number a caller meant). BOOLEAN keeps a genuine bool and accepts only the
+    strings "true"/"false" (case-insensitive). STRING str()-coerces
+    int/float/bool scalars, which is exactly what every backend builder and
+    FilterEngine already did with them. Values of any other Python type are
+    returned unchanged so the field's own type validation reports them.
+    """
+    if value is None:
+        return None
+    if value_type == FilterType.NUMBER:
+        if isinstance(value, bool):
+            raise ValueError("value_type 'number' does not accept a boolean operand")
+        if isinstance(value, int | float):
+            return _check_number_operand(value)
+        if isinstance(value, str):
+            return _parse_number_operand(value)
+        return value
+    if value_type == FilterType.BOOLEAN:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered == "true":
+                return True
+            if lowered == "false":
+                return False
+        raise ValueError(
+            "value_type 'boolean' requires true/false, got "
+            f"an operand of type {type(value).__name__}"
+        )
+    if isinstance(value, bool | int | float):
+        return str(value)
+    return value
+
+
+class Filter(BaseModel):
+    """A single filter condition for trace queries.
+
+    A Filter is built straight from an MCP tool argument (tools/search.py and
+    tools/search_spans.py do ``Filter(**filter_dict)``), so this model is the
+    last trusted decision point before its operands are rendered into a
+    backend query. Unknown keys are rejected (``extra="forbid"``) and
+    ``value``/``values`` are normalised to the declared ``value_type`` before
+    field validation - a NUMBER operand is a genuine, finite,
+    float-representable int/float and a BOOLEAN operand a genuine bool by the
+    time any backend sees the Filter, so a string that merely *claims* to be
+    a number can never reach a raw numeric-literal splice (see tempo.py's
+    ``_render_traceql_scalar``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_FILTER_FIELD_CHARS,
+        description="Field name in dotted notation (e.g., 'gen_ai.system')",
+    )
     operator: FilterOperator = Field(..., description="Comparison operator")
     value: str | int | float | bool | None = Field(
         default=None, description="Single value for most operators"
     )
     values: Sequence[str | int | float | bool] | None = Field(
-        default=None, description="Multiple values for 'in', 'not_in', 'between' operators"
+        default=None,
+        max_length=MAX_FILTER_VALUES,
+        description="Multiple values for 'in', 'not_in', 'between' operators",
     )
     value_type: FilterType = Field(..., description="Type of the value(s)")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_operands_to_value_type(cls, data: Any) -> Any:
+        """Coerce ``value``/``values`` to the declared ``value_type``.
+
+        Runs before field validation on the raw input mapping and returns a
+        new mapping (the input is never mutated). A ``value_type`` that is not
+        a FilterType is left alone so the field's own validation reports it.
+        """
+        if not isinstance(data, dict):
+            return data
+        raw_type = data.get("value_type")
+        if not isinstance(raw_type, str):  # FilterType is a StrEnum, so it passes too
+            return data
+        try:
+            value_type = FilterType(raw_type)
+        except ValueError:
+            return data
+        normalized = dict(data)
+        if "value" in normalized:
+            normalized["value"] = _normalize_filter_operand(normalized["value"], value_type)
+        values = normalized.get("values")
+        if isinstance(values, list | tuple):
+            normalized["values"] = [_normalize_filter_operand(v, value_type) for v in values]
+        return normalized
 
     @model_validator(mode="after")
     def validate_filter_values(self) -> "Filter":
@@ -512,7 +653,7 @@ class TraceQuery(BaseModel):
     end_time: datetime | None = None
     min_duration_ms: int | None = Field(default=None, ge=0)
     max_duration_ms: int | None = Field(default=None, ge=0)
-    tags: dict[str, str] = Field(default_factory=dict)
+    tags: dict[str, str] = Field(default_factory=dict, max_length=MAX_TAGS_PER_QUERY)
     limit: int = Field(default=100, ge=1, le=1000)
     has_error: bool | None = None
 
@@ -522,7 +663,11 @@ class TraceQuery(BaseModel):
     gen_ai_response_model: str | None = None  # Filter by actual model used
 
     # New generic filter system
-    filters: list[Filter] = Field(default_factory=list, description="Generic filter conditions")
+    filters: list[Filter] = Field(
+        default_factory=list,
+        max_length=MAX_FILTERS_PER_QUERY,
+        description="Generic filter conditions",
+    )
     logical_operator: Literal["AND"] = Field(
         default="AND", description="Logical operator for combining filters (currently only AND)"
     )
@@ -667,7 +812,7 @@ class SpanQuery(BaseModel):
     end_time: datetime | None = None
     min_duration_ms: int | None = Field(default=None, ge=0)
     max_duration_ms: int | None = Field(default=None, ge=0)
-    tags: dict[str, str] = Field(default_factory=dict)
+    tags: dict[str, str] = Field(default_factory=dict, max_length=MAX_TAGS_PER_QUERY)
     limit: int = Field(default=100, ge=1, le=1000)
     has_error: bool | None = None
 
@@ -677,7 +822,11 @@ class SpanQuery(BaseModel):
     gen_ai_response_model: str | None = None
 
     # Generic filter system
-    filters: list[Filter] = Field(default_factory=list, description="Generic filter conditions")
+    filters: list[Filter] = Field(
+        default_factory=list,
+        max_length=MAX_FILTERS_PER_QUERY,
+        description="Generic filter conditions",
+    )
     logical_operator: Literal["AND"] = Field(
         default="AND", description="Logical operator for combining filters (currently only AND)"
     )

@@ -18,6 +18,7 @@ limitations rather than presenting a heuristic match as a guaranteed join.
 """
 
 import logging
+from collections import Counter
 from datetime import timedelta
 
 from opentelemetry_mcp.backends.base import BaseBackend
@@ -27,7 +28,13 @@ from opentelemetry_mcp.tools import span_tree
 logger = logging.getLogger(__name__)
 
 _SEARCH_WINDOW_PAD = timedelta(seconds=5)
-_MAX_CANDIDATES_PER_SERVICE_QUERY = 20
+_MAX_SEARCH_WINDOW = timedelta(hours=24)
+_MAX_SEARCH_WINDOW_MS = _MAX_SEARCH_WINDOW / timedelta(milliseconds=1)
+_MS_PER_HOUR = timedelta(hours=1) / timedelta(milliseconds=1)
+# Public: server.py clamps exactly this default to MAX_TRACES_PER_QUERY and
+# passes the result as `max_candidates_per_service`.
+MAX_CANDIDATES_PER_SERVICE_QUERY = 20
+_MAX_SERVICE_QUERIES = 10
 _MAX_REPORTED_MATCHES = 5
 
 _LIMITATIONS = [
@@ -54,12 +61,9 @@ def _error_signal(trace: TraceData) -> tuple[bool, str | None]:
 
     children_map = span_tree.build_children_map(spans)
     roots = span_tree.find_roots(children_map) or [spans[0]]
-    error_chains = [
-        chain for root in roots for chain in span_tree.find_all_error_chains(root, children_map)
-    ]
-    if error_chains:
-        deepest = max(error_chains, key=len)
-        return True, deepest[-1].service_name
+    deepest = span_tree.find_deepest_error_chain_across_roots(roots, children_map)
+    if deepest.chain:
+        return True, deepest.chain[-1].service_name
 
     # No root-reachable error chain, but an error can still be trapped in a
     # disconnected/cyclic parent chain no root-first walk can discover (see
@@ -91,7 +95,10 @@ def _root_cause_consistent(
 
 
 async def correlate_trace(
-    primary_backend: BaseBackend, secondary_backend: BaseBackend, trace_id: str
+    primary_backend: BaseBackend,
+    secondary_backend: BaseBackend,
+    trace_id: str,
+    max_candidates_per_service: int = MAX_CANDIDATES_PER_SERVICE_QUERY,
 ) -> CorrelationResult:
     """Fetch a trace from the primary backend and try to find the
     corresponding trace in the secondary backend.
@@ -100,18 +107,29 @@ async def correlate_trace(
         primary_backend: The backend `trace_id` is already known to.
         secondary_backend: The independently-configured backend to search.
         trace_id: Trace identifier, as known to `primary_backend`.
+        max_candidates_per_service: `limit` of each per-service heuristic
+            search_traces call against `secondary_backend`. The server
+            passes this clamped to MAX_TRACES_PER_QUERY.
 
     Returns:
         CorrelationResult with every candidate match found (direct
         trace_id match, if any, else up to 5 time-window/service-overlap
-        heuristic candidates) and a fixed list of limitations that always
-        apply to this kind of best-effort cross-backend correlation.
+        heuristic candidates) and the fixed limitations that always apply
+        to this kind of best-effort cross-backend correlation, plus any
+        per-call truncation notes - the heuristic search window is capped
+        at _MAX_SEARCH_WINDOW (24 h) after the primary trace's start, however
+        wide an extent the primary trace's spans claim, and at most
+        _MAX_SERVICE_QUERIES (10) primary services - the most-represented by
+        span count - are searched for in the secondary backend.
     """
     primary_trace = await primary_backend.get_trace(trace_id)
     primary_services = {span.service_name for span in primary_trace.spans}
     primary_has_error, primary_blamed_service = _error_signal(primary_trace)
 
     matches: list[CorrelationMatch] = []
+    # Per-call copy: truncation notes are appended below, never to the
+    # module-level list shared by every call.
+    limitations = list(_LIMITATIONS)
 
     try:
         secondary_trace: TraceData | None = await secondary_backend.get_trace(trace_id)
@@ -138,30 +156,69 @@ async def correlate_trace(
             )
         )
         return CorrelationResult(
-            primary_trace_id=trace_id, matches=matches, limitations=_LIMITATIONS
+            primary_trace_id=trace_id, matches=matches, limitations=limitations
         )
 
     # Heuristic fallback: query per primary service name (not one filter-
     # less call) so this works against backends like Jaeger that require
     # `service_name` on search_traces, not just the ones where it's optional.
+    #
+    # The window is derived from the primary trace's own start/duration,
+    # which every backend parser computes as min(span start)..max(span end)
+    # over telemetry-authored timestamps - two spans dated years apart would
+    # otherwise make every secondary search below scan years of the
+    # operator's secondary account. Cap the extent (a clock-skewed negative
+    # duration counts as zero) and keep the window anchored at the primary
+    # start, so correlation still works for the trace's beginning.
+    #
+    # Compared in the float-millisecond domain before any timedelta is
+    # built: duration_ms is an unconstrained float, and timedelta() raises
+    # OverflowError for 1e17 ms or inf (ValueError for nan) before a cap
+    # could apply - a capped window, not an error, is the right outcome for
+    # all of them. nan compares False against everything, so it lands in
+    # the capped branch rather than becoming a zero-width window.
+    extent_ms = primary_trace.duration_ms
+    if extent_ms <= _MAX_SEARCH_WINDOW_MS:
+        extent = timedelta(milliseconds=max(extent_ms, 0.0))
+    else:
+        limitations.append(
+            f"Primary trace spans {extent_ms / _MS_PER_HOUR:g} h; the secondary search "
+            f"window was capped at {_MAX_SEARCH_WINDOW} after its start."
+        )
+        extent = _MAX_SEARCH_WINDOW
     start_time = primary_trace.start_time - _SEARCH_WINDOW_PAD
-    end_time = (
-        primary_trace.start_time
-        + timedelta(milliseconds=primary_trace.duration_ms)
-        + _SEARCH_WINDOW_PAD
-    )
+    end_time = primary_trace.start_time + extent + _SEARCH_WINDOW_PAD
     candidates_by_id: dict[str, TraceData] = {}
+    # service.name is a resource attribute every telemetry producer sets
+    # freely, and most backends' get_trace returns every span of the trace,
+    # so the distinct-name count - and therefore the number of searches
+    # issued below under the operator's secondary credential - is
+    # telemetry-author controlled. Bound it at the loop itself: query the
+    # services most represented in the primary trace (most spans first,
+    # name as the tie-break), skip the rest and say so in the result. An
+    # empty/whitespace name is dropped outright - it would turn the
+    # per-service search into an unscoped search of the whole window.
     # Sorted rather than iterated directly off the set: str hashing (and
     # therefore set iteration order) is randomized per-process by default
     # (PYTHONHASHSEED), which would otherwise make candidates_by_id's
     # insertion order - and thus which candidate wins a tie in the ranked
     # sort below - non-deterministic across runs for the exact same input.
-    for service_name in sorted(primary_services):
+    span_counts = Counter(span.service_name for span in primary_trace.spans)
+    ordered_services = sorted(
+        (name for name in primary_services if name.strip()),
+        key=lambda name: (-span_counts[name], name),
+    )
+    if len(ordered_services) > _MAX_SERVICE_QUERIES:
+        limitations.append(
+            f"Primary trace spans {len(ordered_services)} services; only the "
+            f"{_MAX_SERVICE_QUERIES} most-represented were searched in the secondary backend."
+        )
+    for service_name in ordered_services[:_MAX_SERVICE_QUERIES]:
         query = TraceQuery(
             service_name=service_name,
             start_time=start_time,
             end_time=end_time,
-            limit=_MAX_CANDIDATES_PER_SERVICE_QUERY,
+            limit=max_candidates_per_service,
         )
         try:
             for candidate in await secondary_backend.search_traces(query):
@@ -207,4 +264,4 @@ async def correlate_trace(
         if len(matches) >= _MAX_REPORTED_MATCHES:
             break
 
-    return CorrelationResult(primary_trace_id=trace_id, matches=matches, limitations=_LIMITATIONS)
+    return CorrelationResult(primary_trace_id=trace_id, matches=matches, limitations=limitations)

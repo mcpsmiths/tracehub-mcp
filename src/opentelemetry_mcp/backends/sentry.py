@@ -72,11 +72,11 @@ import logging
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
-from urllib.parse import quote
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
+from opentelemetry_mcp.backends.url_path import safe_path_segment
 from opentelemetry_mcp.constants import Fields
 from opentelemetry_mcp.models import (
     Filter,
@@ -180,6 +180,13 @@ _SPAN_SEARCH_FIELDS = list(_SPAN_STRUCTURAL_FIELDS) + list(_GEN_AI_FIELDS)
 # field like `x) OR (a:b` would inject arbitrary structure into the query.
 # Reject anything that doesn't match this allowlist pattern instead.
 _VALID_SENTRY_FIELD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
+
+# Sentry trace ids are always 32 hex characters. get_trace splices the id
+# into the /trace/{trace_id}/ path, and its callers include the tool layer
+# (an unvalidated argument), search_traces' hydration loop (ids read from
+# backend rows) and correlate_trace's secondary-backend lookup - so the
+# format check lives here, at the splice, rather than in any one caller.
+_SENTRY_TRACE_ID_RE = re.compile(r"[0-9a-fA-F]{32}")
 
 # Keys on a /trace/{id}/ SerializedTraceItem that this backend treats as
 # structural (already extracted into named SpanData fields) rather than
@@ -451,11 +458,22 @@ class SentryBackend(BaseBackend):
                 response shape is unexpected
             httpx.HTTPError: If the API request fails
         """
+        # trace_id can originate from an external MCP tool call (or a backend
+        # search row) and is a URL *path* segment here. quote() alone leaves
+        # "." / ".." intact and httpx collapses them during the base_url
+        # merge, so the endpoint reached with the operator's credential must
+        # be pinned before any URL is built: safe_path_segment rejects the
+        # dot/empty segments and over-long values (see backends/url_path.py),
+        # and Sentry trace ids are 32 hex characters. The length cap runs
+        # first so an over-long value is rejected on its length alone and is
+        # never echoed into the error that _handle_tool_error logs; the
+        # format error below therefore echoes at most 256 characters.
+        encoded_trace_id = safe_path_segment(trace_id, "trace_id")
+        if not _SENTRY_TRACE_ID_RE.fullmatch(trace_id):
+            raise ValueError(
+                f"Invalid Sentry trace_id format: {trace_id!r} (expected 32 hex characters)"
+            )
         start, end = self._time_range(None, None, lookback=_DEFAULT_LOOKBACK)
-        # trace_id can originate from an external MCP tool call. It's a URL
-        # *path* segment here (not a query-string token), so it needs path
-        # escaping rather than the query-value escaper used elsewhere.
-        encoded_trace_id = quote(trace_id, safe="")
 
         response = await self.client.get(
             f"/api/0/organizations/{self.org_slug}/trace/{encoded_trace_id}/",
@@ -593,7 +611,7 @@ class SentryBackend(BaseBackend):
                 status="unhealthy",
                 backend="sentry",
                 url=self.url,
-                error=str(e),
+                error=str(e) or type(e).__name__,
             )
 
     # -- internal helpers ---------------------------------------------------

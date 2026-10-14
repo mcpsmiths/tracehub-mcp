@@ -73,8 +73,9 @@ from typing import Any, Literal
 import httpx
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes
-from opentelemetry_mcp.backends.base import BaseBackend, _RetryingTransport
+from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
+from opentelemetry_mcp.backends.url_path import safe_path_segment
 from opentelemetry_mcp.constants import Fields, Status
 from opentelemetry_mcp.models import (
     Filter,
@@ -125,7 +126,8 @@ _MAX_REASONABLE_DURATION_MS = 1000 * 60 * 60 * 24 * 365 * 10
 # language), so there is no structural-injection risk the way there is for
 # Sentry/New Relic's own query builders - this allowlist is defense in depth
 # against a malformed/control-character-laden column name reaching the API,
-# not an injection guard.
+# not an injection guard. Applied with fullmatch(): with match(), the `$`
+# anchor also accepts a trailing newline.
 _VALID_HONEYCOMB_FIELD_RE = re.compile(r"^[A-Za-z0-9_.]+$")
 
 # Breakdown columns requested on every search, so results carry enough
@@ -166,9 +168,34 @@ _SEARCH_BREAKDOWNS = list(_STRUCTURAL_BREAKDOWNS) + list(_GEN_AI_BREAKDOWNS)
 _STRUCTURAL_ROW_FIELDS = frozenset(_STRUCTURAL_BREAKDOWNS)
 
 
+_MAX_PAYLOAD_EXCERPT_CHARS = 300
+
+
+def _payload_excerpt(payload: object) -> str:
+    """A bounded repr of an unexpected response payload for error text.
+
+    The body itself is already size-capped at the transport
+    (BACKEND_MAX_RESPONSE_BYTES), but a ValueError message that echoes the
+    whole repr would be a second copy of it in memory and in the tool-error
+    channel; a few hundred characters identify the shape just as well.
+    """
+    text = repr(payload)
+    if len(text) <= _MAX_PAYLOAD_EXCERPT_CHARS:
+        return text
+    return f"{text[:_MAX_PAYLOAD_EXCERPT_CHARS]}... ({len(text)} chars)"
+
+
 class HoneycombEnterpriseRequiredError(ValueError):
     """Raised when Honeycomb's Query Data API rejects a request with what
     this backend interprets as tier-gating (see module docstring point 1)."""
+
+
+class HoneycombRateLimitedError(RuntimeError):
+    """Raised by _RateLimiter.acquire(max_wait_seconds) when the next free
+    Create Query Result slot lies beyond the caller's wait budget - the
+    caller fails fast instead of parking toward a timeout it would hit
+    anyway (and instead of holding the limiter's lock for everyone behind
+    it while it does)."""
 
 
 class _RateLimiter:
@@ -184,6 +211,14 @@ class _RateLimiter:
     class exists to enforce. Holding the lock across the sleep means only
     one caller is ever waiting/appending at a time, so the cap is a true
     ceiling on throughput, not just a per-caller estimate.
+
+    One FIFO is shared by everything that runs a query under the same
+    Configuration Key: every MCP session's tool calls AND the readiness
+    probe (GET /ready -> list_services), which is unauthenticated. Because
+    the lock is held across the sleep, a caller's parking time is its
+    lock wait plus its own sleep, so ``acquire(max_wait_seconds)`` bounds
+    the whole acquire: the caller is released with
+    HoneycombRateLimitedError rather than parked past its budget.
     """
 
     def __init__(self, max_per_minute: int) -> None:
@@ -191,8 +226,35 @@ class _RateLimiter:
         self._call_times: collections.deque[float] = collections.deque()
         self._lock = asyncio.Lock()
 
-    async def acquire(self) -> None:
-        """Block until another call is safely under the per-minute cap."""
+    async def acquire(self, max_wait_seconds: float | None = None) -> None:
+        """Block until another call is safely under the per-minute cap.
+
+        Args:
+            max_wait_seconds: Upper bound on the time this caller may spend
+                inside acquire (lock wait plus sleep). None waits as long
+                as it takes.
+
+        Raises:
+            HoneycombRateLimitedError: The next slot is further away than
+                the remaining budget, or the budget elapsed while queued
+                behind other callers.
+        """
+        if max_wait_seconds is None:
+            await self._wait_for_slot(deadline=None)
+            return
+        try:
+            async with asyncio.timeout(max_wait_seconds) as budget:
+                await self._wait_for_slot(deadline=budget.when())
+        except TimeoutError:
+            raise HoneycombRateLimitedError(
+                f"Honeycomb Create Query Result budget ({self._max_per_minute}/min) is "
+                f"exhausted; gave up after waiting {max_wait_seconds:g} s for a slot"
+            ) from None
+
+    async def _wait_for_slot(self, *, deadline: float | None) -> None:
+        """The lock-holding wait loop. `deadline` is in the running loop's
+        time (asyncio.Timeout.when()); a wait that cannot finish before it
+        fails fast rather than parking the lock toward a known timeout."""
         async with self._lock:
             while True:
                 now = time.monotonic()
@@ -211,7 +273,40 @@ class _RateLimiter:
 
                 wait_seconds = 60.0 - (now - self._call_times[0])
                 if wait_seconds > 0:
+                    if deadline is not None:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if wait_seconds > remaining:
+                            raise HoneycombRateLimitedError(
+                                f"Honeycomb Create Query Result budget "
+                                f"({self._max_per_minute}/min) is exhausted; the next slot "
+                                f"frees in {wait_seconds:.1f} s, beyond the remaining "
+                                f"{max(remaining, 0.0):.1f} s wait budget"
+                            )
+                    logger.warning(
+                        "Honeycomb Create Query Result budget is full (%d calls in the last "
+                        "minute); parking this caller for %.1f s",
+                        len(self._call_times),
+                        wait_seconds,
+                    )
                     await asyncio.sleep(wait_seconds)
+
+
+# One limiter per (url, api_key): Honeycomb accounts the Create Query Result
+# limit per Configuration Key, so every backend instance built with the same
+# credential in this process (BACKEND_TYPE and SECONDARY_BACKEND_TYPE both
+# honeycomb) must pace through the same budget, not 10/min each.
+_rate_limiters: dict[tuple[str, str | None], _RateLimiter] = {}
+
+
+def _shared_rate_limiter(url: str, api_key: str | None) -> _RateLimiter:
+    """The one _RateLimiter every backend instance built with this (url,
+    api_key) shares, created on first use."""
+    key = (url, api_key)
+    limiter = _rate_limiters.get(key)
+    if limiter is None:
+        limiter = _RateLimiter(_QUERY_RESULT_RATE_LIMIT_PER_MINUTE)
+        _rate_limiters[key] = limiter
+    return limiter
 
 
 class HoneycombBackend(BaseBackend):
@@ -253,7 +348,8 @@ class HoneycombBackend(BaseBackend):
             )
 
         self.dataset = dataset
-        self._query_result_rate_limiter = _RateLimiter(_QUERY_RESULT_RATE_LIMIT_PER_MINUTE)
+        # Shared per credential, not per instance - see _rate_limiters.
+        self._query_result_rate_limiter = _shared_rate_limiter(self.url, self.api_key)
 
     def _create_headers(self) -> dict[str, str]:
         """Create headers for Honeycomb API requests.
@@ -281,9 +377,7 @@ class HoneycombBackend(BaseBackend):
                 headers=self._create_headers(),
                 timeout=self.timeout,
                 follow_redirects=False,
-                transport=_RetryingTransport(
-                    slow_request_threshold_ms=self.slow_request_threshold_ms
-                ),
+                transport=self._create_transport(),
             )
         return self._client
 
@@ -601,7 +695,10 @@ class HoneycombBackend(BaseBackend):
             return HealthCheckResponse(status="healthy", backend="honeycomb", url=self.url)
         except Exception as e:
             return HealthCheckResponse(
-                status="unhealthy", backend="honeycomb", url=self.url, error=str(e)
+                status="unhealthy",
+                backend="honeycomb",
+                url=self.url,
+                error=str(e) or type(e).__name__,
             )
 
     # -- internal helpers ---------------------------------------------------
@@ -757,15 +854,18 @@ class HoneycombBackend(BaseBackend):
         if not isinstance(query_id, str):
             raise ValueError(
                 f"Unexpected Honeycomb create-query response shape "
-                f"(expected an 'id' string, got {type(payload).__name__}): {payload!r}"
+                f"(expected an 'id' string, got {type(payload).__name__}): {_payload_excerpt(payload)}"
             )
         return query_id
 
     async def _create_query_result(self, query_id: str) -> str:
         """POST /1/query_results/{dataset} - kicks off an async query run.
 
-        Proactively rate-limited (see _RateLimiter). A 402/403 is
-        interpreted as Enterprise-tier gating (module docstring point 1).
+        Proactively rate-limited (see _RateLimiter), with the caller's wait
+        bounded by this backend's own request timeout: the sleep precedes
+        the request, so without the bound a parked call outlives
+        BACKEND_TIMEOUT. A 402/403 is interpreted as Enterprise-tier gating
+        (module docstring point 1).
 
         Args:
             query_id: The query specification's ID to run
@@ -774,10 +874,12 @@ class HoneycombBackend(BaseBackend):
             The created query result's ID
 
         Raises:
+            HoneycombRateLimitedError: If no Create Query Result slot frees
+                within `timeout` seconds
             HoneycombEnterpriseRequiredError: On a 402/403 response
             ValueError: If the response shape is unexpected
         """
-        await self._query_result_rate_limiter.acquire()
+        await self._query_result_rate_limiter.acquire(max_wait_seconds=self.timeout)
 
         response = await self._post_checking_enterprise_gating(
             f"/1/query_results/{self.dataset}", {"query_id": query_id}
@@ -787,7 +889,7 @@ class HoneycombBackend(BaseBackend):
         if not isinstance(result_id, str):
             raise ValueError(
                 f"Unexpected Honeycomb create-query-result response shape "
-                f"(expected an 'id' string, got {type(payload).__name__}): {payload!r}"
+                f"(expected an 'id' string, got {type(payload).__name__}): {_payload_excerpt(payload)}"
             )
         return result_id
 
@@ -795,26 +897,32 @@ class HoneycombBackend(BaseBackend):
         """GET /1/query_results/{dataset}/{resultId} until complete or timeout.
 
         Args:
-            result_id: The query result's ID to poll
+            result_id: The query result's ID to poll - read from the
+                backend's own create-query-result response, so it is
+                validated and percent-encoded as exactly one path segment
+                (safe_path_segment) before any request is built
 
         Returns:
             List of raw result rows
 
         Raises:
-            ValueError: If the query never completes within the server's
+            ValueError: If the result id is not a valid single path segment
+                ("." / ".." / "" would be collapsed into a different
+                endpoint), if the query never completes within the server's
                 own documented execution timeout, or the response shape is
                 unexpected
         """
+        encoded_result_id = safe_path_segment(result_id, "result_id")
         deadline = time.monotonic() + _QUERY_EXECUTION_TIMEOUT_SECONDS + _POLL_INTERVAL_SECONDS
         while True:
-            response = await self.client.get(f"/1/query_results/{self.dataset}/{result_id}")
+            response = await self.client.get(f"/1/query_results/{self.dataset}/{encoded_result_id}")
             response.raise_for_status()
             payload = response.json()
 
             if not isinstance(payload, dict):
                 raise ValueError(
                     f"Unexpected Honeycomb query-result response shape "
-                    f"(expected an object, got {type(payload).__name__}): {payload!r}"
+                    f"(expected an object, got {type(payload).__name__}): {_payload_excerpt(payload)}"
                 )
 
             if payload.get("complete"):
@@ -823,7 +931,7 @@ class HoneycombBackend(BaseBackend):
                 if not isinstance(results, list):
                     raise ValueError(
                         "Unexpected Honeycomb query-result response shape "
-                        f"(expected data.results to be a list): {payload!r}"
+                        f"(expected data.results to be a list): {_payload_excerpt(payload)}"
                     )
                 return [r for r in results if isinstance(r, dict)]
 
@@ -892,7 +1000,7 @@ class HoneycombBackend(BaseBackend):
             Honeycomb filter dict, or None if unsupported/unsafe
         """
         field = self._honeycomb_field(filter_obj.field)
-        if not _VALID_HONEYCOMB_FIELD_RE.match(field):
+        if not _VALID_HONEYCOMB_FIELD_RE.fullmatch(field):
             logger.warning(f"Rejecting filter with unsafe/invalid Honeycomb column name: {field!r}")
             return None
 

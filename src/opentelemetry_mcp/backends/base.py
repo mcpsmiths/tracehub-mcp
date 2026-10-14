@@ -1,10 +1,12 @@
 """Abstract base backend for OpenTelemetry trace storage systems."""
 
+import asyncio
 import functools
 import logging
 import time
+import zlib
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -18,19 +20,25 @@ from tenacity import (
     retry_any,
     retry_if_exception_type,
     retry_if_result,
-    stop_after_attempt,
     wait_exponential,
 )
 
 from opentelemetry_mcp.attributes import HealthCheckResponse
-from opentelemetry_mcp.backends.cache import TTLCoalescingCache
+from opentelemetry_mcp.backends.cache import DEFAULT_QUERY_CACHE_MAX_ENTRIES, TTLCoalescingCache
 from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceData, TraceQuery
 from opentelemetry_mcp.security import is_cloud_metadata_host
 
 logger = logging.getLogger(__name__)
 
 # health_check() is deliberately excluded: /ready and doctor both depend on
-# it reflecting live backend state, and caching it would defeat that.
+# it reflecting live backend state, and caching it would defeat that. The
+# rule that follows from it: health_check() and every readiness-probe helper
+# must never call a cache-wrapped PUBLIC method listed here (a backend's own
+# health_check that awaited self.list_services() would be answered from the
+# cache for a whole TTL after the backend failed). Call a private uncached
+# helper instead (XRayBackend._list_services_uncached,
+# JaegerBackend._list_services_uncached, DatadogBackend._search_spans_raw);
+# server._run_backend_checks probes through list_services_uncached() below.
 _CACHEABLE_METHODS = (
     "search_traces",
     "search_spans",
@@ -38,13 +46,76 @@ _CACHEABLE_METHODS = (
     "list_services",
     "get_service_operations",
 )
+# The two methods that take a TraceQuery/SpanQuery and therefore carry a
+# `limit` the operator's MAX_TRACES_PER_QUERY must bound. Clamped at this
+# boundary - not only in the tool handlers that call server._clamp_limit -
+# because handlers re-expand the clamped value (expensive/slow traces fetch
+# limit * 10), helpers pick their own limits (model_stats 1000, correlate 20)
+# and new callers appear; the boundary covers all of them, present and future.
+_QUERY_LIMITED_METHODS = ("search_traces", "search_spans")
+
+
+# Upper bound on the rendered size of one cache key. A key is built from the
+# validated arguments (pydantic models rendered with model_dump_json), so its
+# size tracks the request's - up to the MCP transport's request-body cap. For
+# Jaeger any non-service.name filter is applied client-side, so a request
+# carrying an arbitrarily large filter value costs the backend one small GET
+# that succeeds empty while the server would retain the whole filter text
+# under the key. A call whose key exceeds this is still served; it just never
+# occupies a cache slot.
+_MAX_CACHE_KEY_BYTES = 64 * 1024
+
+
+def _render_cache_part(value: Any) -> Any:
+    return value.model_dump_json() if isinstance(value, BaseModel) else value
 
 
 def _cache_key(method_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
     parts: list[Any] = [method_name]
-    for value in (*args, *kwargs.values()):
-        parts.append(value.model_dump_json() if isinstance(value, BaseModel) else value)
+    parts.extend(_render_cache_part(value) for value in args)
+    # Keyword names participate (sorted, so call-site order is irrelevant):
+    # two calls passing the same values under different parameter names are
+    # different queries and must not share an entry.
+    parts.extend((name, _render_cache_part(value)) for name, value in sorted(kwargs.items()))
     return tuple(parts)
+
+
+def _cache_key_size(key: tuple[Any, ...]) -> int:
+    """UTF-8 size of every string the key carries - the only parts whose
+    size a caller controls (method names, ids, rendered query models)."""
+    size = 0
+    for part in key:
+        value = part[1] if isinstance(part, tuple) else part
+        if isinstance(value, str):
+            size += len(value.encode("utf-8"))
+    return size
+
+
+def _wrap_with_query_limit(
+    method_name: str, original: Callable[..., Awaitable[Any]]
+) -> Callable[..., Awaitable[Any]]:
+    """Clamp the query's `limit` to self.max_query_limit before `original`
+    (the cache wrapper, then the backend's own method) sees it. Applied
+    OUTSIDE _wrap_with_cache so the cache key is computed from the clamped
+    query: limit=500 and limit=1000 under a ceiling of 50 are the same
+    backend query and share one entry. The caller's query object is never
+    mutated - a copy with the clamped limit is handed down."""
+
+    @functools.wraps(original)
+    async def wrapper(self: "BaseBackend", *args: Any, **kwargs: Any) -> Any:
+        ceiling = self.max_query_limit
+        if ceiling is None:
+            return await original(self, *args, **kwargs)
+        query = args[0] if args else kwargs.get("query")
+        if isinstance(query, TraceQuery | SpanQuery) and query.limit > ceiling:
+            clamped = query.model_copy(update={"limit": ceiling})
+            if args:
+                args = (clamped, *args[1:])
+            else:
+                kwargs = {**kwargs, "query": clamped}
+        return await original(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _wrap_with_cache(
@@ -56,6 +127,10 @@ def _wrap_with_cache(
         if cache is None:
             return await original(self, *args, **kwargs)
         key = _cache_key(method_name, args, kwargs)
+        if _cache_key_size(key) > _MAX_CACHE_KEY_BYTES:
+            # Oversized key: no lookup, no store - a request-sized key must
+            # never occupy one of the bounded slots.
+            return await original(self, *args, **kwargs)
         return await cache.get_or_compute(key, lambda: original(self, *args, **kwargs))
 
     return wrapper
@@ -68,6 +143,374 @@ class MetadataEndpointBlockedError(httpx.TransportError):
     """
 
 
+class RedirectTargetBlockedError(httpx.TransportError):
+    """Raised when a request (in practice a redirect hop chosen by the
+    backend's own 3xx response) targets an origin - scheme, host, port -
+    other than the operator-configured backend's. Like
+    MetadataEndpointBlockedError, never retried - the hop is refused before
+    the wrapped transport sees it.
+    """
+
+
+# scheme -> port a URL without an explicit port means, so that
+# http://backend.test and http://backend.test:80 are one origin.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_of(url: httpx.URL) -> tuple[str, str, int | None]:
+    """(scheme, host, port) of a URL - lower-cased, default port filled in,
+    userinfo/path/query dropped - the triple the origin pin compares."""
+    scheme = url.scheme.lower()
+    port = url.port if url.port is not None else _DEFAULT_PORTS.get(scheme)
+    return scheme, (url.host or "").lower(), port
+
+
+def _format_origin(origin: tuple[str, str, int | None]) -> str:
+    scheme, host, port = origin
+    return f"{scheme}://{host}" if port is None else f"{scheme}://{host}:{port}"
+
+
+# How much of a REFUSED origin reaches the refusal text. Its host comes from
+# the backend's own Location header, so it is backend-chosen like a
+# Content-Encoding value and reaches the same two sinks - the tool-error
+# channel and the server log; a 5 kB hostname used to land in both whole
+# (round-2 review of the origin pin). Cut to the same 64 characters the
+# encoding value is cut to, with a marker, and repr()-quoted so a control
+# character never reaches a terminal unescaped. The configured origin in the
+# same message is operator-set and stays whole.
+_MAX_QUOTED_ORIGIN_CHARS = 64
+
+
+def _bounded_origin_repr(origin: tuple[str, str, int | None]) -> str:
+    text = _format_origin(origin)
+    if len(text) > _MAX_QUOTED_ORIGIN_CHARS:
+        text = text[:_MAX_QUOTED_ORIGIN_CHARS] + "..."
+    return repr(text)
+
+
+# Ceiling on the DECODED (post-Content-Encoding) size of any single backend
+# response, in bytes. httpx advertises Accept-Encoding: gzip, deflate and
+# inflates transparently on the read path, so without a bound a ~1 KB wire
+# body chosen by the backend (or a redirect target) becomes ~1 MB of heap,
+# then ~3x that again when json() parses it - in the one process every MCP
+# session and GET /ready share. 64 MiB is far above a MAX_TRACES_PER_QUERY=500
+# Jaeger response in normal use; BACKEND_MAX_RESPONSE_BYTES raises or lowers
+# it per deployment (config.py).
+DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+# int() refuses a digit string longer than sys.int_info.str_digits_check_threshold
+# (4300 digits) with a bare ValueError. A Content-Length with more digits than
+# this is oversized by construction (19 digits is already ~10^9 times the 1 GiB
+# config ceiling), so it is refused without being parsed - as
+# ResponseTooLargeError, not as an unrelated interpreter message.
+_MAX_CONTENT_LENGTH_DIGITS = 19
+
+
+class ResponseTooLargeError(httpx.TransportError):
+    """Raised when a backend (or redirect-target) response declares, or
+    decodes to, more than the configured max_response_bytes. Deliberately
+    not one of the retryable exceptions below - the same backend would send
+    the same body again.
+    """
+
+
+# The Content-Encodings the transport decodes itself, through
+# zlib.decompressobj driven with max_length, so that no decoding step ever
+# materialises more than the remaining byte budget plus one byte. httpx's own
+# decoders inflate each wire chunk completely before anything downstream can
+# count it, and a 64 KiB gzip chunk of zeros is ~64 MiB decoded: with the
+# httpx path, BACKEND_MAX_RESPONSE_BYTES bounded what was BUFFERED, not the
+# peak (one refused 200 MiB-decoded body under a 1 MiB cap cost +121 MiB
+# RSS in the runtime probe; eight concurrent ones ~500 MB). brotli and zstd
+# have no bounded-output decoder in the installed stack and are refused,
+# and the outgoing Accept-Encoding is held to this set so a well-behaved
+# backend never picks one of them (_BOUNDED_ACCEPT_ENCODING).
+_ZLIB_WBITS_BY_ENCODING = {
+    "gzip": zlib.MAX_WBITS | 16,
+    "x-gzip": zlib.MAX_WBITS | 16,
+    "deflate": zlib.MAX_WBITS,  # zlib-wrapped first; raw deflate on a header failure
+}
+_BOUNDED_ACCEPT_ENCODING = "gzip, deflate"
+_ACCEPTABLE_ENCODING_TOKENS = frozenset({*_ZLIB_WBITS_BY_ENCODING, "identity"})
+# How much of a backend-chosen Content-Encoding value reaches the error text
+# (tool-error channel and server log); repr()-quoted like 600ffb5's header
+# values so a control character can never reach a terminal unescaped.
+_MAX_QUOTED_ENCODING_CHARS = 64
+
+
+class UnsupportedContentEncodingError(httpx.TransportError):
+    """Raised, before a byte of the body is read, when a backend response
+    carries a Content-Encoding the transport cannot decode within the
+    byte budget (brotli, zstd, anything unknown, or a chain of encodings).
+    Not retryable: the same backend would answer the same way. httpx would
+    otherwise pass an unknown encoding through undecoded and inflate br/
+    zstd without an output bound when those extras are installed.
+    """
+
+
+def _content_encoding(headers: httpx.Headers) -> str | None:
+    """The one non-identity Content-Encoding of a response, or None for an
+    unencoded body. Raises UnsupportedContentEncodingError for an encoding
+    outside _ZLIB_WBITS_BY_ENCODING or for more than one applied encoding."""
+    encodings = [
+        value.strip().lower()
+        for value in headers.get_list("content-encoding", split_commas=True)
+        if value.strip() and value.strip().lower() != "identity"
+    ]
+    if not encodings:
+        return None
+    if len(encodings) == 1 and encodings[0] in _ZLIB_WBITS_BY_ENCODING:
+        return encodings[0]
+    shown = ", ".join(encodings)[:_MAX_QUOTED_ENCODING_CHARS]
+    raise UnsupportedContentEncodingError(
+        f"Backend response uses Content-Encoding {shown!r}, which cannot be decoded "
+        f"within BACKEND_MAX_RESPONSE_BYTES (only {_BOUNDED_ACCEPT_ENCODING} are accepted); "
+        "refusing to read it"
+    )
+
+
+def _offers_only_bounded_encodings(request: httpx.Request) -> bool:
+    """True when the request's Accept-Encoding names only codecs the
+    transport can bound (q-values ignored; an absent header or '*' invites
+    any codec and so counts as unbounded)."""
+    tokens = [
+        value.split(";", 1)[0].strip().lower()
+        for value in request.headers.get_list("accept-encoding", split_commas=True)
+    ]
+    return bool(tokens) and all(token in _ACCEPTABLE_ENCODING_TOKENS for token in tokens)
+
+
+class _BoundedInflater:
+    """zlib.decompressobj for one Content-Encoding, fed wire bytes with an
+    explicit output ceiling: decompress(raw, max_length) returns at most
+    max_length bytes and parks the rest of the INPUT in unconsumed_tail, so
+    a chunk that would inflate past the budget costs budget + 1 bytes, not
+    its full expansion. Mirrors httpx's DeflateDecoder in accepting both
+    zlib-wrapped and raw deflate, and its GZipDecoder in raising
+    httpx.DecodingError for a damaged stream."""
+
+    def __init__(self, encoding: str) -> None:
+        self._wbits = _ZLIB_WBITS_BY_ENCODING[encoding]
+        self._decompressor = zlib.decompressobj(self._wbits)
+        self._may_retry_as_raw_deflate = self._wbits == zlib.MAX_WBITS
+
+    def inflate(self, raw: bytes, max_length: int) -> bytes:
+        try:
+            decoded = self._decompressor.decompress(raw, max_length)
+        except zlib.error as exc:
+            if self._may_retry_as_raw_deflate:
+                # A deflate body sent without the zlib wrapper fails the
+                # header check on its first bytes; retry once as raw deflate,
+                # exactly as httpx does, then commit to that form.
+                self._may_retry_as_raw_deflate = False
+                self._decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+                return self.inflate(raw, max_length)
+            raise httpx.DecodingError(str(exc)) from exc
+        self._may_retry_as_raw_deflate = False
+        return decoded
+
+    def flush(self) -> bytes:
+        try:
+            return self._decompressor.flush()
+        except zlib.error as exc:
+            raise httpx.DecodingError(str(exc)) from exc
+
+
+# The wall-clock deadline for one LOGICAL backend request - connect, every
+# retry attempt and the sleep before it, every redirect hop and the whole
+# body read - derived from the operator's BACKEND_TIMEOUT as
+# max(_MIN_REQUEST_DEADLINE_SECONDS, _REQUEST_DEADLINE_TIMEOUT_MULTIPLIER x
+# timeout). httpx's timeout is per SOCKET OPERATION (connect, one read, one
+# write), so without this a backend that completes every operation just
+# inside BACKEND_TIMEOUT - one body byte every 2 s under a 5 s timeout, far
+# below the decoded-size cap - holds a tool call, and with the query cache
+# every coalesced caller, indefinitely (302.5 s in the runtime probe, ended
+# only by killing the backend). Four timeouts cover the worst legitimate
+# shape the retry policy allows (three attempts plus the 10 s retry budget)
+# with room for a slow body; the floor keeps a small BACKEND_TIMEOUT from
+# cutting a large but healthy response. No separate knob: raising
+# BACKEND_TIMEOUT raises this proportionally.
+_REQUEST_DEADLINE_TIMEOUT_MULTIPLIER = 4
+_MIN_REQUEST_DEADLINE_SECONDS = 30.0
+# request.extensions key under which _RetryingTransport keeps the per-logical-
+# request _RequestBudget. httpx builds a fresh Request for every redirect hop
+# but passes `extensions=request.extensions` to it (_build_redirect_request,
+# pinned by tests/test_base_backend.py), so the budget object - not a copy -
+# reaches every hop; a retried attempt reuses the same Request outright.
+_REQUEST_BUDGET_EXTENSION = "tracehub_request_budget"
+
+
+def request_deadline_seconds(timeout: float | None) -> float:
+    """The total deadline for one logical backend request, derived from the
+    backend's per-operation `timeout` (BACKEND_TIMEOUT): four timeouts, and
+    never below 30 s. See _REQUEST_DEADLINE_TIMEOUT_MULTIPLIER."""
+    if timeout is None:
+        return _MIN_REQUEST_DEADLINE_SECONDS
+    return max(_MIN_REQUEST_DEADLINE_SECONDS, _REQUEST_DEADLINE_TIMEOUT_MULTIPLIER * float(timeout))
+
+
+class BackendDeadlineExceededError(httpx.TransportError):
+    """Raised when one logical backend request (all attempts, redirect hops
+    and the body read together) has not completed within the transport's
+    total deadline. A sibling of httpx.TimeoutException on purpose, not a
+    subclass: the retry predicate re-sends TimeoutExceptions, and no second
+    attempt can fit inside a deadline that has already passed.
+    """
+
+
+class _RequestBudget:
+    """What one LOGICAL backend request has left, shared by every attempt
+    and redirect hop of that request via request.extensions (see
+    _REQUEST_BUDGET_EXTENSION). `deadline` is a time.monotonic() instant,
+    or None for a transport built without a total deadline; the retry
+    budget (_MAX_ATTEMPTS - 1 retries, _MAX_RETRY_AFTER_SECONDS of
+    cumulative sleep) and the redirect hop count are spent across the
+    whole chain, never re-armed per hop."""
+
+    __slots__ = ("deadline", "hops", "retries_used", "retry_sleep_used")
+
+    def __init__(self, deadline: float | None) -> None:
+        self.deadline = deadline
+        self.hops = 0
+        self.retries_used = 0
+        self.retry_sleep_used = 0.0
+
+    def can_afford_retry(self, sleep_seconds: float) -> bool:
+        """Whether one more retry, preceded by `sleep_seconds` of sleep,
+        fits what the logical request has left: a retry still unspent, the
+        cumulative sleep still under the ceiling, and the deadline not
+        reached by the end of the sleep. A sleep that cannot fit is not
+        taken at all - the backend's real last outcome reaches the caller
+        now rather than after an idle wait up to the deadline."""
+        if self.retries_used >= _MAX_ATTEMPTS - 1:
+            return False
+        if self.retry_sleep_used + sleep_seconds > _MAX_RETRY_AFTER_SECONDS:
+            return False
+        return self.deadline is None or time.monotonic() + sleep_seconds < self.deadline
+
+    def spend_retry(self, sleep_seconds: float) -> None:
+        self.retries_used += 1
+        self.retry_sleep_used += sleep_seconds
+
+    def remaining_seconds(self) -> float | None:
+        """Seconds left before the deadline (None = unbounded). Raises
+        BackendDeadlineExceededError once the deadline has passed, so a
+        caller about to start another await never does so with no budget."""
+        if self.deadline is None:
+            return None
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise _deadline_exceeded()
+        return remaining
+
+
+def _deadline_exceeded() -> BackendDeadlineExceededError:
+    return BackendDeadlineExceededError(
+        "Backend request did not complete within its total deadline "
+        f"({_REQUEST_DEADLINE_TIMEOUT_MULTIPLIER} x BACKEND_TIMEOUT, at least "
+        f"{_MIN_REQUEST_DEADLINE_SECONDS:.0f} s, covering every retry, redirect hop "
+        "and the body read); giving up"
+    )
+
+
+class _BoundedResponse(httpx.Response):
+    """The response _RetryingTransport hands back to httpx: the wrapped
+    transport's status, headers, body stream and extensions, with an
+    aiter_bytes() that decodes the RAW wire bytes itself under the byte
+    budget (see _BoundedInflater) and raises ResponseTooLargeError the
+    moment the decoded total passes the cap, and that gives up with
+    BackendDeadlineExceededError when the logical request's deadline passes
+    between two chunks (a body trickling in below the read timeout).
+
+    httpx (~=0.28) reads every non-stream response - and every redirect hop
+    it follows - through Response.aread(), which is implemented over
+    aiter_bytes(), so this one override bounds all 25 response.json() sites
+    across the backends with no call-site changes. Peak materialisation is
+    bounded by the cap plus one wire chunk, never by a chunk's expansion.
+    `chunk_size` is accepted for signature compatibility; decoded data is
+    yielded as each wire chunk produces it (only aread() consumes this).
+    """
+
+    def __init__(
+        self,
+        inner: httpx.Response,
+        max_response_bytes: int,
+        budget: _RequestBudget,
+        encoding: str | None,
+    ) -> None:
+        super().__init__(
+            inner.status_code,
+            headers=inner.headers,
+            stream=inner.stream,
+            extensions=inner.extensions,
+        )
+        self._max_response_bytes = max_response_bytes
+        self._budget = budget
+        # Not `_encoding`: httpx.Response keeps the text charset there.
+        self._content_encoding = encoding
+
+    async def _raise_too_large(self) -> None:
+        # Release the pooled connection now rather than leaving the
+        # half-read body to the client's own exception handling.
+        await self.aclose()
+        raise ResponseTooLargeError(
+            f"Backend response exceeded {self._max_response_bytes} decoded bytes "
+            "(BACKEND_MAX_RESPONSE_BYTES); refusing to buffer it"
+        )
+
+    async def aiter_bytes(self, chunk_size: int | None = None) -> AsyncIterator[bytes]:
+        if hasattr(self, "_content"):
+            # Already read and decoded: httpx serves it from memory.
+            async for chunk in super().aiter_bytes(chunk_size):
+                yield chunk
+            return
+        inflater = (
+            None if self._content_encoding is None else _BoundedInflater(self._content_encoding)
+        )
+        decoded_total = 0
+        raw_chunks = self.aiter_raw()
+        while True:
+            # Each wait for the next chunk is capped at the time left on the
+            # logical request, not at httpx's per-read timeout: a backend
+            # pacing its bytes just inside the read timeout keeps every
+            # individual read "healthy" while the request as a whole never
+            # ends. The expired scope is the only TimeoutError converted
+            # here; any other one is somebody else's and propagates as is.
+            try:
+                remaining = self._budget.remaining_seconds()
+            except BackendDeadlineExceededError:
+                await self.aclose()
+                raise
+            try:
+                async with asyncio.timeout(remaining) as scope:
+                    raw = await anext(raw_chunks)
+            except StopAsyncIteration:
+                break
+            except TimeoutError:
+                if not scope.expired():
+                    raise
+                await self.aclose()
+                raise _deadline_exceeded() from None
+            if inflater is None:
+                decoded = raw
+            else:
+                # max_length = budget left + 1: a chunk that fits produces
+                # all of its output (unconsumed_tail stays empty); one that
+                # does not stops at the first byte over the cap.
+                decoded = inflater.inflate(raw, self._max_response_bytes - decoded_total + 1)
+            decoded_total += len(decoded)
+            if decoded_total > self._max_response_bytes:
+                await self._raise_too_large()
+            if decoded:
+                yield decoded
+        if inflater is not None:
+            tail = inflater.flush()
+            decoded_total += len(tail)
+            if decoded_total > self._max_response_bytes:
+                await self._raise_too_large()
+            if tail:
+                yield tail
+
+
 # Only genuine transport-level failures - a connection that never completed
 # or a request that timed out - are worth retrying on their own. An HTTP
 # response with a 4xx/5xx status code is a *successful* transport exchange
@@ -75,15 +518,42 @@ class MetadataEndpointBlockedError(httpx.TransportError):
 # never retried via this mechanism. 429 is retried too, but as a *result*
 # condition (see _is_rate_limited) rather than an exception, since asking to
 # slow down and retry is exactly what 429 means - unlike a genuine 4xx/5xx
-# error, which should reach the caller immediately.
+# error, which should reach the caller immediately. The retry sleep runs
+# here in the transport, OUTSIDE the per-attempt httpx timeout, so a
+# backend-chosen Retry-After is honoured only up to _MAX_RETRY_AFTER_SECONDS
+# (the same ceiling as the exponential fallback): a 429 asking for more is
+# not retried at all and reaches the caller after the current attempt.
+# Both budgets - the attempts and the sleep - belong to the LOGICAL request
+# (_RequestBudget), not to one redirect hop: httpx re-enters
+# handle_async_request for every hop, and a backend that answered each hop
+# with two in-budget 429s before redirecting on re-armed both budgets per
+# hop (3 hops x 2 x 5 s = 30.3 s over 10 backend requests in the runtime
+# probe; ~400 s at httpx's default 20 hops), so the ceiling was per
+# response in name only. Now at most _MAX_ATTEMPTS - 1 retries and
+# _MAX_RETRY_AFTER_SECONDS of sleep are spent across the whole chain, and
+# the chain itself is at most _MAX_REDIRECT_HOPS redirects long.
 _RETRYABLE_TRANSPORT_EXCEPTIONS = (httpx.ConnectError, httpx.TimeoutException)
 
-_DEFAULT_RETRY_WAIT = wait_exponential(multiplier=1, max=10)
+_MAX_ATTEMPTS = 3
+_MAX_RETRY_AFTER_SECONDS = 10.0
+_DEFAULT_RETRY_WAIT = wait_exponential(multiplier=1, max=_MAX_RETRY_AFTER_SECONDS)
+# Redirects followed per logical request, enforced by the transport (so no
+# backend's own client construction can miss it) and mirrored as
+# max_redirects on BaseBackend.client. httpx's default is 20; the backends
+# this server talks to redirect at most once (an http->https upgrade or a
+# trailing-slash canonicalisation), so five is already generous.
+_MAX_REDIRECT_HOPS = 5
 
 
 def _is_rate_limited(response: Any) -> bool:
-    """True if a completed (non-exception) attempt was a 429 response."""
-    return isinstance(response, httpx.Response) and response.status_code == 429
+    """True if a completed (non-exception) attempt was a 429 whose
+    Retry-After (if any) fits the retry budget. A 429 asking for a longer
+    wait is not retried; tenacity hands the real response back and the
+    backend's own raise_for_status() surfaces it immediately."""
+    if not (isinstance(response, httpx.Response) and response.status_code == 429):
+        return False
+    retry_after = _retry_after_seconds(response)
+    return retry_after is None or retry_after <= _MAX_RETRY_AFTER_SECONDS
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
@@ -99,7 +569,10 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     if value is None:
         return None
     value = value.strip()
-    if value.isdigit():
+    # isascii() too: str.isdigit() is true for non-ASCII digits such as
+    # U+00B2, which float() then rejects - a ValueError escaping the wait
+    # strategy would surface out of tenacity as an unrelated crash.
+    if value.isascii() and value.isdigit():
         return float(value)
     try:
         retry_time: datetime = parsedate_to_datetime(value)
@@ -111,16 +584,17 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
 
 
 def _wait_for_retry(retry_state: RetryCallState) -> float:
-    """Respect a 429 response's Retry-After header when present, otherwise
-    fall back to the same exponential backoff used for connect/timeout
-    retries."""
+    """Respect a 429 response's Retry-After header when present, up to
+    _MAX_RETRY_AFTER_SECONDS (belt and braces behind _is_rate_limited, which
+    already refuses to retry an over-cap 429), otherwise fall back to the
+    same exponential backoff used for connect/timeout retries."""
     outcome = retry_state.outcome
     if outcome is not None and not outcome.failed:
         response = outcome.result()
         if isinstance(response, httpx.Response):
             retry_after = _retry_after_seconds(response)
             if retry_after is not None:
-                return retry_after
+                return min(retry_after, _MAX_RETRY_AFTER_SECONDS)
     return _DEFAULT_RETRY_WAIT(retry_state)
 
 
@@ -134,6 +608,9 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         self,
         wrapped: httpx.AsyncBaseTransport | None = None,
         slow_request_threshold_ms: float | None = None,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        total_deadline_seconds: float | None = None,
+        allowed_origin: str | None = None,
     ) -> None:
         """Wrap an underlying transport (defaults to a fresh AsyncHTTPTransport).
 
@@ -142,26 +619,118 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
             slow_request_threshold_ms: If set, log a warning for any request
                 that takes longer than this, independent of the configured
                 log level
+            allowed_origin: If set, a URL whose scheme, host and port
+                (default port filled in; userinfo and path ignored) are the
+                only origin this transport will send to - any other is
+                refused with RedirectTargetBlockedError. Every backend's
+                `client` sets it to the configured backend URL, so a 3xx
+                Location chosen by the backend can never steer the shared
+                client elsewhere: not to another host, and not to another
+                port or scheme on the same host either. This is the ONLY
+                pin: the earlier host-only parameter (allowed_host) let a
+                backend redirect into the MCP server's own listener and was
+                removed rather than kept as a weaker opt-in; None (the
+                test-convenience shape) means no pin at all.
+            max_response_bytes: Ceiling on the DECODED size of any single
+                response (initial or redirect hop). A larger declared
+                Content-Length is refused before the body is read; a body
+                that decodes past the cap raises ResponseTooLargeError
+                mid-read (see _BoundedResponse).
+            total_deadline_seconds: If set, the wall-clock budget for one
+                LOGICAL request - connect, every retry attempt and sleep,
+                every redirect hop and the whole body read - after which
+                BackendDeadlineExceededError is raised wherever the request
+                happens to be. Every backend's `client` sets it from
+                request_deadline_seconds(timeout).
         """
         self._wrapped = wrapped if wrapped is not None else httpx.AsyncHTTPTransport()
         self._slow_request_threshold_ms = slow_request_threshold_ms
+        self._allowed_origin = (
+            _origin_of(httpx.URL(allowed_origin)) if allowed_origin is not None else None
+        )
+        self._max_response_bytes = max_response_bytes
+        self._total_deadline_seconds = total_deadline_seconds
+
+    def _budget_for(self, request: httpx.Request) -> _RequestBudget:
+        """The logical request's budget: created on the first hop of a
+        request (the clock starts here), found again on every retry (same
+        Request) and redirect hop (same extensions, see
+        _REQUEST_BUDGET_EXTENSION). No backend reuses a Request object
+        across logical requests, so a stale budget is never inherited."""
+        budget = request.extensions.get(_REQUEST_BUDGET_EXTENSION)
+        if not isinstance(budget, _RequestBudget):
+            deadline = (
+                None
+                if self._total_deadline_seconds is None
+                else time.monotonic() + self._total_deadline_seconds
+            )
+            budget = _RequestBudget(deadline)
+            request.extensions[_REQUEST_BUDGET_EXTENSION] = budget
+        return budget
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        """Delegate to the wrapped transport, retrying up to 3 total attempts
-        (with exponential backoff, capped around 10s, or a 429's own
-        Retry-After header when present) on connect/timeout failures or a
-        429 rate-limit response.
+        """Delegate to the wrapped transport, retrying connect/timeout
+        failures and 429 rate-limit responses - with exponential backoff
+        capped at 10 s, or a 429's own Retry-After header when present and
+        no larger than that same 10 s ceiling - within ONE budget for the
+        whole logical request: at most 3 attempts and 10 s of cumulative
+        sleep across every redirect hop, at most 5 redirect hops, and one
+        total deadline (total_deadline_seconds) covering the attempts, the
+        sleeps, the hops and the body read. A 429 whose Retry-After exceeds
+        the ceiling, or that the remaining budget cannot afford, is returned
+        after the current attempt with no retry sleep - the backend may not
+        park this process; past the deadline BackendDeadlineExceededError is
+        raised instead of waiting on the backend any longer.
         """
+        budget = self._budget_for(request)
+        budget.hops += 1
+        if budget.hops > _MAX_REDIRECT_HOPS + 1:
+            # The client's own max_redirects (set to the same cap on
+            # BaseBackend.client) normally fires first; this is the backstop
+            # for a client built elsewhere with httpx's default of 20.
+            raise httpx.TooManyRedirects(
+                f"Refusing redirect hop {budget.hops - 1}: at most {_MAX_REDIRECT_HOPS} "
+                "redirects are followed per backend request",
+                request=request,
+            )
         # httpx re-invokes handle_async_request on every redirect hop when
-        # follow_redirects=True, so this single check - run before every
-        # attempt, including redirect targets - blocks a compromised or
-        # misbehaving backend from redirecting a request toward a cloud
-        # metadata endpoint, for all five backends, regardless of each
-        # backend's own follow_redirects setting.
+        # follow_redirects=True, so these checks - run before every attempt,
+        # including redirect targets - apply to every backend regardless of
+        # its own follow_redirects setting. Two layers: the metadata
+        # denylist (canonicalising encoded IPv4 spellings, see security.py)
+        # refuses the one class of host that is never legitimate even for
+        # the operator's own URL, and the origin pin refuses any scheme,
+        # host or port the operator did not configure - which also covers
+        # DNS aliases of a metadata address, arbitrary internal hosts that
+        # no denylist could enumerate, and every other service on the
+        # backend's own host (the runtime probe had a backend redirect
+        # GET /health into this MCP server's listener under a host-only
+        # pin). A 307/308 is refused here before its body is re-sent
+        # anywhere.
         if is_cloud_metadata_host(request.url.host):
             raise MetadataEndpointBlockedError(
                 f"Refusing to connect to cloud metadata endpoint: {request.url.host}"
             )
+        if self._allowed_origin is not None:
+            origin = _origin_of(request.url)
+            if origin != self._allowed_origin:
+                # Origins only - no userinfo, path or query from the request
+                # URL reaches the tool-error channel or the log - and the
+                # refused one bounded, its host being backend-chosen.
+                raise RedirectTargetBlockedError(
+                    f"Refusing request to {_bounded_origin_repr(origin)}: the configured backend "
+                    f"origin is {_format_origin(self._allowed_origin)!r} and a backend response "
+                    "may not redirect elsewhere"
+                )
+        # Offer the backend only the codecs the response path can decode
+        # within the byte budget. httpx's default offer grows with the
+        # optional brotli/zstd extras; a backend honouring such an offer
+        # would then be refused on the way back (_content_encoding), so the
+        # offer is narrowed here, at the one point every backend's client
+        # shares. An offer already within the set (q-values included) is
+        # left exactly as the backend code wrote it.
+        if not _offers_only_bounded_encodings(request):
+            request.headers["Accept-Encoding"] = _BOUNDED_ACCEPT_ENCODING
 
         # A plain `async def` closure (rather than passing
         # self._wrapped.handle_async_request straight to tenacity) ensures
@@ -173,18 +742,48 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
         async def _send() -> httpx.Response:
             return await self._wrapped.handle_async_request(request)
 
+        # tenacity evaluates `wait` (retry_state.upcoming_sleep) before
+        # `stop`, so the stop decision can weigh the very sleep about to be
+        # taken against the logical request's remaining budget; a retry the
+        # budget cannot afford ends the loop with the real last outcome
+        # (reraise=True) instead of a sleep. `before_sleep` runs only when a
+        # retry WILL happen: it books the retry and its sleep against the
+        # budget and releases the 429 response tenacity is about to discard
+        # (its pooled connection would otherwise wait for garbage
+        # collection). The final response, and a 429 that is not retried, go
+        # back to the caller unread and stay open.
+        def _stop_when_budget_exhausted(retry_state: RetryCallState) -> bool:
+            return not budget.can_afford_retry(retry_state.upcoming_sleep)
+
+        async def _spend_budget_before_sleep(retry_state: RetryCallState) -> None:
+            budget.spend_retry(retry_state.upcoming_sleep)
+            outcome = retry_state.outcome
+            if outcome is not None and not outcome.failed:
+                discarded = outcome.result()
+                if isinstance(discarded, httpx.Response):
+                    await discarded.aclose()
+
         retrying = AsyncRetrying(
             retry=retry_any(
                 retry_if_exception_type(_RETRYABLE_TRANSPORT_EXCEPTIONS),
                 retry_if_result(_is_rate_limited),
             ),
             wait=_wait_for_retry,
-            stop=stop_after_attempt(3),
+            stop=_stop_when_budget_exhausted,
+            before_sleep=_spend_budget_before_sleep,
             reraise=True,
         )
         start = time.perf_counter()
         try:
-            response: httpx.Response = await retrying(_send)
+            # The deadline scope wraps the attempts AND tenacity's sleeps
+            # between them: the retry sleep runs here in the transport,
+            # outside every httpx timeout, so this is the only bound on it.
+            async with asyncio.timeout(budget.remaining_seconds()) as deadline_scope:
+                response: httpx.Response = await retrying(_send)
+        except TimeoutError:
+            if not deadline_scope.expired():
+                raise
+            raise _deadline_exceeded() from None
         except RetryError as exc:
             # reraise=True only converts RetryError into the *original*
             # exception when the last attempt failed with one. A 429 is a
@@ -197,14 +796,48 @@ class _RetryingTransport(httpx.AsyncBaseTransport):
             if exc.last_attempt.failed:
                 raise
             response = exc.last_attempt.result()
+        # Content-Length is the WIRE size (pre-decoding), so this only ever
+        # rejects a body that is oversized before inflation - but then it
+        # does so without reading a byte of it. The decisive control is the
+        # decoded-byte count in _BoundedResponse.aiter_bytes().
+        declared_length = response.headers.get("Content-Length")
+        if (
+            declared_length is not None
+            and declared_length.isascii()
+            and declared_length.isdigit()
+            and (
+                len(declared_length) > _MAX_CONTENT_LENGTH_DIGITS
+                or int(declared_length) > self._max_response_bytes
+            )
+        ):
+            await response.aclose()
+            shown = (
+                declared_length
+                if len(declared_length) <= _MAX_CONTENT_LENGTH_DIGITS
+                else f"<{len(declared_length)} digits>"
+            )
+            raise ResponseTooLargeError(
+                f"Backend response declared Content-Length {shown}, above the "
+                f"{self._max_response_bytes}-byte BACKEND_MAX_RESPONSE_BYTES cap"
+            )
+        # Decided before the body is read, like the Content-Length check: an
+        # encoding the bounded decoder cannot handle is refused with the
+        # connection released, never inflated or passed through.
+        try:
+            encoding = _content_encoding(response.headers)
+        except UnsupportedContentEncodingError:
+            await response.aclose()
+            raise
+        response = _BoundedResponse(response, self._max_response_bytes, budget, encoding)
         if self._slow_request_threshold_ms is not None:
             duration_ms = (time.perf_counter() - start) * 1000
             if duration_ms > self._slow_request_threshold_ms:
                 # Query strings can carry trace IDs, filter values, or (for
                 # backends that use query-param rather than header auth)
-                # credentials - logging the path only is enough to identify
-                # which endpoint was slow without exposing that.
-                url_without_query = request.url.copy_with(query=None)
+                # credentials, and a URL userinfo IS a credential - logging
+                # scheme, host and path only is enough to identify which
+                # endpoint was slow without exposing either.
+                url_without_query = request.url.copy_with(query=None, username=None, password=None)
                 logger.warning(
                     f"Slow backend request: {request.method} {url_without_query} took "
                     f"{duration_ms:.0f}ms (threshold: {self._slow_request_threshold_ms:.0f}ms)"
@@ -226,12 +859,21 @@ class BaseBackend(ABC):
         methods a subclass defines itself (cls.__dict__), never a method
         inherited unchanged from a parent, which would otherwise be
         wrapped twice across a subclass hierarchy.
+
+        search_traces/search_spans additionally get the query-limit clamp
+        as the OUTER wrapper (clamp -> cache -> original): the cache key
+        must be built from the clamped query. functools.wraps chains
+        __wrapped__ through both layers.
         """
         super().__init_subclass__(**kwargs)
         for method_name in _CACHEABLE_METHODS:
             original = cls.__dict__.get(method_name)
-            if original is not None:
-                setattr(cls, method_name, _wrap_with_cache(method_name, original))
+            if original is None:
+                continue
+            wrapped = _wrap_with_cache(method_name, original)
+            if method_name in _QUERY_LIMITED_METHODS:
+                wrapped = _wrap_with_query_limit(method_name, wrapped)
+            setattr(cls, method_name, wrapped)
 
     def __init__(self, url: str, api_key: str | None = None, timeout: float = 30.0):
         """Initialize backend with connection parameters.
@@ -250,15 +892,29 @@ class BaseBackend(ABC):
         # timeout) positionally, so a caller (server.py's _create_backend)
         # sets this as a plain attribute after construction instead.
         self.slow_request_threshold_ms: float | None = None
+        # Same post-construction pattern: server.py applies the operator's
+        # BACKEND_MAX_RESPONSE_BYTES here, and `client` hands it to the
+        # transport, which enforces it on every response.
+        self.max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
+        # Same post-construction pattern: server.py applies the operator's
+        # MAX_TRACES_PER_QUERY here and _wrap_with_query_limit enforces it on
+        # every search_traces/search_spans call, whichever tool or helper
+        # built the query. None (the library default) means no clamp.
+        self.max_query_limit: int | None = None
         self._query_cache: TTLCoalescingCache | None = None
 
-    def configure_query_cache(self, ttl_seconds: float | None) -> None:
+    def configure_query_cache(
+        self, ttl_seconds: float | None, max_entries: int = DEFAULT_QUERY_CACHE_MAX_ENTRIES
+    ) -> None:
         """Mirrors slow_request_threshold_ms's own post-construction-
         attribute pattern above - set by the caller (server.py's
         _create_backend) after construction, since several subclasses
-        override __init__ with their own named params."""
+        override __init__ with their own named params. `max_entries` is
+        the LRU bound on cached results (QUERY_CACHE_MAX_ENTRIES)."""
         self._query_cache = (
-            TTLCoalescingCache(ttl_seconds) if ttl_seconds and ttl_seconds > 0 else None
+            TTLCoalescingCache(ttl_seconds, max_entries=max_entries)
+            if ttl_seconds and ttl_seconds > 0
+            else None
         )
 
     @property
@@ -278,11 +934,24 @@ class BaseBackend(ABC):
                 headers=self._create_headers(),
                 timeout=self.timeout,
                 follow_redirects=True,
-                transport=_RetryingTransport(
-                    slow_request_threshold_ms=self.slow_request_threshold_ms
-                ),
+                max_redirects=_MAX_REDIRECT_HOPS,
+                transport=self._create_transport(),
             )
         return self._client
+
+    def _create_transport(self) -> "_RetryingTransport":
+        """The one _RetryingTransport construction every backend shares -
+        the Datadog/New Relic/Honeycomb `client` overrides (which differ
+        from the base one only in follow_redirects) call this too, so a
+        transport-level control added here (origin pin, response size cap,
+        total deadline, slow-request logging) can never be missed by one
+        backend's own client."""
+        return _RetryingTransport(
+            slow_request_threshold_ms=self.slow_request_threshold_ms,
+            allowed_origin=self.url,
+            max_response_bytes=self.max_response_bytes,
+            total_deadline_seconds=request_deadline_seconds(self.timeout),
+        )
 
     @abstractmethod
     def _create_headers(self) -> dict[str, str]:
@@ -360,6 +1029,29 @@ class BaseBackend(ABC):
             Exception: If query fails
         """
         pass
+
+    async def list_services_uncached(self) -> list[str]:
+        """list_services() with the query cache bypassed - a live request,
+        whatever QUERY_CACHE_TTL_SECONDS is.
+
+        The readiness probe (/ready, the Docker HEALTHCHECK) and doctor call
+        this: a cached result must never make readiness report healthy
+        after the backend has failed or rejected the credential. Invokes the
+        concrete class's pre-wrap original through the ``__wrapped__``
+        functools.wraps leaves on the cache wrapper, so no per-backend edit
+        is needed and no backend can accidentally re-wrap it (not a
+        _CACHEABLE_METHODS entry).
+
+        Returns:
+            List of service names, straight from the backend
+
+        Raises:
+            Exception: If the query fails
+        """
+        method = type(self).list_services
+        original = getattr(method, "__wrapped__", method)
+        services: list[str] = await original(self)
+        return services
 
     @abstractmethod
     async def get_service_operations(self, service_name: str) -> list[str]:

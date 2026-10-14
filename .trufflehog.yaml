@@ -1,0 +1,24 @@
+# Custom TruffleHog detectors, loaded by .github/workflows/secret-scan.yml via
+# `--config .trufflehog.yaml` on both the PR-range and the whole-history job.
+#
+# TruffleHog ships no detector for Traceloop API keys, the credential class
+# this repository already carried once (start_locally.sh at c5fd220, removed at
+# HEAD but reachable from every ref). The regex is the same one .gitleaks.toml
+# uses for the pre-commit hook; tests/test_secret_scan_workflow.py asserts both.
+#
+# No `verify` block: Traceloop's API must never be presented with a candidate
+# key from CI, so every hit is reported as UNVERIFIED - both workflow jobs
+# therefore run with `--results=verified,unknown,unverified` (and exclude the
+# generic URI detector, see secret-scan.yml).
+#
+# Local control (needs docker + network, never run in tests):
+#   docker run --rm -v "$PWD:/repo" trufflesecurity/trufflehog:3.97.9 \
+#     filesystem --config /repo/.trufflehog.yaml \
+#     --results=verified,unknown,unverified /path/to/file-with-a-fake-tl-key
+# must report the key; the same command without --config must not.
+detectors:
+  - name: traceloop-api-key
+    keywords:
+      - tl_
+    regex:
+      api_key: tl_[a-z0-9]{32}

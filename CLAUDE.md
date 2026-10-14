@@ -53,6 +53,8 @@ uv run ruff check .
 uv run mypy src/
 ```
 
+**Packaging:** `mcpb pack mcpb/` builds the Claude Desktop bundle from `mcpb/`. `mcpb/.mcpbignore` is a deny-list (mcpb never consults `.gitignore`): every file under `mcpb/` that it does not name is archived, tracked or not - pack from a clean tree and check the printed file count.
+
 ## Architecture
 
 ### Backend Abstraction Pattern
@@ -82,9 +84,9 @@ Concrete implementations:
 - [backends/traceloop.py](opentelemetry_mcp/backends/traceloop.py) - Traceloop backend
 - [backends/datadog.py](opentelemetry_mcp/backends/datadog.py) - Datadog backend
 - [backends/sentry.py](opentelemetry_mcp/backends/sentry.py) - Sentry backend
-- [backends/xray.py](opentelemetry_mcp/backends/xray.py) - AWS X-Ray backend (boto3/SigV4, not httpx - see its module docstring)
+- [backends/xray.py](opentelemetry_mcp/backends/xray.py) - AWS X-Ray backend (boto3/SigV4, not httpx - see its module docstring; every boto3 call goes through `_call` on the instance's private `ThreadPoolExecutor(8)` behind a same-size `asyncio.Semaphore`, never the loop's default executor - `_MAX_CONCURRENT_XRAY_CALLS` is fixed, no env var; `close()` shuts the pool down)
 - [backends/newrelic.py](opentelemetry_mcp/backends/newrelic.py) - New Relic backend (NerdGraph GraphQL API - built without a live account to verify against, see its module docstring for exactly what's unverified)
-- [backends/honeycomb.py](opentelemetry_mcp/backends/honeycomb.py) - Honeycomb backend (Query Data API - built without a live account to verify against; the programmatic Query Data API is documented as Enterprise-plan exclusive, see its module docstring)
+- [backends/honeycomb.py](opentelemetry_mcp/backends/honeycomb.py) - Honeycomb backend (Query Data API - built without a live account to verify against; the programmatic Query Data API is documented as Enterprise-plan exclusive, see its module docstring; Create Query Result runs pace through one `_RateLimiter` per `(url, api_key)` - `_shared_rate_limiter`, 10/min, shared by a same-key `SECONDARY_BACKEND_*` instance and the `/ready` probe - and `acquire(max_wait_seconds=self.timeout)` raises `HoneycombRateLimitedError` instead of parking a caller past `BACKEND_TIMEOUT`)
 
 ### Tool-Based Architecture
 
@@ -95,8 +97,8 @@ Each MCP capability is implemented as a separate tool module in [opentelemetry_m
 - [tools/search.py](opentelemetry_mcp/tools/search.py) - Search traces with filters
 - [tools/search_spans.py](opentelemetry_mcp/tools/search_spans.py) - Search individual spans with filters
 - [tools/trace.py](opentelemetry_mcp/tools/trace.py) - Get detailed trace by ID (`detail_level`: `"full"` default returns everything unbounded; `"summary"` elides large gen_ai.\* message/document fields and truncates long event attributes)
-- [tools/triage.py](opentelemetry_mcp/tools/triage.py) - `triage_trace`: synthesize a likely-root-cause diagnosis (critical path, latency-contribution ranking, error chain) instead of returning raw trace data - composes [tools/span_tree.py](opentelemetry_mcp/tools/span_tree.py)'s tree-walking utilities, which no backend or other tool builds elsewhere
-- [tools/correlate.py](opentelemetry_mcp/tools/correlate.py) - `correlate_trace`: best-effort cross-backend correlation against a second, independently-configured backend (`SECONDARY_BACKEND_*`) - direct `trace_id` match first, else a time-window/service-overlap heuristic; also reuses `tools/span_tree.py` to compare error-driven root causes across both traces
+- [tools/triage.py](opentelemetry_mcp/tools/triage.py) - `triage_trace`: synthesize a likely-root-cause diagnosis (critical path, latency-contribution ranking, error chain) instead of returning raw trace data - composes [tools/span_tree.py](opentelemetry_mcp/tools/span_tree.py)'s tree-walking utilities, which no backend or other tool builds elsewhere. `error_chain`/`critical_path` are bounded whatever the trace depth (summary: the first 5 and last 20 spans around one explicit elision entry; full: 1000) and a root-less parent cycle is reported with `confidence: "low"` instead of a depth
+- [tools/correlate.py](opentelemetry_mcp/tools/correlate.py) - `correlate_trace`: best-effort cross-backend correlation against a second, independently-configured backend (`SECONDARY_BACKEND_*`) - direct `trace_id` match first, else a time-window/service-overlap heuristic whose search window is capped at 24 h after the primary trace's start and which searches at most the 10 most-represented primary services (the result's `limitations` are the fixed list plus any per-call truncation notes); also reuses `tools/span_tree.py` to compare error-driven root causes across both traces
 - [tools/usage.py](opentelemetry_mcp/tools/usage.py) - Aggregate token usage metrics
 - [tools/services.py](opentelemetry_mcp/tools/services.py) - List available services
 - [tools/errors.py](opentelemetry_mcp/tools/errors.py) - Find traces with errors
@@ -147,7 +149,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 **Environment Variables** (see [.env.example](.env.example)):
 
 - `BACKEND_TYPE` - Required: `jaeger`, `tempo`, `traceloop`, `datadog`, `sentry`, `xray`, `newrelic`, or `honeycomb`
-- `BACKEND_URL` - Required: Backend API endpoint (decorative-only placeholder for X-Ray - see config.py's `BackendConfig.url` docstring)
+- `BACKEND_URL` - Required: Backend API endpoint (decorative-only placeholder for X-Ray - see config.py's `BackendConfig.url` docstring). `BackendConfig.validate_url` rejects a `user:password@host` URL outright (the URL is logged, printed and echoed by httpx error text); `security.redact_url_userinfo` / `redact_userinfo_in_text` are the defence in depth applied at every sink that stringifies a URL or backend error (startup INFO lines, lazy-init health log, `_run_backend_checks` details for `/ready` and `doctor`, `--print-config`, `_handle_tool_error`, the slow-request WARNING). The raw env/CLI string is refused before pydantic sees it (`config._reject_url_userinfo`) and `server._format_config_error` renders a `ValidationError` without its `input_value`, so a credentialed URL is never echoed, not even truncated; `redact_userinfo_in_text` additionally rewrites a truncated authority with no visible `@` (`https://user:pa...host/path` -> `https://[REDACTED]...host/path`) as defence in depth
 - `BACKEND_API_KEY` - Optional: Authentication key (unused by X-Ray, which authenticates via boto3's standard AWS credential chain)
 - `BACKEND_APP_KEY` - Required for Datadog backend only: Application key, in addition to `BACKEND_API_KEY`
 - `BACKEND_SENTRY_ORG` - Required for Sentry backend only: Organization slug
@@ -155,17 +157,29 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `BACKEND_AWS_REGION` - Required for X-Ray backend only: AWS region (e.g. `us-east-1`)
 - `BACKEND_NEWRELIC_ACCOUNT_ID` - Required for New Relic backend only: numeric account ID (NerdGraph queries are user-scoped, not account-scoped)
 - `BACKEND_HONEYCOMB_DATASET` - Required for Honeycomb backend only: dataset slug (the Query Data API is dataset-scoped)
-- `BACKEND_TIMEOUT` - Optional: Request timeout (default: 30s)
+- `BACKEND_TIMEOUT` - Optional: Request timeout per socket operation (default: 30s). Also derives the total deadline of one logical backend request - connect, retries and their sleeps, every redirect hop and the whole body read - as `max(30 s, 4 x BACKEND_TIMEOUT)` (`backends/base.py`'s `request_deadline_seconds`; `BackendDeadlineExceededError` is a `TransportError` sibling of `httpx.TimeoutException` and is not retried). Across the hops of one request `_RetryingTransport` spends ONE budget: at most 2 retries, 10 s of `Retry-After` sleep in total and 5 redirects (`BaseBackend.client` sets `max_redirects` to the same cap)
+- `BACKEND_MAX_RESPONSE_BYTES` - Optional: ceiling on the *decoded* size of any single backend response (default: 64 MiB, range 1 to 1 GiB; `SECONDARY_BACKEND_MAX_RESPONSE_BYTES` for the secondary backend). Enforced in `backends/base.py`'s `_RetryingTransport` (`_BoundedResponse` counts post-`Content-Encoding` bytes on httpx's `aread()` path, so every `response.json()` site and every redirect hop is covered without call-site changes); an oversized body raises `ResponseTooLargeError`, which is not retried. Bodies are inflated incrementally (`_BoundedInflater`, zlib with `max_length`) so the cap bounds peak memory, not just the buffered size; only `gzip`/`deflate`/identity are accepted - `br`, `zstd`, unknown or chained encodings raise `UnsupportedContentEncodingError` before the body is read, and the outgoing `Accept-Encoding` is narrowed to `gzip, deflate`
 - `BACKEND_TEMPO_INSTANCE_ID` - Optional for Tempo backend: Grafana Cloud stack/instance ID (Basic Auth with `BACKEND_API_KEY` instead of Bearer auth)
 - `SECONDARY_BACKEND_TYPE` / `SECONDARY_BACKEND_URL` / ... - Optional, opt-in: a second, independently-configured backend for `correlate_trace` (cross-backend correlation) - every `BACKEND_*` variable above has a `SECONDARY_BACKEND_*` equivalent. Env-var only (no CLI override), see `config.py`'s `BackendConfig.from_env_optional`
-- `LOG_LEVEL` - Optional: Logging level (default: INFO)
-- `MAX_TRACES_PER_QUERY` - Optional: Result limit (default: 500, 1-1000)
+- `LOG_LEVEL` - Optional: Logging level (default: INFO). `server._apply_log_level` also sets the `httpx` logger to WARNING unless the level is DEBUG, because httpx's per-request INFO line prints the full request URL; `LOG_LEVEL=DEBUG` keeps those lines for connectivity debugging. The root stderr handler (`server._ROOT_LOG_HANDLER`) carries `security.UserinfoRedactingFilter`, which strips any `user:password@` URL component from every record's message and formatted traceback - attached to the handler, not the root logger, because logger-level filters never see propagated child-logger records. The `fastmcp` logger does NOT propagate to the root handler (fastmcp's `configure_logging` sets `propagate=False` and installs its own `RichHandler`s at import), and neither do uvicorn's, so records they emit bypass the filter - which is why `server._handle_tool_error` judges the whole exception chain (`__cause__`/`__context__`) and raises a redacted `ToolError` (logged by fastmcp with `exc_info=False`) when any link carries a userinfo, instead of letting fastmcp's generic `logger.exception` print the chain. uvicorn's access log is off (`access_log=False` in `server._build_uvicorn_config`): it would write the full request target - a token a client put in the query string included - and the `uvicorn.access` logger has its own non-propagating handler the redacting filter never sees; `server.AccessLogQueryStringFilter` is attached to that logger so an access log an operator re-enables still drops the query string. `UserinfoRedactingFilter` also escapes every C0/C1 control character, DEL and U+2028/U+2029 in a record's rendered message repr-style (`\x01`, `\n`), so a client-supplied value logged by any dependency (the mcp SDK's session-id rejection line) can neither forge nor split a log line. `doctor` applies the level exactly as `main()` does
+- `MAX_TRACES_PER_QUERY` - Optional: server-wide ceiling on the trace/span `limit` of every backend query, including tool-internal over-fetch (default: 500, 1-1000). Enforced at the backend boundary: `server._create_backend`/`_get_secondary_backend` set `BaseBackend.max_query_limit` and `backends/base.py`'s `_wrap_with_query_limit` (the OUTER wrapper around the cache wrapper, so cache keys see the clamped query) clamps every `search_traces`/`search_spans` query - the handler-level `server._clamp_limit` calls remain the advertised per-tool contract. Backends may still request up to 5x that many raw spans (2x for span search) to discover trace IDs
 - `SLOW_REQUEST_THRESHOLD_MS` - Optional: Logs a WARNING for any backend request slower than this, independent of `LOG_LEVEL` (default: unset/disabled)
-- `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` - Optional: Env-var equivalents of `--transport`/`--host`/`--port` (see CLI flags below)
+- `QUERY_CACHE_TTL_SECONDS` - Optional, opt-in: cache `search_traces`/`search_spans`/`get_trace`/`list_services`/`get_service_operations` results for this many seconds with in-flight request coalescing (`backends/cache.py`'s `TTLCoalescingCache`, wrapped onto every backend by `BaseBackend.__init_subclass__`). Must be finite, > 0 and at most `86400` (one day) - `ServerConfig` rejects anything else at startup. The cache is process-wide and shared by every MCP session (default: unset/disabled)
+- `QUERY_CACHE_MAX_ENTRIES` - Optional: LRU entry bound on that cache (1-100000, default: `1024`), independent of the TTL - the aggregate cap on what distinct tool arguments can make the process retain. Keys are built from the validated arguments; a key over 64 KiB (`backends/base.py`'s `_MAX_CACHE_KEY_BYTES`) bypasses the cache entirely so a request-sized key never occupies a slot
+- `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` - Optional: Env-var equivalents of `--transport`/`--host`/`--port` (see CLI flags below). HTTP binds loopback (`127.0.0.1`) by default; a non-loopback host requires `MCP_HTTP_BEARER_TOKEN` or `MCP_ALLOW_UNAUTHENTICATED_HTTP`
+- `MCP_HTTP_BEARER_TOKEN` - Optional, HTTP transport only: shared bearer token every `/mcp` request must present as `Authorization: Bearer <token>` (at least 32 characters). Installs `server.OperatorTokenVerifier` (constant-time compare) as `mcp.auth`, which makes fastmcp wrap `/mcp` in `RequireAuthMiddleware`; `/health` and `/ready` stay unauthenticated. Ignored (with a WARNING) under stdio. A blank value (set but empty) is a `click.UsageError` (exit 2), not "unset", and the value must fullmatch printable ASCII without whitespace (0x21-0x7E) so a client can present it byte-for-byte
+- `MCP_ALLOW_UNAUTHENTICATED_HTTP` - Optional, HTTP transport only: explicit acknowledgement for serving `/mcp` on a non-loopback host with no token (default: `false` - `main()` raises a `click.UsageError`, exit code 2, before anything starts)
+- `FORWARDED_ALLOW_IPS` - Optional, HTTP transport only: comma-separated proxy IPs/CIDRs (or `*`) whose `X-Forwarded-For` may replace the TCP peer address as the rate-limit key (uvicorn's own variable name, passed through `server._build_uvicorn_config` as `proxy_headers=<is set>, forwarded_allow_ips=`). Unset: the header is never trusted, not even from `127.0.0.1` - uvicorn's implicit loopback trust is deliberately not applied, so `RATE_LIMIT_MAX_REQUESTS` is per TCP peer. `*` trusts every hop, so any client can set `X-Forwarded-For` and choose its own rate-limit key - name the proxy addresses; `*` must stand alone and every other entry must parse as a strict `ipaddress.ip_network` (`server._validate_forwarded_allow_ips_option`, exit 2 otherwise)
+- `MCP_ALLOWED_HOSTS` - Optional, HTTP transport only: comma-separated hostnames/IP literals accepted in the `Host` header besides loopback names and the bound address; anything else answers `421` before any route runs (`OriginValidationMiddleware`, Host is checked before Origin). A loopback `MCP_HOST` validates Host automatically; a wildcard bind (`0.0.0.0`/`::`) only validates once this is set; `*` disables Host validation and must stand alone - a list mixing `*` with names, or an entry that is not an IP literal / hostname (RFC 1123 labels plus `_`, a deliberate superset so Docker Compose service names such as `trace_hub` pass; `server._HOSTNAME_LABEL_RE`), is a usage error at startup (`server._validate_allowed_hosts_option`); a trailing dot and the spelling of an IPv6 literal are normalised on both sides. The Docker image's default `CMD` binds `0.0.0.0`, so containers reachable beyond their host should always set this
 - `MCP_INCLUDE_ARGS_IN_SPANS` - Optional: Env-var equivalent of `--include-args-in-spans` (default: `false`). Known credential shapes are redacted before export (`observability._redact_secrets`) - a pattern match, not a guarantee.
 - `OTEL_EXPORTER_OTLP_ENDPOINT` - Optional: Enables opt-in OTel self-instrumentation of tool calls when set (unset by default - no TracerProvider is configured and no middleware is registered, so there is zero overhead if you don't opt in)
 - `OTEL_SERVICE_NAME` - Optional: Service name reported in self-instrumentation spans (default: `tracehub-mcp`)
-- `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` - Optional: Env-var equivalents of `--rate-limit-max-requests`/`--rate-limit-window-seconds` (HTTP transport only, defaults: `100`/`60.0`)
+- `OTEL_TRACES_SAMPLER` - Optional: standard OTel SDK sampler override. Unset, `configure_tracing` installs `observability._OPERATOR_OWNED_SAMPLER` (ParentBased, root and remote-parent-not-sampled both ALWAYS_ON) so a caller's `traceparent` trace-flags can never drop this server's own span; set, the SDK's own resolution wins untouched
+- `MCP_TRUST_CLIENT_TRACE_CONTEXT` - Optional: Env-var equivalent of `--trust-client-trace-context` (default: `true` for stdio, `false` for `--transport http`). `true` -> fastmcp `telemetry_mode="propagation_only"` (a caller's `params._meta` trace context parents this server's spans); `false` -> `"off"` (neither extracted nor attached). Both suppress FastMCP's own duplicate spans (`tests/test_double_tracing_regression.py`)
+- `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` - Optional: Env-var equivalents of `--rate-limit-max-requests`/`--rate-limit-window-seconds` (HTTP transport only, defaults: `100`/`60.0`). Validated at startup like the duration options: `click.IntRange(min=0)` (`0` keeps its disable meaning) and `FloatRange(min=0, min_open=True)` plus `_require_finite_seconds`, so a negative count, `0`, a negative window, `inf` and `nan` exit 2. These two, `--allowed-hosts` and `--forwarded-allow-ips` set `show_envvar=True`, so the usage error and `--help` name the env var (`[env var: ...]`)
+- `READINESS_CACHE_SECONDS` - Optional: Env-var equivalent of `--readiness-cache-seconds` (HTTP transport only, default: `30.0`, `0` disables the memo). `GET /ready` is unauthenticated and each probe costs the backend a `health_check` + `list_services` (a Honeycomb Create Query Result slot, up to 222 X-Ray API calls), so `server._run_backend_checks_memoized` memoizes the result for this window (`_READINESS_MEMO_TTL_SECONDS`; a failure for `_READINESS_FAILURE_MEMO_TTL_SECONDS` = `5` s), shares one in-flight probe between concurrent requests (loop-keyed `asyncio.Lock`, keyed on the backend object's identity) and answers `503` after `_READINESS_CHECK_TIMEOUT_SECONDS` = `10` s. `doctor` keeps calling the live `_run_backend_checks`
+- `SESSION_IDLE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--session-idle-timeout-seconds` (HTTP transport only, must be > 0, default: `1800.0` = the mcp SDK default). fastmcp's own default is `None`/never, so `server._build_http_app` always passes a finite bound; an idle session's id answers `404` and clients re-initialize. `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT` is a no-code stopgap for already-deployed containers
+- `MCP_STATELESS_HTTP` - Optional: Env-var equivalent of `--stateless-http` (HTTP transport only, default: `false`). Stateless mode keeps no per-peer session state at all but drops the GET SSE stream for server-initiated notifications
 - `SHUTDOWN_DRAIN_SECONDS` - Optional: Env-var equivalent of `--shutdown-drain-seconds` (HTTP transport only, default: `0.0`/disabled)
 - `BACKEND_CLOSE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--backend-close-timeout-seconds` (HTTP transport only, default: `5.0`)
 - `GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--graceful-shutdown-timeout-seconds` (HTTP transport only, default: `2`)
@@ -177,8 +191,16 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `--disable-tools <name1,name2,...>` - Removes the named tools from this server instance (applied after `--enabled-tools`)
 - `--enabled-tools <name1,name2,...>` - Allowlist: every tool not named here is removed from this server instance
 - `--slow-request-threshold-ms <float>` - Overrides `SLOW_REQUEST_THRESHOLD_MS`
+- `--query-cache-ttl-seconds <float>` - Overrides `QUERY_CACHE_TTL_SECONDS` (finite, > 0, at most 86400)
+- `--query-cache-max-entries <1-100000>` - Overrides `QUERY_CACHE_MAX_ENTRIES`
 - `--include-args-in-spans` - Overrides `MCP_INCLUDE_ARGS_IN_SPANS`
+- `--trust-client-trace-context` / `--no-trust-client-trace-context` - Overrides `MCP_TRUST_CLIENT_TRACE_CONTEXT` (see above)
+- `--http-bearer-token <token>` / `--allow-unauthenticated-http` - HTTP transport only. Override `MCP_HTTP_BEARER_TOKEN` / `MCP_ALLOW_UNAUTHENTICATED_HTTP`; prefer the env var for the token since argv is visible via `ps`
+- `--allowed-hosts <name1,name2,...>` - HTTP transport only. Overrides `MCP_ALLOWED_HOSTS` (see above); `--allowed-hosts '*'` opts out of Host validation and must stand alone (a mixed list is refused at startup)
+- `--forwarded-allow-ips <ip1,cidr2,...>` - HTTP transport only. Overrides `FORWARDED_ALLOW_IPS` (see above); `'*'` lets every client choose its own rate-limit key via `X-Forwarded-For` - name the proxy addresses
 - `--rate-limit-max-requests <int>` / `--rate-limit-window-seconds <float>` - HTTP transport only. Per-client-IP fixed-window rate limit (defaults: 100 requests / 60s window). Set `--rate-limit-max-requests 0` to disable.
+- `--readiness-cache-seconds <float>` - HTTP transport only. Overrides `READINESS_CACHE_SECONDS` (finite, >= 0; default `30`, `0` disables the memo but keeps the 10 s probe timeout and the in-flight sharing).
+- `--session-idle-timeout-seconds <float>` / `--stateless-http` - HTTP transport only. Override `SESSION_IDLE_TIMEOUT_SECONDS` / `MCP_STATELESS_HTTP` (see above).
 - `--shutdown-drain-seconds <float>` - HTTP transport only. On shutdown, wait this many seconds inside the ASGI shutdown handler (after uvicorn has already finished draining in-flight connections) before closing the shared backend HTTP client (default: `0.0`/disabled).
 - `--backend-close-timeout-seconds <float>` - HTTP transport only. Abandon closing the shared backend HTTP client during shutdown if it does not finish within this many seconds - uvicorn places no timeout of its own around this wait (default: `5.0`).
 - `--graceful-shutdown-timeout-seconds <int>` - HTTP transport only. uvicorn's own bound on waiting for in-flight connections/tasks to finish on shutdown before cancelling them - passed straight through as `uvicorn.Config(timeout_graceful_shutdown=)`, which only accepts whole seconds (default: `2`).
@@ -186,7 +208,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 
 **`tracehub-mcp doctor`** - Subcommand (not a flag) that runs startup diagnostics against the resolved backend config: config load, backend construction, `health_check()`, and a real read-only connectivity probe (`list_services`). Also validates the optional secondary backend (`SECONDARY_BACKEND_*`) the same way, if one is configured. Prints `[OK]`/`[FAIL]` per step and exits non-zero on any failure - unlike the server's own lazy backend initialization, which deliberately swallows a failed health check and keeps running. Accepts the same `--backend`/`--url`/etc. override flags as the main command, so a candidate config can be validated before committing to it (the secondary backend has no such override flags - it's resolved from env vars only).
 
-**HTTP Endpoints** (streamable-http transport only, registered via `FastMCP.custom_route` - not applicable to stdio): `GET /health` - liveness only, always `200 {"status": "ok"}`, no backend I/O. `GET /ready` - readiness, reuses the server's own cached backend (never closes it), `200` when `health_check`/`list_services` both succeed, `503` with details otherwise.
+**HTTP Endpoints** (streamable-http transport only, registered via `FastMCP.custom_route` - not applicable to stdio): `GET /health` - liveness only, always `200 {"status": "ok"}`, no backend I/O. `GET /ready` - readiness, reuses the server's own cached backend (never closes it), `200` when `health_check`/`list_services` both succeed, `503` whose body names only an error class per failing half (`backend unreachable` / `backend timeout` / `backend error <status>` / `backend unhealthy`) otherwise - the redacted detail is logged once per fresh probe at WARNING, bounded and repr-quoted, and never returned to the unauthenticated caller (or `503 {"status": "not_ready", "error": "readiness check timed out ..."}` after `_READINESS_CHECK_TIMEOUT_SECONDS` = 10 s). The result is memoized for `READINESS_CACHE_SECONDS` (default 30 s; a failure for 5 s) and concurrent probes share one in-flight check, so the body may be up to that many seconds old and any number of probes cost the backend at most one `health_check` + `list_services` per window. Neither requires `MCP_HTTP_BEARER_TOKEN`; only `/mcp` does.
 
 **Configuration Precedence:** CLI args > environment variables > defaults
 
@@ -241,7 +263,10 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
   let backend exceptions bubble up as-is) rather than catching them and returning `{"error": ...}`
   JSON. `server.py`'s shared `_handle_tool_error` logs then re-raises; letting the exception
   reach the MCP SDK's lowlevel server is what makes it build `CallToolResult(isError=True)` per
-  SEP-2140. A tool function that swallows an exception and returns a normal JSON string produces
+  SEP-2140. The one exception to the identity re-raise: when the message embeds a URL userinfo
+  (httpx's `HTTPStatusError` text carries the request URL verbatim) it raises a
+  `fastmcp.exceptions.ToolError` with the redacted text `from` the original - still
+  `isError=True`, and fastmcp logs a `ToolError` without a traceback. A tool function that swallows an exception and returns a normal JSON string produces
   `isError=False` even though the call failed - a client checking the spec-correct `isError` flag
   would see it as a success.
 - Backend health checks are non-blocking
@@ -258,6 +283,20 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
    unconditionally from `BackendConfig` regardless of `type` - there is no per-backend-type
    *validation* at the config layer; "required for this backend" is enforced inside the
    concrete backend's own `__init__` via a `ValueError`, not in config.py
+4a. `health_check()` must never call one of the cache-wrapped public `_CACHEABLE_METHODS`
+   (`list_services`, `search_spans`, ...) - with `QUERY_CACHE_TTL_SECONDS` set it would be
+   answered from the cache for a whole TTL after the backend failed. Probe through a private
+   uncached helper (`_list_services_uncached` in jaeger.py/xray.py, `_search_spans_raw` in
+   datadog.py); `server._run_backend_checks` itself probes via the generic
+   `BaseBackend.list_services_uncached`, which no backend may override or re-wrap
+   (`tests/test_backend_caching.py` pins both)
+4b. If the backend needs its own `client` property (e.g. `follow_redirects=False` because it
+   sends a non-standard credential header httpx would not strip on a cross-origin hop), build
+   the transport with `self._create_transport()` rather than constructing `_RetryingTransport`
+   directly - that is where the configured-origin pin (`allowed_origin`: scheme, host and port,
+   refusing backend-chosen redirect targets) and slow-request logging are wired, and
+   `tests/test_base_backend.py`
+   asserts every backend's client carries them
 5. Add the new backend name to every hardcoded backend-name literal site (must update in
    lockstep): [config.py](opentelemetry_mcp/config.py)'s `BackendConfig.type` `Literal` (and its
    `from_env`/`apply_cli_overrides` inline validation lists),
@@ -325,6 +364,7 @@ Get detailed performance statistics for a specific model including latency perce
 - `model_name` - Model to analyze (required)
 - `start_time`, `end_time` - Time range filter
 - `service_name` - Filter by service
+- `limit` - Maximum traces to analyze (default: 1000, capped by `MAX_TRACES_PER_QUERY`)
 
 **Returns:**
 
@@ -514,6 +554,15 @@ Each filter is an object with:
 - **value**: Single value for most operators
 - **values**: List of values for `in`, `not_in`, `between` operators
 - **value_type**: Type of value(s) - `"string"`, `"number"`, or `"boolean"`
+
+### Limits and Validation
+
+Enforced on the `Filter`/`TraceQuery`/`SpanQuery` models in `models.py` (constants `MAX_FILTER_VALUES`, `MAX_FILTERS_PER_QUERY`, `MAX_TAGS_PER_QUERY`, `MAX_FILTER_FIELD_CHARS`), so both search tools and every backend builder inherit them:
+
+- At most **50 `filters`** and **50 `tags`** per query (independent caps, not one shared budget); at most **100 `values`** per `in`/`not_in` filter; `field` is 1-256 characters
+- Operands are normalised to the declared `value_type` before validation: `"number"` accepts a finite int/float within double range, or a numeric string parsing to one (`"5000"` -> `5000`), and rejects anything else (including booleans, non-finite values and integers too large for a double); `"boolean"` accepts a bool or the strings `"true"`/`"false"`; `"string"` stringifies int/float/bool scalars
+- Unknown keys on a filter object are rejected (`extra="forbid"`)
+- Any violation is a `ValidationError` raised before the backend is called, so the tool returns `isError`
 
 ### Supported Operators
 

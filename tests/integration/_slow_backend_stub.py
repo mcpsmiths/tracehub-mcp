@@ -12,12 +12,13 @@ one-off test fixture.
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
+from threading import Event, Thread
 from types import TracebackType
 
 
 class _Handler(BaseHTTPRequestHandler):
     delay_seconds: float = 0.0
+    traces_started: Event | None = None
 
     def log_message(self, format: str, *args: object) -> None:
         """Silence stdlib's default per-request stderr logging - noisy in
@@ -27,6 +28,10 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/services"):
             body = json.dumps({"data": ["stub-service"]}).encode()
         elif self.path.startswith("/api/traces"):
+            # Set BEFORE the delay: from here the call is provably in flight at the
+            # backend for delay_seconds, the window a SIGTERM must land in.
+            if self.traces_started is not None:
+                self.traces_started.set()
             if self.delay_seconds > 0:
                 time.sleep(self.delay_seconds)
             body = json.dumps({"data": []}).encode()
@@ -48,7 +53,13 @@ class SlowBackendStub:
     list_services/search_traces to succeed against it."""
 
     def __init__(self, delay_seconds: float = 0.0) -> None:
-        handler_cls = type("_BoundHandler", (_Handler,), {"delay_seconds": delay_seconds})
+        # Set by the handler the moment a /api/traces request is being served.
+        self.traces_started = Event()
+        handler_cls = type(
+            "_BoundHandler",
+            (_Handler,),
+            {"delay_seconds": delay_seconds, "traces_started": self.traces_started},
+        )
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
         self._thread = Thread(target=self._server.serve_forever, daemon=True)
 

@@ -3,11 +3,11 @@
 import logging
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import quote
 
 from opentelemetry_mcp.attributes import HealthCheckResponse, SpanAttributes, SpanEvent
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.filter_engine import FilterEngine
+from opentelemetry_mcp.backends.url_path import safe_path_segment
 from opentelemetry_mcp.constants import Fields
 from opentelemetry_mcp.models import FilterOperator, SpanData, SpanQuery, TraceData, TraceQuery
 
@@ -233,10 +233,10 @@ class JaegerBackend(BaseBackend):
         logger.debug(f"Fetching trace: {trace_id}")
 
         # trace_id can originate from an external MCP tool call. It's a URL
-        # *path* segment here, so a crafted value (e.g. containing "../")
-        # could redirect the outbound request to a different path if left
-        # unescaped - see sentry.py's get_trace for the identical pattern.
-        encoded_trace_id = quote(trace_id, safe="")
+        # *path* segment here, so a crafted value (e.g. containing "../", or
+        # the bare "." / ".." httpx would collapse) could redirect the
+        # outbound request to a different path - see backends/url_path.py.
+        encoded_trace_id = safe_path_segment(trace_id, "trace_id")
         response = await self.client.get(f"/api/traces/{encoded_trace_id}")
         response.raise_for_status()
 
@@ -254,12 +254,26 @@ class JaegerBackend(BaseBackend):
     async def list_services(self) -> list[str]:
         """List all services from Jaeger.
 
+        Cache-wrapped by BaseBackend.__init_subclass__ once a query cache is
+        configured; the body lives in _list_services_uncached so
+        health_check() can probe live.
+
         Returns:
             List of service names
 
         Raises:
             httpx.HTTPError: If API request fails
         """
+        return await self._list_services_uncached()
+
+    async def _list_services_uncached(self) -> list[str]:
+        """The actual GET /api/services, never cache-wrapped (not a
+        _CACHEABLE_METHODS name). health_check() calls this rather than the
+        public list_services(): /ready and the Docker HEALTHCHECK depend on
+        health_check reflecting live state, and a warmed cache entry would
+        otherwise answer "healthy" for a whole TTL after the backend failed
+        or the credential was revoked - same pattern as
+        XRayBackend._list_services_uncached."""
         logger.debug("Listing services")
 
         response = await self.client.get("/api/services")
@@ -271,6 +285,13 @@ class JaegerBackend(BaseBackend):
         # missing, not when the key is present with a null value, so `or []`
         # is needed to avoid iterating over None.
         services_raw = data.get("data") or []
+        if not isinstance(services_raw, list):
+            # A string here was iterated character by character and /ready counted the
+            # characters as services (delta verification); the type name is the only echo.
+            raise ValueError(
+                f"Jaeger /api/services returned {type(services_raw).__name__} for 'data', "
+                "expected a list"
+            )
         return [str(s) for s in services_raw]
 
     async def get_service_operations(self, service_name: str) -> list[str]:
@@ -288,9 +309,9 @@ class JaegerBackend(BaseBackend):
         logger.debug(f"Getting operations for service: {service_name}")
 
         # service_name can originate from an external MCP tool call and is a
-        # URL *path* segment here - encode it the same way get_trace encodes
+        # URL *path* segment here - guard it the same way get_trace guards
         # trace_id, to avoid a crafted value redirecting the request.
-        encoded_service_name = quote(service_name, safe="")
+        encoded_service_name = safe_path_segment(service_name, "service_name")
         response = await self.client.get(f"/api/services/{encoded_service_name}/operations")
         response.raise_for_status()
 
@@ -309,8 +330,9 @@ class JaegerBackend(BaseBackend):
         logger.debug("Checking backend health")
 
         try:
-            # Try to list services as a health check
-            services = await self.list_services()
+            # Try to list services as a health check - the private, never-
+            # cached body, so a configured query cache cannot answer this.
+            services = await self._list_services_uncached()
             return HealthCheckResponse(
                 status="healthy",
                 backend="jaeger",
@@ -322,7 +344,7 @@ class JaegerBackend(BaseBackend):
                 status="unhealthy",
                 backend="jaeger",
                 url=self.url,
-                error=str(e),
+                error=str(e) or type(e).__name__,
             )
 
     def _parse_jaeger_trace(self, trace_data: dict[str, Any]) -> TraceData | None:

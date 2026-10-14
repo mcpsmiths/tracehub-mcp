@@ -270,11 +270,12 @@ class TestFilterToTraceloopGenAiProviderRename:
 
 
 class TestFilterToTraceloopBooleanSerialization:
-    """Filter.value is typed str | int | float | bool | None, and pydantic's
-    smart-mode union validation keeps a caller-supplied string like "false"
-    as the str "false" rather than coercing it to the bool False. Plain
-    Python truthiness on that non-empty string is True, which would
-    silently invert a boolean filter's meaning."""
+    """Filter.value is typed str | int | float | bool | None. The Filter
+    model normalises a caller-supplied "false"/"true" string to the genuine
+    bool for value_type boolean (plain Python truthiness on the non-empty
+    string "false" is True, which would silently invert the filter's
+    meaning), and the builder serialises the bool back to Traceloop's
+    lowercase token either way."""
 
     def _backend(self) -> TraceloopBackend:
         return TraceloopBackend(url="https://api.traceloop.com/v2", api_key=_FAKE_API_KEY)
@@ -288,9 +289,8 @@ class TestFilterToTraceloopBooleanSerialization:
             value_type=FilterType.BOOLEAN,
         )
 
-        # Sanity check on the premise: pydantic kept the string, not a bool.
-        assert f.value == "false"
-        assert isinstance(f.value, str)
+        # Sanity check on the premise: the model normalised the string to a bool.
+        assert f.value is False
 
         converted = backend._filter_to_traceloop(f)
         assert converted is not None
@@ -581,3 +581,24 @@ class TestGetTraceEscapesTraceId:
         requested_endpoint = backend._client.get.call_args[0][0]
         assert "../" not in requested_endpoint
         assert "%2F.." in requested_endpoint or "..%2F" in requested_endpoint
+
+
+class TestGetTraceRejectsDotSegmentTraceId:
+    """ "", "." and ".." survive percent-encoding as whole path segments and
+    httpx removes them when merging onto base_url, so they must be rejected
+    before any request is built.
+
+    Audit: src/opentelemetry_mcp/backends/sentry.py:SentryBackend.get_trace:dot-segment-trace-id
+    """
+
+    @pytest.mark.parametrize("trace_id", ["..", ".", ""])
+    async def test_dot_segment_trace_id_raises_before_any_request(self, trace_id: str) -> None:
+        backend = TraceloopBackend(url="https://api.traceloop.com/v2", api_key=_FAKE_API_KEY)
+        backend._client = AsyncMock()
+        backend._client.is_closed = False
+        backend._client.get = AsyncMock()
+
+        with pytest.raises(ValueError, match="Invalid trace_id"):
+            await backend.get_trace(trace_id)
+
+        backend._client.get.assert_not_awaited()

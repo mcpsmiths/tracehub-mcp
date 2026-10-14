@@ -25,6 +25,7 @@ from opentelemetry_mcp.backends.sentry import (
     _SPAN_SEARCH_FIELDS,
     SentryBackend,
 )
+from opentelemetry_mcp.backends.url_path import MAX_PATH_SEGMENT_CHARS
 from opentelemetry_mcp.models import (
     Filter,
     FilterOperator,
@@ -36,6 +37,9 @@ from opentelemetry_mcp.models import (
 
 FAKE_AUTH = "sentry-key1"
 FAKE_ORG = "acme"
+# Sentry trace ids are always 32 hex characters; get_trace enforces that.
+HEX_TRACE_ID = "0123456789abcdef0123456789abcdef"
+OTHER_HEX_TRACE_ID = "fedcba9876543210fedcba9876543210"
 
 
 def test_sentry_backend_requires_api_key() -> None:
@@ -257,11 +261,12 @@ class TestBuildSentryQuery:
         assert backend._filter_to_sentry_query(f) == 'gen_ai.system:"a\\" OR system:*"'
 
     def test_range_operator_rejects_non_numeric_value(self) -> None:
-        """Filter.value_type isn't enforced against the actual Python type,
-        so a range operator with a string value must be rejected rather than
-        interpolated unchecked into a numeric range expression."""
+        """The Filter model now normalises NUMBER operands (a non-numeric str
+        is a ValidationError), so model_construct bypasses it here to prove
+        the builder's own type gate still rejects a string operand rather
+        than interpolating it unchecked into a numeric range expression."""
         backend = _backend()
-        f = Filter(
+        f = Filter.model_construct(
             field="duration",
             operator=FilterOperator.GT,
             value="1000ms OR span.duration:>0",
@@ -270,9 +275,10 @@ class TestBuildSentryQuery:
         assert backend._filter_to_sentry_query(f) is None
 
     def test_range_operator_rejects_bool_value(self) -> None:
-        """bool is an int subclass in Python but not a sensible range operand."""
+        """bool is an int subclass in Python but not a sensible range operand
+        (model_construct: the Filter model itself rejects a bool for NUMBER)."""
         backend = _backend()
-        f = Filter(
+        f = Filter.model_construct(
             field="duration", operator=FilterOperator.GTE, value=True, value_type=FilterType.NUMBER
         )
         assert backend._filter_to_sentry_query(f) is None
@@ -867,7 +873,7 @@ class TestGetTraceUsesNativeEndpoint:
         fake_response.json = lambda: [
             {
                 "span_id": "s1",
-                "trace_id": "requested",
+                "trace_id": HEX_TRACE_ID,
                 "op": "root-op",
                 "project": "svc",
                 "start_timestamp": "2023-01-02T09:42:36.320Z",
@@ -878,29 +884,127 @@ class TestGetTraceUsesNativeEndpoint:
         backend._client.is_closed = False
         backend._client.get = AsyncMock(return_value=fake_response)
 
-        trace = await backend.get_trace("requested")
+        trace = await backend.get_trace(HEX_TRACE_ID)
 
-        assert trace.trace_id == "requested"
+        assert trace.trace_id == HEX_TRACE_ID
         call_args = backend._client.get.call_args
-        assert call_args.args[0] == "/api/0/organizations/acme/trace/requested/"
+        assert call_args.args[0] == f"/api/0/organizations/acme/trace/{HEX_TRACE_ID}/"
         # search_traces's span-search endpoint is never touched by get_trace.
         assert backend._client.get.call_count == 1
 
-    async def test_escapes_trace_id_in_path(self) -> None:
-        backend = _backend()
-        fake_response = AsyncMock()
-        fake_response.raise_for_status = lambda: None
-        fake_response.json = lambda: []
-        backend._client = AsyncMock()
-        backend._client.is_closed = False
-        backend._client.get = AsyncMock(return_value=fake_response)
 
-        with pytest.raises(ValueError, match="No spans found"):
-            await backend.get_trace("evil/../ trace")
+def _wire_backend(
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> tuple[SentryBackend, list[str]]:
+    """A SentryBackend whose client keeps the production shape (base_url,
+    real headers, follow_redirects via _RetryingTransport) but terminates in
+    a MockTransport, recording every emitted request's path (query string
+    excluded; the hex-id test asserts on it separately). Asserting on the
+    string handed to a mocked client.get cannot see httpx collapsing "." /
+    ".." during the base_url merge - the wire-level path can."""
+    backend = _backend()
+    raw_paths: list[str] = []
 
-        call_args = backend._client.get.call_args
-        assert "evil" in call_args.args[0]
-        assert " " not in call_args.args[0]
+    async def recording_handler(request: httpx.Request) -> httpx.Response:
+        raw_paths.append(request.url.path)
+        return handler(request)
+
+    backend._client = httpx.AsyncClient(
+        base_url=backend.url,
+        headers=backend._create_headers(),
+        follow_redirects=True,
+        transport=_RetryingTransport(wrapped=httpx.MockTransport(recording_handler)),
+    )
+    return backend, raw_paths
+
+
+class TestGetTracePathSegmentSafety:
+    """A caller- or backend-supplied trace_id may only vary the {trace_id}
+    segment of /api/0/organizations/{org}/trace/{trace_id}/. The values "",
+    "." and ".." survive percent-encoding as whole segments and httpx removes
+    them when merging onto base_url, retargeting the operator-authenticated
+    request at a different same-host endpoint - so they, and anything that
+    is not a 32-hex Sentry trace id, are rejected before any request.
+
+    Audit: src/opentelemetry_mcp/backends/sentry.py:SentryBackend.get_trace:dot-segment-trace-id
+    """
+
+    @pytest.mark.parametrize("trace_id", ["..", ".", ""])
+    async def test_dot_segment_ids_raise_and_emit_no_request(self, trace_id: str) -> None:
+        backend, raw_paths = _wire_backend(lambda request: httpx.Response(200, json=[]))
+
+        with pytest.raises(ValueError, match="Invalid"):
+            await backend.get_trace(trace_id)
+
+        assert raw_paths == []
+
+    @pytest.mark.parametrize("trace_id", ["evil/../x", "evil/../ trace", "requested", "t1"])
+    async def test_non_hex_ids_raise_and_emit_no_request(self, trace_id: str) -> None:
+        backend, raw_paths = _wire_backend(lambda request: httpx.Response(200, json=[]))
+
+        with pytest.raises(ValueError, match="Invalid Sentry trace_id format"):
+            await backend.get_trace(trace_id)
+
+        assert raw_paths == []
+
+    async def test_overlong_id_is_rejected_on_length_alone_without_being_echoed(self) -> None:
+        """The path-segment length cap runs before the 32-hex check, so an
+        over-long id is rejected for its length and never echoed into the
+        ValueError that _handle_tool_error writes to the server log
+        (url_path.py withholds over-long values from its message on
+        purpose). All-hex, so only the length is wrong."""
+        long_id = "a" * (MAX_PATH_SEGMENT_CHARS + 1)
+        backend, raw_paths = _wire_backend(lambda request: httpx.Response(200, json=[]))
+
+        with pytest.raises(ValueError) as excinfo:
+            await backend.get_trace(long_id)
+
+        assert long_id not in str(excinfo.value)
+        assert str(MAX_PATH_SEGMENT_CHARS) in str(excinfo.value)
+        assert raw_paths == []
+
+    async def test_hex_id_emits_exactly_one_get_inside_the_trace_segment(self) -> None:
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json=[_trace_item("s1", HEX_TRACE_ID)])
+
+        backend, raw_paths = _wire_backend(handler)
+
+        trace = await backend.get_trace(HEX_TRACE_ID)
+
+        assert trace.trace_id == HEX_TRACE_ID
+        assert raw_paths == [f"/api/0/organizations/acme/trace/{HEX_TRACE_ID}/"]
+        params = seen[0].url.params
+        assert params["project"] == "-1"
+        assert "start" in params and "end" in params
+
+    async def test_hydration_rows_with_dot_segment_ids_never_leave_the_trace_path(
+        self,
+    ) -> None:
+        """sentry.py's search_traces feeds backend-row trace ids into
+        get_trace; the guard lives inside get_trace, so those rows inherit
+        it: ".." and "." are skipped (logged, not propagated) and the
+        remaining row still hydrates."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=[_trace_item("s3", HEX_TRACE_ID)])
+
+        backend, raw_paths = _wire_backend(handler)
+        backend._search_events_raw = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _search_row("s1", ".."),
+                _search_row("s2", "."),
+                _search_row("s3", HEX_TRACE_ID),
+            ]
+        )
+
+        traces = await backend.search_traces(TraceQuery(limit=10))
+
+        assert [t.trace_id for t in traces] == [HEX_TRACE_ID]
+        assert raw_paths == [f"/api/0/organizations/acme/trace/{HEX_TRACE_ID}/"]
+        assert all(p.startswith("/api/0/organizations/acme/trace/") for p in raw_paths)
 
 
 class TestGetTraceExactMatch:
@@ -913,7 +1017,7 @@ class TestGetTraceExactMatch:
         fake_response.json = lambda: [
             {
                 "span_id": "s1",
-                "trace_id": "requested",
+                "trace_id": HEX_TRACE_ID,
                 "op": "op",
                 "project": "svc",
                 "start_timestamp": "2023-01-02T09:42:36.320Z",
@@ -923,7 +1027,7 @@ class TestGetTraceExactMatch:
                 # Wrong trace_id - should be filtered out even though it
                 # came back from the endpoint.
                 "span_id": "s2",
-                "trace_id": "other",
+                "trace_id": OTHER_HEX_TRACE_ID,
                 "op": "op",
                 "project": "svc",
                 "start_timestamp": "2023-01-02T09:42:36.320Z",
@@ -934,9 +1038,9 @@ class TestGetTraceExactMatch:
         backend._client.is_closed = False
         backend._client.get = AsyncMock(return_value=fake_response)
 
-        trace = await backend.get_trace("requested")
+        trace = await backend.get_trace(HEX_TRACE_ID)
 
-        assert trace.trace_id == "requested"
+        assert trace.trace_id == HEX_TRACE_ID
         assert len(trace.spans) == 1
         assert trace.spans[0].span_id == "s1"
 
@@ -950,7 +1054,7 @@ class TestGetTraceExactMatch:
         backend._client.get = AsyncMock(return_value=fake_response)
 
         with pytest.raises(ValueError, match="No spans found"):
-            await backend.get_trace("missing")
+            await backend.get_trace(HEX_TRACE_ID)
 
     async def test_raises_on_non_list_response(self) -> None:
         backend = _backend()
@@ -962,7 +1066,7 @@ class TestGetTraceExactMatch:
         backend._client.get = AsyncMock(return_value=fake_response)
 
         with pytest.raises(ValueError, match="Unexpected Sentry trace response shape"):
-            await backend.get_trace("t1")
+            await backend.get_trace(HEX_TRACE_ID)
 
 
 class TestGroupIntoTrace:

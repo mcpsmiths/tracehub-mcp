@@ -21,6 +21,7 @@ import tomllib
 from pathlib import Path
 from typing import get_args
 
+from opentelemetry_mcp.backends.base import DEFAULT_MAX_RESPONSE_BYTES
 from opentelemetry_mcp.config import BackendConfig
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -152,3 +153,50 @@ def test_mcpb_manifest_env_mapping_covers_every_backend_specific_field() -> None
     }
     missing = backend_specific_env_vars - set(env.keys())
     assert not missing, f"mcpb/manifest.json's mcp_config.env is missing: {missing}"
+
+
+def test_mcpb_manifest_env_placeholders_resolve_to_declared_user_config() -> None:
+    """Every `${user_config.<key>}` the bundle maps into the server's env
+    must name a declared user_config entry - a typo here silently leaves
+    the variable unset for every Desktop Extension user."""
+    manifest = json.loads((REPO_ROOT / "mcpb" / "manifest.json").read_text())
+    env = manifest["server"]["mcp_config"]["env"]
+    declared = set(manifest["user_config"])
+
+    referenced = {
+        value.removeprefix("${user_config.").removesuffix("}")
+        for value in env.values()
+        if value.startswith("${user_config.") and value.endswith("}")
+    }
+    undeclared = referenced - declared
+    assert not undeclared, f"mcp_config.env references undeclared user_config keys: {undeclared}"
+
+
+def test_mcpb_manifest_surfaces_the_response_size_cap_opt_out() -> None:
+    """BACKEND_MAX_RESPONSE_BYTES is a breaking default (a legitimate large
+    trace query can be refused) whose only opt-out is raising the cap, so
+    the Desktop Extension bundle must expose it the way it exposes
+    BACKEND_TIMEOUT - and its default/bounds must match config.py and the
+    MCP Registry listing so the three surfaces cannot drift."""
+    manifest = json.loads((REPO_ROOT / "mcpb" / "manifest.json").read_text())
+    server_json = json.loads((REPO_ROOT / "server.json").read_text())
+
+    env = manifest["server"]["mcp_config"]["env"]
+    assert env["BACKEND_MAX_RESPONSE_BYTES"] == "${user_config.backend_max_response_bytes}"
+
+    knob = manifest["user_config"]["backend_max_response_bytes"]
+    assert knob["type"] == "number"
+    assert knob["required"] is False
+    assert knob["default"] == DEFAULT_MAX_RESPONSE_BYTES
+    bounds = {
+        type(m).__name__: m for m in BackendConfig.model_fields["max_response_bytes"].metadata
+    }
+    assert knob["min"] == bounds["Ge"].ge
+    assert knob["max"] == bounds["Le"].le
+
+    registry_var = next(
+        v
+        for v in server_json["packages"][0]["environmentVariables"]
+        if v["name"] == "BACKEND_MAX_RESPONSE_BYTES"
+    )
+    assert registry_var["default"] == str(knob["default"])

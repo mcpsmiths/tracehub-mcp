@@ -17,11 +17,30 @@ or any third party. There is no tracking of any kind baked into the software.
   environment variables you provide and used only to authenticate to the observability
   backend *you* configure (`BACKEND_URL`). They are never logged, never sent anywhere
   else, and never leave the process — redaction is applied on the one code path that
-  could otherwise echo them back (see [Secret Flow](#secret-flow) below).
+  could otherwise echo them back (see [Secret Flow](#secret-flow) below). `BACKEND_URL`
+  itself may not carry a credential: a `user:password@host` URL is rejected at startup,
+  and as defence in depth every URL and backend error text that is logged, printed
+  (`--print-config`, `doctor`) or returned (tool errors) is stripped of any userinfo
+  component first. The unauthenticated `GET /ready` never returns backend text at all:
+  a failing probe's `503` body names only an error class (`backend unreachable`,
+  `backend timeout`, `backend error <status>`, `backend unhealthy`) and the redacted
+  detail is written to the server log once per fresh probe.
+- **Server logs** are the only place request data is written, and only in bounded form.
+  The HTTP transport keeps uvicorn's per-request access log off, because it would record
+  every request target - a token a misconfigured client puts in the query string
+  included; the server's own lines carry rejected `Host`/`Origin` values cut and
+  repr-quoted, and every record written by the root log handler is stripped of URL
+  credentials and of control characters before it reaches the terminal or a log
+  collector. Nothing is logged to any destination other than the process's stderr.
 - **Trace and span data** returned by tools comes from whatever application your own
   observability backend is instrumenting. tracehub-mcp queries that backend using your
   credentials and returns the results to your MCP client (Claude, Cursor, etc.) — it does
-  not store, cache, or forward that data anywhere beyond that single request/response.
+  not persist or forward that data anywhere beyond that single request/response. The one
+  exception is the opt-in query cache (`QUERY_CACHE_TTL_SECONDS`, unset by default): when
+  enabled, query results are held in the server process's memory for up to the configured
+  TTL (at most one day), capped at `QUERY_CACHE_MAX_ENTRIES` results (default 1024, least
+  recently used evicted first), shared by every MCP session of that process and discarded
+  when it exits. Nothing is ever written to disk.
 - **Network calls** the running server makes are limited to: (1) the backend URL you
   configure (Jaeger/Tempo/Traceloop/Datadog/Sentry), and (2) if you enable
   `--transport http`, binding its own listening port for MCP clients to connect to. No

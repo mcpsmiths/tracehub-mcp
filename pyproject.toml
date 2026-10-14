@@ -87,13 +87,29 @@ Changelog = "https://github.com/mcpsmiths/tracehub-mcp/blob/main/CHANGELOG.md"
 tracehub-mcp = "opentelemetry_mcp.server:main"
 
 [build-system]
-requires = ["hatchling"]
+# Exact pin: the release artifact's bytes must depend on reviewed content only,
+# not on whatever hatchling PyPI serves at publish time. Must equal the pin in
+# [tool.uv] build-constraint-dependencies and .github/requirements-build.txt
+# (tests/test_build_toolchain.py); Dependabot bumps the hashed file, a human
+# moves these two in the same PR.
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/opentelemetry_mcp"]
 
 [tool.uv]
+# hatchling and its build-time closure, pinned so `uv build` / `uv sync` resolve
+# the same backend everywhere. release.yml additionally passes the hash-bound
+# .github/requirements-build.txt via --build-constraints --require-hashes.
+build-constraint-dependencies = [
+    "hatchling==1.32.4",
+    "packaging==26.3",
+    "pathspec==1.1.1",
+    "pluggy==1.6.0",
+    "tomlkit==0.15.1",
+    "trove-classifiers==2026.9.21.13",
+]
 
 [dependency-groups]
 dev = [
@@ -107,6 +123,10 @@ dev = [
     "types-boto3[xray]>=1.40,<2",
     "pip-audit>=2.10.1,<3",
     "hypothesis>=6.160,<7",
+    # tests/test_workflow_policy.py and friends parse .github/workflows/*.yml;
+    # PyYAML was previously only transitive (vcrpy) and had no type stubs.
+    "pyyaml>=6.0.3,<7",
+    "types-pyyaml>=6.0.12,<7",
 ]
 
 [tool.ruff]

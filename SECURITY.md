@@ -20,7 +20,8 @@ Include, where relevant:
 - A description of the vulnerability and its potential impact
 - Steps to reproduce (a minimal repro is ideal)
 - The affected version(s)
-- Whether it requires a specific backend (Jaeger, Tempo, Traceloop, Datadog, Sentry) to trigger
+- Whether it requires a specific backend (Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry,
+  AWS X-Ray, New Relic, Honeycomb) to trigger
 
 We aim to acknowledge new reports within a few days. Since this is an independently maintained
 open-source project rather than a funded security team, response and fix timelines are
@@ -32,13 +33,53 @@ For anyone auditing this project as a dependency:
 
 - All GitHub Actions third-party steps are pinned to a full commit SHA (not a mutable tag) across
   every workflow.
+- The release toolchain is version- and hash-pinned in-tree: the release job installs Commitizen
+  only from `.github/requirements-release.txt` (`pip install --require-hashes --no-deps
+  --only-binary=:all:`, so a mismatched wheel hash fails the install instead of falling back
+  to an sdist build with run-time-resolved build dependencies); `uv` is
+  pinned to the same version as the Dockerfile in every workflow; the build backend (`hatchling`)
+  and its build-time dependencies are exact-pinned in `pyproject.toml` and hash-bound through
+  `.github/requirements-build.txt` (`uv build --build-constraints ... --require-hashes`). Nothing
+  is resolved from PyPI at release time, and the checkout that receives the release token does not
+  persist it to disk.
 - CI runs [`ruff`](https://docs.astral.sh/ruff/) with the `S` (flake8-bandit) ruleset and
   [`pip-audit`](https://pypi.org/project/pip-audit/) against the resolved lockfile on every push.
+- Secret detection: TruffleHog scans the commit range of every push to `main` and every pull
+  request, and weekly (plus on demand) the whole history of every branch, with a custom detector
+  for Traceloop API keys (`.trufflehog.yaml`) that no built-in detector or GitHub partner pattern
+  covers; a `gitleaks` pre-commit hook with the same rule (`.gitleaks.toml`) runs locally - its
+  one allowlist entry exempts a single literal test-fixture line for one default rule, never a
+  path.
 - Published container images (`ghcr.io/mcpsmiths/tracehub-mcp`) include build provenance
   attestation and an SBOM via `docker/build-push-action`.
 - Releases are published to PyPI via GitHub Actions using
   [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC), not a long-lived API
   token.
+
+### Release authorization
+
+Releases are cut only by dispatching `release.yml` from `main`. The jobs that hold release
+credentials declare the `release` GitHub environment, whose deployment-branch policy admits only
+`main`: GitHub refuses such a job before its first step when the run's ref is anything else, which
+is the control that holds even against a branch carrying an edited copy of the workflow. The
+`RELEASE_PAT` used to push the bump commit and tag (a fine-grained token scoped to this repository
+with Contents read/write) is stored as a secret of that environment, is handed to the checkout
+without being persisted, and reaches the push step only as a step-level variable. The PyPI trusted
+publisher for `tracehub-mcp` and the MCP Registry publish job mint their OIDC tokens only from jobs
+running under the same environment, so neither can be fed an unreviewed build from another ref.
+GitHub has no per-workflow dispatch permission: any collaborator with write access can dispatch
+`release.yml`, but a dispatch from `main` runs only the reviewed workflow file on `main`, and the
+`release` environment refuses every other ref. Required reviewers on the environment are off while
+the project has a single maintainer and should be enabled before a non-admin writer is added.
+Published container tags rest on one more control: `docker-publish.yml` builds `:X.Y.Z` and
+`:latest` only from the tree behind `refs/tags/vX.Y.Z`, so the `protect-release-tags` ruleset
+(`refs/tags/v*`; no update or deletion except by bypass actors) is what stops a writer from
+re-pointing a release tag at another tree.
+
+The environment's deployment-branch policy, the environment-scoped `RELEASE_PAT` secret, the PyPI
+publisher's environment name and the tag ruleset are repository and PyPI settings configured by the
+maintainer, not by files in this repository: the workflow-side declarations above are inert until
+they are configured, and each protection holds only once its setting is in place.
 
 ## Scope
 
@@ -49,6 +90,7 @@ full explanation; this document's scope is the vulnerability reporting process b
 
 This policy covers the tracehub-mcp server code itself (this repository). It does not cover:
 
-- The observability backends it connects to (Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry) —
-  report vulnerabilities in those systems to their respective maintainers.
+- The observability backends it connects to (Jaeger, Grafana Tempo, Traceloop, Datadog, Sentry,
+  AWS X-Ray, New Relic, Honeycomb) — report vulnerabilities in those systems to their respective
+  maintainers.
 - MCP clients that connect to this server (Claude Desktop, Cursor, etc.).

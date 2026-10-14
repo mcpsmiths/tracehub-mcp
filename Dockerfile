@@ -115,9 +115,20 @@ EXPOSE 8000
 #   - Docker Compose environment files
 #   - Kubernetes secrets
 #   - .env files mounted at runtime
+#
+# FASTMCP_CHECK_FOR_UPDATES / FASTMCP_SHOW_SERVER_BANNER are FastMCP's own
+# settings, not this project's: with the defaults, the framework fetches
+# https://pypi.org/pypi/fastmcp/json once per 12 h when it prints its startup
+# banner (stdio mode included - observed from the shipped image). README and
+# CLAUDE.md already tell operators to turn that off; the image ships with it
+# off so a container never makes egress nobody configured. Override at run
+# time (-e FASTMCP_CHECK_FOR_UPDATES=stable) to get the banner's update hint
+# back.
 ENV BACKEND_TIMEOUT="30" \
     LOG_LEVEL="INFO" \
-    MAX_TRACES_PER_QUERY="500"
+    MAX_TRACES_PER_QUERY="500" \
+    FASTMCP_CHECK_FOR_UPDATES="off" \
+    FASTMCP_SHOW_SERVER_BANNER="false"
 
 # Health check - see docker_healthcheck.py (already present, copied in via
 # COPY --from=builder /app /app above) for what "healthy" means here and
