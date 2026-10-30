@@ -190,6 +190,19 @@ def test_dependabot_tracks_the_hashed_github_requirements() -> None:
     assert "/.github" in pip_dirs, pip_dirs
 
 
+def test_dependabot_tracks_uv_lock_at_the_root() -> None:
+    """The root entry must use the `uv` ecosystem: with `pip` Dependabot reads
+    only pyproject.toml, never rewrites uv.lock, and the dependency graph stays
+    empty so no security alert is ever raised for what the image actually ships.
+    The hash-pinned /.github toolchain stays on `pip` (no uv.lock there)."""
+    updates = _load_yaml(DEPENDABOT_YML)["updates"]
+    root_ecosystems = [u["package-ecosystem"] for u in updates if u["directory"] == "/"]
+    assert root_ecosystems.count("uv") == 1, root_ecosystems
+    assert "pip" not in root_ecosystems, root_ecosystems
+    toolchain = [u for u in updates if u["directory"] == "/.github"]
+    assert [u["package-ecosystem"] for u in toolchain] == ["pip"], toolchain
+
+
 def test_security_md_describes_the_hash_pinned_release_toolchain() -> None:
     text = SECURITY_MD.read_text(encoding="utf-8")
     assert "requirements-release.txt" in text or "hash-pinned" in text
