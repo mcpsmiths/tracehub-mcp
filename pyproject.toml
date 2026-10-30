@@ -61,6 +61,17 @@ dependencies = [
     # tracks direct + lockfile-pinned versions, not "whatever the resolver
     # happens to pick" for a transitive dep with no floor here).
     "anyio>=4.14.2",
+    # Same reasoning as anyio above: fastmcp-slim only requires authlib>=1.6.11
+    # and nothing here floors dnspython, so a resolve outside uv.lock could still
+    # land on a release with a published advisory. certifi is already floored
+    # transitively by fastmcp>=4.1.3 but is pinned here too so the floor cannot
+    # vanish if a later fastmcp drops it.
+    #   authlib>=1.9.0      CVE-2026-96760 (critical) and 7 more advisories
+    #   dnspython>=2.9.0    CVE-2026-114605 (high)
+    #   certifi>=2026.10.19 GHSA-6q48-6c7w-9gw2 / PYSEC-2026-4320 (critical)
+    "authlib>=1.9.0",
+    "dnspython>=2.9.0",
+    "certifi>=2026.10.19",
     "pydantic>=2.12,<2.14",
     "httpx~=0.28.0",
     "python-dotenv~=1.2.2",

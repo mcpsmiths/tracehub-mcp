@@ -2324,8 +2324,11 @@ version = "0.13.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
+    { name = "authlib" },
     { name = "boto3" },
+    { name = "certifi" },
     { name = "click" },
+    { name = "dnspython" },
     { name = "fastmcp" },
     { name = "httpx" },
     { name = "mcp" },
@@ -2358,8 +2361,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = ">=4.14.2" },
+    { name = "authlib", specifier = ">=1.9.0" },
     { name = "boto3", specifier = ">=1.43.97,<2" },
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "click", specifier = ">=8.3,<8.6" },
+    { name = "dnspython", specifier = ">=2.9.0" },
     { name = "fastmcp", specifier = ">=4.1.3,<4.2" },
     { name = "httpx", specifier = "~=0.28.0" },
     { name = "mcp", specifier = ">=2.3.0,<3" },
