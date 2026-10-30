@@ -1083,6 +1083,22 @@ class TestToolAnnotationsComplete:
         assert all(isinstance(title, str) and title for title in titles), titles
         assert len(set(titles)) == 19, "titles must be distinct per tool"
 
+    async def test_list_services_description_keeps_its_returns_section(self) -> None:
+        """fastmcp 4.1 started stripping a trailing Google-style `Returns:`
+        section from a docstring-derived description when the tool has no
+        `Args:` section (4.0 kept it). list_services is that tool, so a bare
+        docstring silently changed the client-visible tools/list text at the
+        fastmcp bump. The description is therefore passed explicitly and
+        must stay byte-identical to what v0.13.0 advertised."""
+        async with Client(server.mcp) as client:
+            tools = await client.list_tools()
+
+        description = next(t for t in tools if t.name == "list_services").description
+        assert description == (
+            "List all available services in the OpenTelemetry backend.\n\n"
+            "Returns:\n    JSON string with list of services"
+        )
+
     async def test_get_llm_model_stats_advertises_an_optional_limit(self) -> None:
         """The one intended tools/list inputSchema change of the security
         remediation: get_llm_model_stats gains `limit` (integer, default

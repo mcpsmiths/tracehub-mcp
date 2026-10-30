@@ -93,3 +93,55 @@ def test_dependency_floors_match_locked_versions() -> None:
             "resolve outside `uv sync --frozen` could select an untested, "
             "potentially-vulnerable older release."
         )
+
+
+# First fastmcp release that is clean of GHSA-7xgj-8392-5q4r and GHSA-vqqp-x5qm-5qp4
+# (fixed in 4.1.2) AND whose server extra requires certifi>=2026.10.19
+# (GHSA-6q48-6c7w-9gw2 / PYSEC-2026-4320; 4.1.2 does not declare that floor, 4.1.3 does).
+FASTMCP_FIRST_PATCHED = Version("4.1.3")
+FASTMCP_VULNERABLE_RELEASES = ["4.0.5", "4.1.0", "4.1.1", "4.1.2"]
+
+
+def test_fastmcp_range_excludes_every_vulnerable_release() -> None:
+    """A fresh resolve outside `uv sync --frozen` (pip install of the wheel, a
+    downstream project without our lockfile) must not be able to pick a fastmcp
+    that carries a published advisory, directly or through its certifi floor.
+    The upper bound stays below the next minor so an untested 4.2 is never
+    selected silently."""
+    fastmcp = _pyproject_dependency_specifiers()["fastmcp"]
+
+    floor = _lower_bound(fastmcp)
+    assert floor is not None
+    assert floor >= FASTMCP_FIRST_PATCHED
+    for vulnerable in FASTMCP_VULNERABLE_RELEASES:
+        assert not fastmcp.specifier.contains(vulnerable), vulnerable
+    assert fastmcp.specifier.contains(FASTMCP_FIRST_PATCHED)
+    assert not fastmcp.specifier.contains("4.2.0")
+
+
+# Transitive packages this project floors directly because their upstream
+# requirers do not (or may stop to): the first release past each published
+# advisory. A floor below these would let a resolve outside uv.lock pick a
+# vulnerable release.
+FIRST_PATCHED_TRANSITIVE_FLOORS = {
+    "anyio": Version("4.14.2"),  # CVE-2026-63374, CVE-2026-64847
+    "authlib": Version("1.9.0"),  # CVE-2026-96760 (critical) and 7 more
+    "dnspython": Version("2.9.0"),  # CVE-2026-114605
+    "certifi": Version("2026.10.19"),  # GHSA-6q48-6c7w-9gw2 / PYSEC-2026-4320
+}
+
+
+def test_transitive_security_floors_are_declared_and_satisfied_by_the_lock() -> None:
+    """Each directly-floored transitive dependency declares a '>=' floor at or
+    above its first patched release, and uv.lock resolves to a version the
+    floor admits (so the lock cannot silently sit on a vulnerable release)."""
+    specifiers = _pyproject_dependency_specifiers()
+    locked_versions = _uv_lock_versions()
+
+    for package, first_patched in FIRST_PATCHED_TRANSITIVE_FLOORS.items():
+        assert package in specifiers, f"{package} is missing from pyproject.toml dependencies"
+        floor = _lower_bound(specifiers[package])
+        assert floor is not None, f"{package} has no '>=' lower bound"
+        assert floor >= first_patched, f"{package} floor {floor} is below first patched release"
+        assert specifiers[package].specifier.contains(locked_versions[package])
+        assert Version(locked_versions[package]) >= first_patched

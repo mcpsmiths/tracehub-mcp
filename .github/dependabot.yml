@@ -3,8 +3,11 @@
 
 version: 2
 updates:
-  # Python dependencies (pyproject.toml)
-  - package-ecosystem: "pip"
+  # Python dependencies (pyproject.toml + uv.lock). The `uv` ecosystem rewrites
+  # uv.lock and populates the dependency graph from it; the old root `pip` entry
+  # read pyproject.toml only, so the locked versions the image ships were never
+  # tracked and no security alert could fire for them.
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"

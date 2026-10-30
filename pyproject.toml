@@ -42,13 +42,17 @@ classifiers = [
 ]
 dependencies = [
     # Lower bound raised to the version actually locked/tested in uv.lock
-    # (2.2.0) rather than the original ">=2.0" floor - a fresh resolve
-    # outside this repo's `uv sync --frozen` workflow (e.g. `pip install`
-    # from an sdist, or a downstream project vendoring this package without
-    # the lockfile) could otherwise select an older 2.x point release this
-    # project has never actually run against.
-    "mcp>=2.2.0,<3",
-    "fastmcp>=4.0.5,<4.1",
+    # (2.3.0, which fastmcp 4.1.4's server extra also requires) rather than
+    # the original ">=2.0" floor - a fresh resolve outside this repo's
+    # `uv sync --frozen` workflow (e.g. `pip install` from an sdist, or a
+    # downstream project vendoring this package without the lockfile) could
+    # otherwise select an older 2.x point release this project has never
+    # actually run against.
+    "mcp>=2.3.0,<3",
+    # Floor 4.1.3: 4.1.2 closed GHSA-7xgj-8392-5q4r / GHSA-vqqp-x5qm-5qp4, and 4.1.3
+    # is the first release whose server extra requires certifi>=2026.10.19
+    # (GHSA-6q48-6c7w-9gw2). tests/test_pyproject.py pins this.
+    "fastmcp>=4.1.3,<4.2",
     # Pinned directly (not just transitive via mcp/fastmcp/httpx/starlette) to
     # close CVE-2026-63374 (TLS cert-validation bypass via IDNA2003 hostname
     # encoding) and CVE-2026-64847 (process-pool stderr-pipe DoS), both fixed
@@ -57,6 +61,17 @@ dependencies = [
     # tracks direct + lockfile-pinned versions, not "whatever the resolver
     # happens to pick" for a transitive dep with no floor here).
     "anyio>=4.14.2",
+    # Same reasoning as anyio above: fastmcp-slim only requires authlib>=1.6.11
+    # and nothing here floors dnspython, so a resolve outside uv.lock could still
+    # land on a release with a published advisory. certifi is already floored
+    # transitively by fastmcp>=4.1.3 but is pinned here too so the floor cannot
+    # vanish if a later fastmcp drops it.
+    #   authlib>=1.9.0      CVE-2026-96760 (critical) and 7 more advisories
+    #   dnspython>=2.9.0    CVE-2026-114605 (high)
+    #   certifi>=2026.10.19 GHSA-6q48-6c7w-9gw2 / PYSEC-2026-4320 (critical)
+    "authlib>=1.9.0",
+    "dnspython>=2.9.0",
+    "certifi>=2026.10.19",
     "pydantic>=2.12,<2.14",
     "httpx~=0.28.0",
     "python-dotenv~=1.2.2",
@@ -66,13 +81,15 @@ dependencies = [
     "opentelemetry-semantic-conventions>=0.60b0",
     "tenacity>=9.1,<10",
     # Lower bounds raised to the versions actually locked/tested in
-    # uv.lock (1.44.0 / 1.44.0 / 1.43.97) rather than the original,
+    # uv.lock (1.45.2 / 1.45.2 / 1.43.97) rather than the original,
     # much-wider ">=1.30"/">=1.40" floors - a fresh resolve outside this
     # repo's `uv sync --frozen` workflow could otherwise select an older
     # point release predating a since-patched CVE that this project has
     # never actually run against.
-    "opentelemetry-sdk>=1.44.0,<2",
-    "opentelemetry-exporter-otlp-proto-http>=1.44.0,<2",
+    # 1.45.1 closed CVE-2026-114603 (unbounded tracestate parsing in
+    # opentelemetry-api); the sdk and exporter pin api to their own version.
+    "opentelemetry-sdk>=1.45.2,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.2,<2",
     "boto3>=1.43.97,<2",
 ]
 

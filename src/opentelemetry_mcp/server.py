@@ -897,7 +897,21 @@ async def get_llm_usage(
         return _handle_tool_error("get_llm_usage", e)
 
 
-@mcp.tool(title="List Services", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+# The description is passed explicitly: fastmcp 4.1 strips a trailing
+# `Returns:` section from a docstring-derived description when the tool has
+# no `Args:` section (4.0 kept it), which changed the client-visible
+# tools/list text for this one tool. The literal keeps it identical to v0.13.0.
+_LIST_SERVICES_DESCRIPTION = (
+    "List all available services in the OpenTelemetry backend.\n\n"
+    "Returns:\n    JSON string with list of services"
+)
+
+
+@mcp.tool(
+    title="List Services",
+    description=_LIST_SERVICES_DESCRIPTION,
+    annotations=_READ_ONLY_TOOL_ANNOTATIONS,
+)
 async def list_services() -> str:
     """List all available services in the OpenTelemetry backend.
 
@@ -1573,11 +1587,11 @@ class OperatorTokenVerifier(TokenVerifier):
     """Binds every /mcp request on the HTTP transport to the operator's own
     shared bearer token.
 
-    fastmcp 4.0.5 only installs RequireAuthMiddleware around the /mcp route
-    when ``FastMCP.auth`` is set (fastmcp/server/http.py, the ``if auth:``
-    branch of create_streamable_http_app); with it unset every network peer
-    that can reach the port runs all 19 tools under the operator's backend
-    credential. This is the smallest AuthProvider that closes that gap for
+    fastmcp (4.0.5 and 4.1.x alike) only installs RequireAuthMiddleware around
+    the /mcp route when ``FastMCP.auth`` is set (fastmcp/server/http.py, the
+    ``if auth:`` branch of create_streamable_http_app); with it unset every
+    network peer that can reach the port runs all 19 tools under the
+    operator's backend credential. This is the smallest AuthProvider that closes that gap for
     the shared-secret case: no OAuth routes, no metadata endpoints, one
     constant-time comparison. fastmcp's own StaticTokenVerifier is
     deliberately not used - its docstring says it must never be used in
@@ -1853,23 +1867,16 @@ class OriginValidationMiddleware(BaseHTTPMiddleware):
     Origin rule. fastmcp 3.2.0 built its StreamableHTTPSessionManager without
     passing security_settings through at all, leaving the upstream mcp SDK's
     own DNS-rebinding/Origin protection (mcp.server.transport_security)
-    disabled by omission. Re-verified against the real installed fastmcp
-    4.0.5 (fastmcp/server/http.py:668-682, not assumed unchanged from
+    disabled by omission. Re-verified against the real installed fastmcp (4.0.5, and
+    again on 4.1.4; see fastmcp/server/http.py, not assumed unchanged from
     3.2.0): the gap is now an explicit, unconditional
-
-    fastmcp 3.2.0 built its StreamableHTTPSessionManager without passing
-    security_settings through at all, leaving the upstream mcp SDK's own
-    DNS-rebinding/Origin protection (mcp.server.transport_security) disabled
-    by omission. Re-verified against the real installed fastmcp 4.0.5
-    (fastmcp/server/http.py:668-682, not assumed unchanged from 3.2.0): the
-    gap is now an explicit, unconditional
     `security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False)`
     - fastmcp's own comment there says it "owns DNS-rebinding protection via
     HostOriginGuardMiddleware... always disable the SDK's own protection so
     the two layers don't double-block." That replacement,
     HostOriginGuardMiddleware, is real but stays opt-in
     (`host_origin_protection: HostOriginProtection = False` by default,
-    fastmcp/server/http.py:556) and this codebase's own
+    in fastmcp/server/http.py) and this codebase's own
     `mcp.http_app(transport=..., middleware=[...])` call never sets it - so
     fastmcp's own native alternative is never actually inserted for this
     deployment, and the underlying SDK protection stays disabled either way.
@@ -2066,7 +2073,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 # Parity with the mcp SDK's own DEFAULT_SESSION_IDLE_TIMEOUT (30 min), which
-# every other mcp-based streamable-HTTP server already applies; fastmcp 4.0.5
+# every other mcp-based streamable-HTTP server already applies; fastmcp <=4.0
 # is the odd one out in overriding it to "never" (see _build_http_app).
 _DEFAULT_SESSION_IDLE_TIMEOUT_SECONDS = 1800.0
 
@@ -2091,14 +2098,17 @@ def _build_http_app(
 ) -> StarletteWithLifespan:
     """The one place main() turns `mcp` into the streamable-HTTP Starlette app.
 
-    fastmcp 4.0.5's http_app() resolves an unset session_idle_timeout from
-    its own ``settings.http_session_idle_timeout``, whose default is None -
-    "sessions never expire from inactivity" - and forwards that None into
-    the mcp SDK's StreamableHTTPSessionManager, overriding the SDK's own
-    1800 s default. With the SDK's 10,000-session cap left in place, one
-    peer could then fill the shared session table with bare initialize
-    POSTs and make every new client's initialize answer 503 until restart.
-    Always passing a finite bound here restores the SDK behaviour; an idle
+    fastmcp's http_app() resolves an unset session_idle_timeout from its own
+    ``settings.http_session_idle_timeout``. Up to 4.0.x that default was None -
+    "sessions never expire from inactivity" - forwarded into the mcp SDK's
+    StreamableHTTPSessionManager, overriding the SDK's own 1800 s default. With
+    the SDK's 10,000-session cap left in place, one peer could then fill the
+    shared session table with bare initialize POSTs and make every new
+    client's initialize answer 503 until restart. Since 4.1.0 the default is
+    "auto" (the SDK's 1800 s) and "none" is how to disable it, so the bound
+    below is defence in depth rather than the only protection: it keeps the
+    behaviour independent of the fastmcp version and of any
+    FASTMCP_HTTP_SESSION_IDLE_TIMEOUT=none in the environment. An idle
     session's id answers 404 and spec-compliant clients re-initialize.
 
     In stateless mode no per-peer state exists, so the timeout is passed as
