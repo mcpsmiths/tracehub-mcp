@@ -897,7 +897,21 @@ async def get_llm_usage(
         return _handle_tool_error("get_llm_usage", e)
 
 
-@mcp.tool(title="List Services", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+# The description is passed explicitly: fastmcp 4.1 strips a trailing
+# `Returns:` section from a docstring-derived description when the tool has
+# no `Args:` section (4.0 kept it), which changed the client-visible
+# tools/list text for this one tool. The literal keeps it identical to v0.13.0.
+_LIST_SERVICES_DESCRIPTION = (
+    "List all available services in the OpenTelemetry backend.\n\n"
+    "Returns:\n    JSON string with list of services"
+)
+
+
+@mcp.tool(
+    title="List Services",
+    description=_LIST_SERVICES_DESCRIPTION,
+    annotations=_READ_ONLY_TOOL_ANNOTATIONS,
+)
 async def list_services() -> str:
     """List all available services in the OpenTelemetry backend.
 
