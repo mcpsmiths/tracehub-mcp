@@ -18,6 +18,9 @@ updates:
       - "dependencies"
       - "python"
     open-pull-requests-limit: 10
+    # `increase` raises the pyproject.toml minimum to the new version together with
+    # uv.lock (the default `auto` widens ranges); docs: dependabot-options-reference.
+    versioning-strategy: "increase"
     groups:
       python-minor-patch:
         patterns: ["*"]
