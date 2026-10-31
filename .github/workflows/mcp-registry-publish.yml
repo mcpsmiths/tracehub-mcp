@@ -25,6 +25,13 @@ name: Publish to MCP Registry
 # entry for the version is already live, and a read-back step then requires the
 # served listing to be active at the released version (issue #56; the same
 # hardening cost-guard-mcp's registry workflow ran through two real releases).
+# The registry token `login github-oidc` saves expires 5 minutes after it is
+# minted and `publish` never refreshes it, so the publish step logs in again
+# before every attempt after the first.
+# Recovery: by the time this job runs PyPI and the GitHub Release are already
+# live. If it fails, re-run it or dispatch mcp-registry-publish.yml from main
+# with version=X.Y.Z; the publish step is idempotent (an already-served entry
+# for the version is not an error) and the read-back step re-checks the listing.
 
 on:
   workflow_call:
@@ -56,8 +63,10 @@ jobs:
     name: Publish server.json to the MCP Registry
     runs-on: ubuntu-latest
     # The designed worst case (PyPI poll 13.3 min + 8 publish attempts 3.5 min of
-    # waits + read-back 2.3 min) is about 20 minutes; anything longer is a stalled
-    # connection, not progress.
+    # waits plus the time each failed publish takes + read-back 2.3 min) is about
+    # 20 minutes; anything longer is a stalled connection, not progress. The
+    # registry token outlives only 5 minutes, so the publish step mints a fresh
+    # one per attempt rather than relying on the login step above it.
     timeout-minutes: 30
     # Same boundary as release.yml's publishing jobs: the `release`
     # environment's deployment-branch policy admits only main. On the
@@ -187,6 +196,12 @@ jobs:
         # response, or a re-dispatch for an already-published tag) the step
         # reports it and lets the read-back step decide whether the served entry
         # is right.
+        # The registry token minted by the login step is valid for 5 minutes
+        # (registry v1.8.1 internal/auth/jwt.go) and `publish` reads the saved
+        # token without refreshing it. Seven 30 s waits plus the failed publishes
+        # outlast that, so every attempt after the first logs in again just before
+        # it publishes; a 401 from a stale token would otherwise be classed as
+        # non-transient and end the step with a misleading error.
         env:
           NEW_VERSION: ${{ inputs.version }}
         run: |
@@ -196,6 +211,11 @@ jobs:
           encoded="$(jq -rn --arg s "$name" '$s | @uri')"
           entry_url="https://registry.modelcontextprotocol.io/v0.1/servers/${encoded}/versions/${NEW_VERSION}"
           for attempt in $(seq 1 8); do
+            if [ "$attempt" -gt 1 ]; then
+              if ! ./mcp-publisher login github-oidc; then
+                echo "::warning::registry re-login failed before attempt ${attempt}; publishing with the saved token"
+              fi
+            fi
             if output="$(./mcp-publisher publish 2>&1)"; then
               echo "$output"
               exit 0
@@ -213,7 +233,7 @@ jobs:
               sleep 30
             fi
           done
-          echo "::error::mcp-publisher publish still failing after 8 attempts"
+          echo "::error::mcp-publisher publish still failing after 8 attempts. PyPI and the GitHub Release are already live; re-run this job or dispatch mcp-registry-publish.yml from main with version=${NEW_VERSION} (the publish step is idempotent)."
           exit 1
 
       - name: Confirm the published entry
@@ -240,10 +260,13 @@ jobs:
             fi
           done
           if [ -z "$body" ]; then
-            echo "::error::Registry entry for ${name} ${NEW_VERSION} was not readable after 10 attempts"
+            echo "::error::Registry entry for ${name} ${NEW_VERSION} was not readable after 10 attempts. PyPI and the GitHub Release are already live; re-run this job or dispatch mcp-registry-publish.yml from main with version=${NEW_VERSION} (the publish step is idempotent)."
             exit 1
           fi
           printf '%s' "$body" | jq '{name: (.server // .).name, version: (.server // .).version, package: (.server // .).packages[0], meta: ._meta}'
-          printf '%s' "$body" | jq -e --arg v "$NEW_VERSION" --arg id "$identifier" \
-            '(.server // .) as $s | $s.version == $v and $s.packages[0].registryType == "pypi" and $s.packages[0].identifier == $id and $s.packages[0].version == $v and ._meta["io.modelcontextprotocol.registry/official"].status == "active"' >/dev/null
+          if ! printf '%s' "$body" | jq -e --arg v "$NEW_VERSION" --arg id "$identifier" \
+            '(.server // .) as $s | $s.version == $v and $s.packages[0].registryType == "pypi" and $s.packages[0].identifier == $id and $s.packages[0].version == $v and ._meta["io.modelcontextprotocol.registry/official"].status == "active"' >/dev/null; then
+            echo "::error::The registry serves ${name} ${NEW_VERSION}, but not as an active pypi/${identifier}/${NEW_VERSION} entry (see the printed record). PyPI and the GitHub Release are already live; re-dispatching mcp-registry-publish.yml cannot change a served record, so inspect the entry and fix the workflow on main if the check itself is wrong."
+            exit 1
+          fi
           echo "Registry serves ${name} ${NEW_VERSION} (status active) with package record pypi/${identifier}/${NEW_VERSION}"

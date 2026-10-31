@@ -146,6 +146,10 @@ case "$1" in
     echo validate >> "$d/events"
     if [ -f "$d/validate_fails" ]; then echo "validation failed: bad server.json"; exit 1; fi
     exit 0 ;;
+  login)
+    echo login >> "$d/events"
+    if [ -f "$d/login_fails" ]; then echo "login failed: oidc unreachable"; exit 1; fi
+    exit 0 ;;
   publish)
     echo publish >> "$d/events"
     n=$(( $(cat "$d/publish_count" 2>/dev/null || echo 0) + 1 ))
@@ -299,6 +303,14 @@ def test_read_back_step_follows_the_publish_step_and_requires_an_active_listing(
     assert "mcp-publisher" not in script, "the read-back must not publish anything"
 
 
+def test_header_documents_the_token_bound_and_the_recovery_path() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    header = text.split("\non:\n", 1)[0]
+    assert "5 minutes" in header and "logs in again" in header
+    assert "dispatch mcp-registry-publish.yml from main" in header
+    assert "idempotent" in header
+
+
 def test_job_has_a_timeout_that_covers_the_designed_worst_case() -> None:
     # PyPI poll 40 x 20 s (13.3 min) + 8 publish attempts (3.5 min of waits) + read-back
     # 10 x 15 s (2.25 min) is about 20 minutes; anything past 30 is a stalled connection.
@@ -374,7 +386,7 @@ def test_registry_404_then_success_retries_once_after_30s(sandbox: _Sandbox) -> 
     sandbox.publish_attempts((1, TRANSIENT_ERRORS[0]), (0, "published"))
     completed = sandbox.run(_script(PUBLISH_STEP))
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert sandbox.events() == ["validate", "publish", "sleep 30", "publish"]
+    assert sandbox.events() == ["validate", "publish", "sleep 30", "login", "publish"]
     assert "Attempt 1/8" in completed.stdout
 
 
@@ -389,8 +401,10 @@ def test_each_transient_registry_error_is_retried_then_succeeds(
         "validate",
         "publish",
         "sleep 30",
+        "login",
         "publish",
         "sleep 30",
+        "login",
         "publish",
     ]
 
@@ -431,11 +445,58 @@ def test_exhausting_eight_transient_attempts_fails_with_no_trailing_sleep(
     assert "still failing after 8 attempts" in completed.stdout + completed.stderr
 
 
+def test_registry_token_is_minted_fresh_before_every_attempt_after_the_first(
+    sandbox: _Sandbox,
+) -> None:
+    # The saved registry token lives 5 minutes and `publish` never refreshes it, while seven
+    # 30 s waits plus the failed publishes outlast that: attempts 2..8 each need a new login,
+    # made after the wait so the token is youngest when it is used.
+    sandbox.publish_attempts((1, TRANSIENT_ERRORS[1]))
+    completed = sandbox.run(_script(PUBLISH_STEP))
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    events = sandbox.events()
+    assert events[:2] == ["validate", "publish"], "attempt 1 uses the login step's token"
+    assert events.count("login") == RETRY_ATTEMPTS - 1
+    expected_tail = [
+        event for _ in range(RETRY_ATTEMPTS - 1) for event in ("sleep 30", "login", "publish")
+    ]
+    assert events[2:] == expected_tail
+
+
+def test_a_failed_re_login_does_not_stop_the_retry_loop(sandbox: _Sandbox) -> None:
+    (sandbox.state / "login_fails").write_text("", encoding="utf-8")
+    sandbox.publish_attempts((1, TRANSIENT_ERRORS[0]), (0, "published"))
+    completed = sandbox.run(_script(PUBLISH_STEP))
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert sandbox.events() == ["validate", "publish", "sleep 30", "login", "publish"]
+    assert "::warning::registry re-login failed before attempt 2" in completed.stdout
+
+
+def test_exhaustion_error_tells_the_operator_how_to_recover(sandbox: _Sandbox) -> None:
+    sandbox.publish_attempts((1, TRANSIENT_ERRORS[1]))
+    completed = sandbox.run(_script(PUBLISH_STEP))
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    error_line = next(
+        line for line in completed.stdout.splitlines() if "still failing after 8 attempts" in line
+    )
+    assert error_line.startswith("::error::")
+    assert "PyPI and the GitHub Release are already live" in error_line
+    assert f"mcp-registry-publish.yml from main with version={VERSION}" in error_line
+    assert "idempotent" in error_line
+
+
 def test_a_transient_run_ending_in_a_final_error_stops_there(sandbox: _Sandbox) -> None:
     sandbox.publish_attempts((1, TRANSIENT_ERRORS[0]), (1, FINAL_ERRORS[3]))
     completed = sandbox.run(_script(PUBLISH_STEP))
     assert completed.returncode == 1, completed.stdout + completed.stderr
-    assert sandbox.events() == ["validate", "publish", "sleep 30", "publish", f"curl {ENTRY_URL}"]
+    assert sandbox.events() == [
+        "validate",
+        "publish",
+        "sleep 30",
+        "login",
+        "publish",
+        f"curl {ENTRY_URL}",
+    ]
 
 
 # --- the read-back step, executed ---------------------------------------------------------------
@@ -497,3 +558,29 @@ def test_read_back_gives_up_after_ten_unreadable_attempts_with_no_trailing_sleep
     assert events.count("sleep 15") == READ_BACK_ATTEMPTS - 1
     assert events[-1].startswith("curl "), "no sleep may follow the final attempt"
     assert "was not readable after 10 attempts" in completed.stdout + completed.stderr
+
+
+def test_read_back_gives_the_operator_a_recovery_path_when_the_entry_is_unreadable(
+    sandbox: _Sandbox,
+) -> None:
+    completed = sandbox.run(_script(READ_BACK_STEP))
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    error_line = next(
+        line for line in completed.stdout.splitlines() if "not readable after 10 attempts" in line
+    )
+    assert error_line.startswith("::error::")
+    assert "PyPI and the GitHub Release are already live" in error_line
+    assert f"mcp-registry-publish.yml from main with version={VERSION}" in error_line
+
+
+def test_read_back_mismatch_explains_that_a_re_dispatch_cannot_change_the_record(
+    sandbox: _Sandbox,
+) -> None:
+    sandbox.entry_live(_entry_body(status="deprecated"))
+    completed = sandbox.run(_script(READ_BACK_STEP))
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    error_line = next(
+        line for line in completed.stdout.splitlines() if line.startswith("::error::")
+    )
+    assert "but not as an active pypi/tracehub-mcp/9.9.9 entry" in error_line
+    assert "cannot change a served record" in error_line
