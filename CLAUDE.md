@@ -75,6 +75,8 @@ class BaseBackend(ABC):
     async def get_service_operations(self, service: str) -> list[str]: ...
     @abstractmethod
     async def health_check(self) -> bool: ...
+    @abstractmethod
+    def get_supported_operators(self) -> set[FilterOperator]: ...
 ```
 
 Concrete implementations:
@@ -119,9 +121,9 @@ Each MCP capability is implemented as a separate tool module in [opentelemetry_m
 requirement - it was this codebase's original convention, from before FastMCP auto-derived
 `outputSchema`/`structuredContent` from a tool function's return-type annotation. Most tools
 still use the original pattern; `search_traces`, `search_spans_tool`, `list_sessions`, `get_trace`,
-and `triage_trace` were converted to (or, for the latter two, built directly on) the newer pattern
-(see [models.py](src/opentelemetry_mcp/models.py)'s `SearchTracesResult`/`SearchSpansResult`/
-`TraceDetail`/`TriageResult` and [tools/sessions.py](src/opentelemetry_mcp/tools/sessions.py)'s
+`triage_trace` and `correlate_trace` were converted to (or, for the latter three, built directly on)
+the newer pattern (see [models.py](src/opentelemetry_mcp/models.py)'s `SearchTracesResult`/
+`SearchSpansResult`/`TraceDetail`/`TriageResult`/`CorrelationResult` and [tools/sessions.py](src/opentelemetry_mcp/tools/sessions.py)'s
 `ListSessionsResult`) so MCP clients get real structured output instead of a JSON string wrapped
 in `{"result": "<json string>"}`.
 
@@ -129,7 +131,7 @@ in `{"result": "<json string>"}`.
 # Pattern A (most tools): return a JSON string
 return json.dumps({"result": data})
 
-# Pattern B (search_traces, search_spans_tool, list_sessions, get_trace, triage_trace): return a typed model
+# Pattern B (search_traces, search_spans_tool, list_sessions, get_trace, triage_trace, correlate_trace): return a typed model
 return SearchTracesResult(count=len(summaries), traces=summaries)
 ```
 
@@ -178,7 +180,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `MCP_TRUST_CLIENT_TRACE_CONTEXT` - Optional: Env-var equivalent of `--trust-client-trace-context` (default: `true` for stdio, `false` for `--transport http`). `true` -> fastmcp `telemetry_mode="propagation_only"` (a caller's `params._meta` trace context parents this server's spans); `false` -> `"off"` (neither extracted nor attached). Both suppress FastMCP's own duplicate spans (`tests/test_double_tracing_regression.py`)
 - `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` - Optional: Env-var equivalents of `--rate-limit-max-requests`/`--rate-limit-window-seconds` (HTTP transport only, defaults: `100`/`60.0`). Validated at startup like the duration options: `click.IntRange(min=0)` (`0` keeps its disable meaning) and `FloatRange(min=0, min_open=True)` plus `_require_finite_seconds`, so a negative count, `0`, a negative window, `inf` and `nan` exit 2. These two, `--allowed-hosts` and `--forwarded-allow-ips` set `show_envvar=True`, so the usage error and `--help` name the env var (`[env var: ...]`)
 - `READINESS_CACHE_SECONDS` - Optional: Env-var equivalent of `--readiness-cache-seconds` (HTTP transport only, default: `30.0`, `0` disables the memo). `GET /ready` is unauthenticated and each probe costs the backend a `health_check` + `list_services` (a Honeycomb Create Query Result slot, up to 222 X-Ray API calls), so `server._run_backend_checks_memoized` memoizes the result for this window (`_READINESS_MEMO_TTL_SECONDS`; a failure for `_READINESS_FAILURE_MEMO_TTL_SECONDS` = `5` s), shares one in-flight probe between concurrent requests (loop-keyed `asyncio.Lock`, keyed on the backend object's identity) and answers `503` after `_READINESS_CHECK_TIMEOUT_SECONDS` = `10` s. `doctor` keeps calling the live `_run_backend_checks`
-- `SESSION_IDLE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--session-idle-timeout-seconds` (HTTP transport only, must be > 0, default: `1800.0` = the mcp SDK default). fastmcp >=4.1 defaults to the SDK's 1800 s (`auto`), fastmcp <=4.0 defaulted to never, and `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT=none` disables it; `server._build_http_app` always passes a finite bound regardless (defence in depth); an idle session's id answers `404` and clients re-initialize. `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT` is a no-code stopgap for already-deployed containers
+- `SESSION_IDLE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--session-idle-timeout-seconds` (HTTP transport only, must be > 0, default: `1800.0` = the mcp SDK default). fastmcp >=4.1 defaults to the SDK's 1800 s (`auto`), fastmcp <=4.0 defaulted to never, and `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT=none` disables it for a plain fastmcp app; `server._build_http_app` always passes a finite bound in stateful mode regardless (defence in depth), and fastmcp only falls back to its own setting when no bound is passed, so `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT` has no effect on this server - set `SESSION_IDLE_TIMEOUT_SECONDS` instead. It was a no-code stopgap only for a container still running a build older than v0.13.0 (the first release that passes the bound) on fastmcp <=4.0; an idle session's id answers `404` and clients re-initialize
 - `MCP_STATELESS_HTTP` - Optional: Env-var equivalent of `--stateless-http` (HTTP transport only, default: `false`). Stateless mode keeps no per-peer session state at all but drops the GET SSE stream for server-initiated notifications
 - `SHUTDOWN_DRAIN_SECONDS` - Optional: Env-var equivalent of `--shutdown-drain-seconds` (HTTP transport only, default: `0.0`/disabled)
 - `BACKEND_CLOSE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--backend-close-timeout-seconds` (HTTP transport only, default: `5.0`)
@@ -668,8 +670,10 @@ The server uses a hybrid filtering strategy:
 | ------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------- |
 | **Tempo (TraceQL)** | equals, not_equals, gt, lt, gte, lte, contains (regex), in (OR logic), exists, not_exists | -                                   |
 | **Traceloop**       | equals, not_equals, gt, lt, gte, lte                                                      | -                                   |
-| **Datadog**         | Most operators via span-search syntax                                                     | Field names validated against an allowlist before being spliced into the query |
-| **Sentry**          | Most operators via Discover search syntax                                                 | Same field-name allowlisting as Datadog |
+| **Datadog**         | equals, not_equals, gt, lt, gte, lte, in, exists, not_exists (span-search syntax)         | Every other operator (`contains`, `starts_with`, `between`, ...) is applied client-side. Field names validated against an allowlist (`_VALID_DD_FIELD_RE`) before being spliced into the query |
+| **Sentry**          | equals, not_equals, gt, lt, gte, lte, in, exists, not_exists (Sentry search syntax over the span-centric Events API) | Same operator set and client-side fallback as Datadog; same field-name allowlisting (`_VALID_SENTRY_FIELD_RE`) |
+| **New Relic**       | equals, not_equals, gt, lt, gte, lte, in, exists, not_exists (NRQL `WHERE`)               | Same operator set as Datadog/Sentry (no `contains`); field names allowlisted (`_VALID_NRQL_FIELD_RE`). Built without a live account - see the unverified list in `backends/newrelic.py`'s module docstring |
+| **Honeycomb**       | equals, not_equals, gt, lt, gte, lte, in, exists, not_exists, contains (Query Data API filter ops) | The only backend besides Tempo with native `contains`. Filters are JSON objects, not a query string, so the column-name allowlist (`_VALID_HONEYCOMB_FIELD_RE`) is defence in depth rather than an injection guard. The Query Data API is documented as Enterprise-plan exclusive and the backend was built without a live account - see `backends/honeycomb.py`'s module docstring |
 | **Jaeger**          | equals (via tags only)                                                                    | **Requires service_name parameter** |
 | **AWS X-Ray**       | equals, not_equals, gt, lt, gte, lte, in - only on `service.name`/`duration`/`status`      | `gen_ai.*` and every other field is never natively filterable via `FilterExpression` - by default OTel attributes land in unindexed segment *metadata*, not indexed *annotations* (undetectable at runtime) - always applied client-side |
 
@@ -751,13 +755,13 @@ ValueError: Jaeger backend requires 'service_name' parameter.
 Use list_services() to see available services, then specify one with service_name parameter.
 ```
 
-**Other backends (Tempo, Traceloop):** service_name is optional - they support querying across all services.
+**Every other backend** (Tempo, Traceloop, Datadog, Sentry, AWS X-Ray, New Relic, Honeycomb): `service_name` is optional - Jaeger is the only backend whose `search_traces`/`search_spans` raise when it is missing.
 
 ## Span Search and LLM Tools Discovery
 
-### `search_spans` - Individual Span Search
+### `search_spans_tool` - Individual Span Search
 
-Unlike `search_traces` which returns grouped traces, `search_spans` returns individual spans. This is useful for analyzing specific operations or finding spans with certain characteristics.
+Unlike `search_traces` which returns grouped traces, `search_spans_tool` returns individual spans. This is useful for analyzing specific operations or finding spans with certain characteristics.
 
 **Key Features:**
 
@@ -796,7 +800,7 @@ Unlike `search_traces` which returns grouped traces, `search_spans` returns indi
 - `is_llm_span`, `gen_ai_system`
 - `total_tokens` (for LLM spans)
 
-### `list_llm_tools` - Discover LLM Tool Usage
+### `list_llm_tools_tool` - Discover LLM Tool Usage
 
 Automatically discovers which tools/functions LLM applications are calling by identifying spans with `traceloop.span.kind == tool`.
 
