@@ -59,7 +59,7 @@ uv run mypy src/
 
 ### Backend Abstraction Pattern
 
-All trace storage backends implement the `BaseBackend` abstract interface in [opentelemetry_mcp/backends/base.py](opentelemetry_mcp/backends/base.py):
+All trace storage backends implement the `BaseBackend` abstract interface in [opentelemetry_mcp/backends/base.py](src/opentelemetry_mcp/backends/base.py):
 
 ```python
 class BaseBackend(ABC):
@@ -75,53 +75,55 @@ class BaseBackend(ABC):
     async def get_service_operations(self, service: str) -> list[str]: ...
     @abstractmethod
     async def health_check(self) -> bool: ...
+    @abstractmethod
+    def get_supported_operators(self) -> set[FilterOperator]: ...
 ```
 
 Concrete implementations:
 
-- [backends/jaeger.py](opentelemetry_mcp/backends/jaeger.py) - Jaeger backend
-- [backends/tempo.py](opentelemetry_mcp/backends/tempo.py) - Grafana Tempo backend
-- [backends/traceloop.py](opentelemetry_mcp/backends/traceloop.py) - Traceloop backend
-- [backends/datadog.py](opentelemetry_mcp/backends/datadog.py) - Datadog backend
-- [backends/sentry.py](opentelemetry_mcp/backends/sentry.py) - Sentry backend
-- [backends/xray.py](opentelemetry_mcp/backends/xray.py) - AWS X-Ray backend (boto3/SigV4, not httpx - see its module docstring; every boto3 call goes through `_call` on the instance's private `ThreadPoolExecutor(8)` behind a same-size `asyncio.Semaphore`, never the loop's default executor - `_MAX_CONCURRENT_XRAY_CALLS` is fixed, no env var; `close()` shuts the pool down)
-- [backends/newrelic.py](opentelemetry_mcp/backends/newrelic.py) - New Relic backend (NerdGraph GraphQL API - built without a live account to verify against, see its module docstring for exactly what's unverified)
-- [backends/honeycomb.py](opentelemetry_mcp/backends/honeycomb.py) - Honeycomb backend (Query Data API - built without a live account to verify against; the programmatic Query Data API is documented as Enterprise-plan exclusive, see its module docstring; Create Query Result runs pace through one `_RateLimiter` per `(url, api_key)` - `_shared_rate_limiter`, 10/min, shared by a same-key `SECONDARY_BACKEND_*` instance and the `/ready` probe - and `acquire(max_wait_seconds=self.timeout)` raises `HoneycombRateLimitedError` instead of parking a caller past `BACKEND_TIMEOUT`)
+- [backends/jaeger.py](src/opentelemetry_mcp/backends/jaeger.py) - Jaeger backend
+- [backends/tempo.py](src/opentelemetry_mcp/backends/tempo.py) - Grafana Tempo backend
+- [backends/traceloop.py](src/opentelemetry_mcp/backends/traceloop.py) - Traceloop backend
+- [backends/datadog.py](src/opentelemetry_mcp/backends/datadog.py) - Datadog backend
+- [backends/sentry.py](src/opentelemetry_mcp/backends/sentry.py) - Sentry backend
+- [backends/xray.py](src/opentelemetry_mcp/backends/xray.py) - AWS X-Ray backend (boto3/SigV4, not httpx - see its module docstring; every boto3 call goes through `_call` on the instance's private `ThreadPoolExecutor(8)` behind a same-size `asyncio.Semaphore`, never the loop's default executor - `_MAX_CONCURRENT_XRAY_CALLS` is fixed, no env var; `close()` shuts the pool down)
+- [backends/newrelic.py](src/opentelemetry_mcp/backends/newrelic.py) - New Relic backend (NerdGraph GraphQL API - built without a live account to verify against, see its module docstring for exactly what's unverified)
+- [backends/honeycomb.py](src/opentelemetry_mcp/backends/honeycomb.py) - Honeycomb backend (Query Data API - built without a live account to verify against; the programmatic Query Data API is documented as Enterprise-plan exclusive, see its module docstring; Create Query Result runs pace through one `_RateLimiter` per `(url, api_key)` - `_shared_rate_limiter`, 10/min, shared by a same-key `SECONDARY_BACKEND_*` instance and the `/ready` probe - and `acquire(max_wait_seconds=self.timeout)` raises `HoneycombRateLimitedError` instead of parking a caller past `BACKEND_TIMEOUT`)
 
 ### Tool-Based Architecture
 
-Each MCP capability is implemented as a separate tool module in [opentelemetry_mcp/tools/](opentelemetry_mcp/tools/):
+Each MCP capability is implemented as a separate tool module in [opentelemetry_mcp/tools/](src/opentelemetry_mcp/tools/):
 
 **Core Tools:**
 
-- [tools/search.py](opentelemetry_mcp/tools/search.py) - Search traces with filters
-- [tools/search_spans.py](opentelemetry_mcp/tools/search_spans.py) - Search individual spans with filters
-- [tools/trace.py](opentelemetry_mcp/tools/trace.py) - Get detailed trace by ID (`detail_level`: `"full"` default returns everything unbounded; `"summary"` elides large gen_ai.\* message/document fields and truncates long event attributes)
-- [tools/triage.py](opentelemetry_mcp/tools/triage.py) - `triage_trace`: synthesize a likely-root-cause diagnosis (critical path, latency-contribution ranking, error chain) instead of returning raw trace data - composes [tools/span_tree.py](opentelemetry_mcp/tools/span_tree.py)'s tree-walking utilities, which no backend or other tool builds elsewhere. `error_chain`/`critical_path` are bounded whatever the trace depth (summary: the first 5 and last 20 spans around one explicit elision entry; full: 1000) and a root-less parent cycle is reported with `confidence: "low"` instead of a depth
-- [tools/correlate.py](opentelemetry_mcp/tools/correlate.py) - `correlate_trace`: best-effort cross-backend correlation against a second, independently-configured backend (`SECONDARY_BACKEND_*`) - direct `trace_id` match first, else a time-window/service-overlap heuristic whose search window is capped at 24 h after the primary trace's start and which searches at most the 10 most-represented primary services (the result's `limitations` are the fixed list plus any per-call truncation notes); also reuses `tools/span_tree.py` to compare error-driven root causes across both traces
-- [tools/usage.py](opentelemetry_mcp/tools/usage.py) - Aggregate token usage metrics
-- [tools/services.py](opentelemetry_mcp/tools/services.py) - List available services
-- [tools/errors.py](opentelemetry_mcp/tools/errors.py) - Find traces with errors
+- [tools/search.py](src/opentelemetry_mcp/tools/search.py) - Search traces with filters
+- [tools/search_spans.py](src/opentelemetry_mcp/tools/search_spans.py) - Search individual spans with filters
+- [tools/trace.py](src/opentelemetry_mcp/tools/trace.py) - Get detailed trace by ID (`detail_level`: `"full"` default returns everything unbounded; `"summary"` elides large gen_ai.\* message/document fields and truncates long event attributes)
+- [tools/triage.py](src/opentelemetry_mcp/tools/triage.py) - `triage_trace`: synthesize a likely-root-cause diagnosis (critical path, latency-contribution ranking, error chain) instead of returning raw trace data - composes [tools/span_tree.py](src/opentelemetry_mcp/tools/span_tree.py)'s tree-walking utilities, which no backend or other tool builds elsewhere. `error_chain`/`critical_path` are bounded whatever the trace depth (summary: the first 5 and last 20 spans around one explicit elision entry; full: 1000) and a root-less parent cycle is reported with `confidence: "low"` instead of a depth
+- [tools/correlate.py](src/opentelemetry_mcp/tools/correlate.py) - `correlate_trace`: best-effort cross-backend correlation against a second, independently-configured backend (`SECONDARY_BACKEND_*`) - direct `trace_id` match first, else a time-window/service-overlap heuristic whose search window is capped at 24 h after the primary trace's start and which searches at most the 10 most-represented primary services (the result's `limitations` are the fixed list plus any per-call truncation notes); also reuses `tools/span_tree.py` to compare error-driven root causes across both traces
+- [tools/usage.py](src/opentelemetry_mcp/tools/usage.py) - Aggregate token usage metrics
+- [tools/services.py](src/opentelemetry_mcp/tools/services.py) - List available services
+- [tools/errors.py](src/opentelemetry_mcp/tools/errors.py) - Find traces with errors
 
 **LLM-Oriented Tools (Discovery & Analysis):**
 
-- [tools/list_models.py](opentelemetry_mcp/tools/list_models.py) - List all models in use with statistics
-- [tools/model_stats.py](opentelemetry_mcp/tools/model_stats.py) - Performance stats for a specific model
-- [tools/expensive_traces.py](opentelemetry_mcp/tools/expensive_traces.py) - Find highest token usage traces
-- [tools/slow_traces.py](opentelemetry_mcp/tools/slow_traces.py) - Find slowest LLM traces
-- [tools/list_llm_tools.py](opentelemetry_mcp/tools/list_llm_tools.py) - List LLM tools used (via traceloop.span.kind == tool)
-- [tools/sessions.py](opentelemetry_mcp/tools/sessions.py) - `list_sessions`/`get_session_stats`: group spans by `gen_ai.conversation.id`
-- [tools/compare.py](opentelemetry_mcp/tools/compare.py) - `compare_time_windows`: diff aggregated usage between two time ranges
-- [tools/investigate.py](opentelemetry_mcp/tools/investigate.py) - `investigate_cost_spike`/`investigate_error_spike`: compare a recent window against a baseline and rank which models/services/error types contributed most to the change
-- [tools/prompt_versions.py](opentelemetry_mcp/tools/prompt_versions.py) - `get_prompt_version_stats`: group spans by `gen_ai.prompt.name`/`gen_ai.prompt.version`
+- [tools/list_models.py](src/opentelemetry_mcp/tools/list_models.py) - List all models in use with statistics
+- [tools/model_stats.py](src/opentelemetry_mcp/tools/model_stats.py) - Performance stats for a specific model
+- [tools/expensive_traces.py](src/opentelemetry_mcp/tools/expensive_traces.py) - Find highest token usage traces
+- [tools/slow_traces.py](src/opentelemetry_mcp/tools/slow_traces.py) - Find slowest LLM traces
+- [tools/list_llm_tools.py](src/opentelemetry_mcp/tools/list_llm_tools.py) - List LLM tools used (via traceloop.span.kind == tool)
+- [tools/sessions.py](src/opentelemetry_mcp/tools/sessions.py) - `list_sessions`/`get_session_stats`: group spans by `gen_ai.conversation.id`
+- [tools/compare.py](src/opentelemetry_mcp/tools/compare.py) - `compare_time_windows`: diff aggregated usage between two time ranges
+- [tools/investigate.py](src/opentelemetry_mcp/tools/investigate.py) - `investigate_cost_spike`/`investigate_error_spike`: compare a recent window against a baseline and rank which models/services/error types contributed most to the change
+- [tools/prompt_versions.py](src/opentelemetry_mcp/tools/prompt_versions.py) - `get_prompt_version_stats`: group spans by `gen_ai.prompt.name`/`gen_ai.prompt.version`
 
 **Two valid return patterns exist.** Returning a JSON string was never actually an MCP protocol
 requirement - it was this codebase's original convention, from before FastMCP auto-derived
 `outputSchema`/`structuredContent` from a tool function's return-type annotation. Most tools
 still use the original pattern; `search_traces`, `search_spans_tool`, `list_sessions`, `get_trace`,
-and `triage_trace` were converted to (or, for the latter two, built directly on) the newer pattern
-(see [models.py](opentelemetry_mcp/models.py)'s `SearchTracesResult`/`SearchSpansResult`/
-`TraceDetail`/`TriageResult` and [tools/sessions.py](opentelemetry_mcp/tools/sessions.py)'s
+`triage_trace` and `correlate_trace` were converted to (or, for the latter three, built directly on)
+the newer pattern (see [models.py](src/opentelemetry_mcp/models.py)'s `SearchTracesResult`/
+`SearchSpansResult`/`TraceDetail`/`TriageResult`/`CorrelationResult` and [tools/sessions.py](src/opentelemetry_mcp/tools/sessions.py)'s
 `ListSessionsResult`) so MCP clients get real structured output instead of a JSON string wrapped
 in `{"result": "<json string>"}`.
 
@@ -129,7 +131,7 @@ in `{"result": "<json string>"}`.
 # Pattern A (most tools): return a JSON string
 return json.dumps({"result": data})
 
-# Pattern B (search_traces, search_spans_tool, list_sessions, get_trace, triage_trace): return a typed model
+# Pattern B (search_traces, search_spans_tool, list_sessions, get_trace, triage_trace, correlate_trace): return a typed model
 return SearchTracesResult(count=len(summaries), traces=summaries)
 ```
 
@@ -139,10 +141,10 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 
 ### Key Components
 
-- [server.py](opentelemetry_mcp/server.py) - FastMCP application, CLI interface, tool handlers
-- [config.py](opentelemetry_mcp/config.py) - Pydantic configuration models
-- [models.py](opentelemetry_mcp/models.py) - Core data models (SpanData, TraceData, UsageMetrics)
-- [attributes.py](opentelemetry_mcp/attributes.py) - Strongly-typed OpenTelemetry attribute models
+- [server.py](src/opentelemetry_mcp/server.py) - FastMCP application, CLI interface, tool handlers
+- [config.py](src/opentelemetry_mcp/config.py) - Pydantic configuration models
+- [models.py](src/opentelemetry_mcp/models.py) - Core data models (SpanData, TraceData, UsageMetrics)
+- [attributes.py](src/opentelemetry_mcp/attributes.py) - Strongly-typed OpenTelemetry attribute models
 
 ## Configuration
 
@@ -178,7 +180,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 - `MCP_TRUST_CLIENT_TRACE_CONTEXT` - Optional: Env-var equivalent of `--trust-client-trace-context` (default: `true` for stdio, `false` for `--transport http`). `true` -> fastmcp `telemetry_mode="propagation_only"` (a caller's `params._meta` trace context parents this server's spans); `false` -> `"off"` (neither extracted nor attached). Both suppress FastMCP's own duplicate spans (`tests/test_double_tracing_regression.py`)
 - `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS` - Optional: Env-var equivalents of `--rate-limit-max-requests`/`--rate-limit-window-seconds` (HTTP transport only, defaults: `100`/`60.0`). Validated at startup like the duration options: `click.IntRange(min=0)` (`0` keeps its disable meaning) and `FloatRange(min=0, min_open=True)` plus `_require_finite_seconds`, so a negative count, `0`, a negative window, `inf` and `nan` exit 2. These two, `--allowed-hosts` and `--forwarded-allow-ips` set `show_envvar=True`, so the usage error and `--help` name the env var (`[env var: ...]`)
 - `READINESS_CACHE_SECONDS` - Optional: Env-var equivalent of `--readiness-cache-seconds` (HTTP transport only, default: `30.0`, `0` disables the memo). `GET /ready` is unauthenticated and each probe costs the backend a `health_check` + `list_services` (a Honeycomb Create Query Result slot, up to 222 X-Ray API calls), so `server._run_backend_checks_memoized` memoizes the result for this window (`_READINESS_MEMO_TTL_SECONDS`; a failure for `_READINESS_FAILURE_MEMO_TTL_SECONDS` = `5` s), shares one in-flight probe between concurrent requests (loop-keyed `asyncio.Lock`, keyed on the backend object's identity) and answers `503` after `_READINESS_CHECK_TIMEOUT_SECONDS` = `10` s. `doctor` keeps calling the live `_run_backend_checks`
-- `SESSION_IDLE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--session-idle-timeout-seconds` (HTTP transport only, must be > 0, default: `1800.0` = the mcp SDK default). fastmcp >=4.1 defaults to the SDK's 1800 s (`auto`), fastmcp <=4.0 defaulted to never, and `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT=none` disables it; `server._build_http_app` always passes a finite bound regardless (defence in depth); an idle session's id answers `404` and clients re-initialize. `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT` is a no-code stopgap for already-deployed containers
+- `SESSION_IDLE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--session-idle-timeout-seconds` (HTTP transport only, must be > 0, default: `1800.0` = the mcp SDK default). fastmcp >=4.1 defaults to the SDK's 1800 s (`auto`), fastmcp <=4.0 defaulted to never, and `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT=none` disables it for a plain fastmcp app; `server._build_http_app` always passes a finite bound in stateful mode regardless (defence in depth), and fastmcp only falls back to its own setting when no bound is passed, so `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT` has no effect on this server - set `SESSION_IDLE_TIMEOUT_SECONDS` instead. It was a no-code stopgap only for a container still running a build older than v0.13.0 (the first release that passes the bound) on fastmcp <=4.0; an idle session's id answers `404` and clients re-initialize
 - `MCP_STATELESS_HTTP` - Optional: Env-var equivalent of `--stateless-http` (HTTP transport only, default: `false`). Stateless mode keeps no per-peer session state at all but drops the GET SSE stream for server-initiated notifications
 - `SHUTDOWN_DRAIN_SECONDS` - Optional: Env-var equivalent of `--shutdown-drain-seconds` (HTTP transport only, default: `0.0`/disabled)
 - `BACKEND_CLOSE_TIMEOUT_SECONDS` - Optional: Env-var equivalent of `--backend-close-timeout-seconds` (HTTP transport only, default: `5.0`)
@@ -274,10 +276,10 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
 
 ### 5. Adding New Backends
 
-1. Create new file in [opentelemetry_mcp/backends/](opentelemetry_mcp/backends/)
+1. Create new file in [opentelemetry_mcp/backends/](src/opentelemetry_mcp/backends/)
 2. Extend `BaseBackend` class
 3. Implement all abstract methods
-4. Add a branch to the `_create_backend` factory in [server.py](opentelemetry_mcp/server.py)
+4. Add a branch to the `_create_backend` factory in [server.py](src/opentelemetry_mcp/server.py)
    (not config.py - config.py only holds the config *schema*). Any field the backend needs
    beyond `url`/`api_key`/`timeout` (e.g. Sentry's `org_slug`, X-Ray's `aws_region`) is read
    unconditionally from `BackendConfig` regardless of `type` - there is no per-backend-type
@@ -298,10 +300,10 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
    `tests/test_base_backend.py`
    asserts every backend's client carries them
 5. Add the new backend name to every hardcoded backend-name literal site (must update in
-   lockstep): [config.py](opentelemetry_mcp/config.py)'s `BackendConfig.type` `Literal` (and its
+   lockstep): [config.py](src/opentelemetry_mcp/config.py)'s `BackendConfig.type` `Literal` (and its
    `from_env`/`apply_cli_overrides` inline validation lists),
-   [attributes.py](opentelemetry_mcp/attributes.py)'s `HealthCheckResponse.backend` `Literal`,
-   [server.py](opentelemetry_mcp/server.py)'s `click.Choice` for the `--backend` CLI flag,
+   [attributes.py](src/opentelemetry_mcp/attributes.py)'s `HealthCheckResponse.backend` `Literal`,
+   [server.py](src/opentelemetry_mcp/server.py)'s `click.Choice` for the `--backend` CLI flag,
    [server.json](server.json)'s `BACKEND_TYPE` env var `choices` (published to the live MCP
    Registry on every release - this drifted unnoticed across 3 backend additions in a row before
    `tests/test_discoverability_sync.py` was added specifically to catch it),
@@ -320,9 +322,9 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
 
 ### 6. Adding New Tools
 
-1. Create new module in [opentelemetry_mcp/tools/](opentelemetry_mcp/tools/)
+1. Create new module in [opentelemetry_mcp/tools/](src/opentelemetry_mcp/tools/)
 2. Implement tool function that takes backend and returns JSON string
-3. Register in [server.py](opentelemetry_mcp/server.py) using `@mcp.tool()`
+3. Register in [server.py](src/opentelemetry_mcp/server.py) using `@mcp.tool()`
 
 ## LLM-Oriented Tools
 
@@ -668,8 +670,10 @@ The server uses a hybrid filtering strategy:
 | ------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------- |
 | **Tempo (TraceQL)** | equals, not_equals, gt, lt, gte, lte, contains (regex), in (OR logic), exists, not_exists | -                                   |
 | **Traceloop**       | equals, not_equals, gt, lt, gte, lte                                                      | -                                   |
-| **Datadog**         | Most operators via span-search syntax                                                     | Field names validated against an allowlist before being spliced into the query |
-| **Sentry**          | Most operators via Discover search syntax                                                 | Same field-name allowlisting as Datadog |
+| **Datadog**         | equals, not_equals, gt, lt, gte, lte, in, exists, not_exists (span-search syntax)         | Every other operator (`contains`, `starts_with`, `between`, ...) is applied client-side. Field names validated against an allowlist (`_VALID_DD_FIELD_RE`) before being spliced into the query |
+| **Sentry**          | equals, not_equals, gt, lt, gte, lte, in, exists, not_exists (Sentry search syntax over the span-centric Events API) | Same operator set and client-side fallback as Datadog; same field-name allowlisting (`_VALID_SENTRY_FIELD_RE`) |
+| **New Relic**       | equals, not_equals, gt, lt, gte, lte, in, exists, not_exists (NRQL `WHERE`)               | Same operator set as Datadog/Sentry (no `contains`); field names allowlisted (`_VALID_NRQL_FIELD_RE`). Built without a live account - see the unverified list in `backends/newrelic.py`'s module docstring |
+| **Honeycomb**       | equals, not_equals, gt, lt, gte, lte, in, exists, not_exists, contains (Query Data API filter ops) | The only backend besides Tempo with native `contains`. Filters are JSON objects, not a query string, so the column-name allowlist (`_VALID_HONEYCOMB_FIELD_RE`) is defence in depth rather than an injection guard. The Query Data API is documented as Enterprise-plan exclusive and the backend was built without a live account - see `backends/honeycomb.py`'s module docstring |
 | **Jaeger**          | equals (via tags only)                                                                    | **Requires service_name parameter** |
 | **AWS X-Ray**       | equals, not_equals, gt, lt, gte, lte, in - only on `service.name`/`duration`/`status`      | `gen_ai.*` and every other field is never natively filterable via `FilterExpression` - by default OTel attributes land in unindexed segment *metadata*, not indexed *annotations* (undetectable at runtime) - always applied client-side |
 
@@ -751,13 +755,13 @@ ValueError: Jaeger backend requires 'service_name' parameter.
 Use list_services() to see available services, then specify one with service_name parameter.
 ```
 
-**Other backends (Tempo, Traceloop):** service_name is optional - they support querying across all services.
+**Every other backend** (Tempo, Traceloop, Datadog, Sentry, AWS X-Ray, New Relic, Honeycomb): `service_name` is optional - Jaeger is the only backend whose `search_traces`/`search_spans` raise when it is missing.
 
 ## Span Search and LLM Tools Discovery
 
-### `search_spans` - Individual Span Search
+### `search_spans_tool` - Individual Span Search
 
-Unlike `search_traces` which returns grouped traces, `search_spans` returns individual spans. This is useful for analyzing specific operations or finding spans with certain characteristics.
+Unlike `search_traces` which returns grouped traces, `search_spans_tool` returns individual spans. This is useful for analyzing specific operations or finding spans with certain characteristics.
 
 **Key Features:**
 
@@ -796,7 +800,7 @@ Unlike `search_traces` which returns grouped traces, `search_spans` returns indi
 - `is_llm_span`, `gen_ai_system`
 - `total_tokens` (for LLM spans)
 
-### `list_llm_tools` - Discover LLM Tool Usage
+### `list_llm_tools_tool` - Discover LLM Tool Usage
 
 Automatically discovers which tools/functions LLM applications are calling by identifying spans with `traceloop.span.kind == tool`.
 

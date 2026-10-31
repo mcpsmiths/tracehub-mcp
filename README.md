@@ -94,15 +94,15 @@ All eight implement the same `BaseBackend` interface, so every MCP tool works id
 
 ## What's Different From Upstream
 
-Upstream `opentelemetry-mcp-server` shipped Jaeger, Tempo, and Traceloop. tracehub-mcp adds **Datadog and Sentry** as full backends — not thin wrappers, but complete implementations of every tool (search, span search, trace hydration, service discovery, health checks). Along the way, all five backends — including the three inherited from upstream — were hardened to a consistent bar:
+Upstream `opentelemetry-mcp-server` shipped Jaeger, Tempo, and Traceloop. tracehub-mcp adds **Datadog, Sentry, AWS X-Ray, New Relic and Honeycomb** as full backends — not thin wrappers, but complete implementations of every tool (search, span search, trace hydration, service discovery, health checks). Along the way, the Datadog and Sentry backends and the three inherited from upstream were hardened to a consistent bar:
 
-- **HTTPS-only enforcement** on cloud backends. Datadog and Sentry both refuse to start against a plain `http://` URL, because their auth is a bearer token / API+App key pair that has no business going out over plaintext.
+- **HTTPS-only enforcement** on cloud backends. Datadog, Sentry, New Relic and Honeycomb all refuse to start against a plain `http://` URL, because their credentials (a bearer token, an API+App key pair, or an `API-Key` / `X-Honeycomb-Team` header) have no business going out over plaintext. AWS X-Ray has no such check because it sends nothing to `BACKEND_URL` (a decorative placeholder there): `boto3` signs requests with SigV4 over TLS, its default, and this backend never passes `use_ssl=False`.
 - **Query-injection-safe escaping.** Every value spliced into a Datadog span-search query or a Sentry Discover query is escaped and exact-quoted; field *names* (which are less obviously untrusted, since they come from the MCP tool's `filters` parameter) are validated against an allowlist pattern before being spliced into the query string, closing off structural injection through a crafted field name.
 - **Bounded pagination** on every backend that paginates via cursor (Datadog, Sentry) — a search stops at the requested `limit` or when the backend stops returning a continuation cursor, whichever comes first, so a single tool call can't degrade into an unbounded crawl.
 - **Exact-ID re-verification.** Where a backend's search API can return neighbors instead of an exact match (notably Datadog's trace reconstruction from grouped spans), every result is re-checked against the exact ID that was asked for before being returned.
 - **No fabricated data on malformed responses, in the backends we built.** Datadog and Sentry reject a span outright — rather than substituting a placeholder like `now()` for a missing timestamp or a literal `"unknown"` for a missing `service_name`/`operation_name` — since a fabricated value would silently corrupt trace ordering, duration aggregation, and any tool that groups by service or operation. (The three backends inherited from upstream — Jaeger, Tempo, Traceloop — predate this discipline and haven't been retrofitted; that's deliberate scope discipline, not an oversight, mirroring this project's own precedent of not reaching into shared/inherited code without full regression coverage for it.)
 
-All of this is backed by **458 passing tests (2 skipped, zero regressions)**, a clean `ruff check` and `mypy --strict` run, and two rounds of adversarial CodeRabbit review on the new backends.
+All of this is backed by the project's test suite, a clean `ruff check` and `mypy --strict` run, and two rounds of adversarial CodeRabbit review on the new backends. CI runs the full suite on every pull request and every push to `main` — see `.github/workflows/ci.yml` for the exact steps.
 
 ---
 
@@ -211,14 +211,14 @@ tracehub-mcp --backend jaeger --url http://localhost:16686
 | `FORWARDED_ALLOW_IPS` | string | unset | HTTP transport only. Comma-separated proxy IPs/CIDRs (or `*`) whose `X-Forwarded-For` may replace the TCP peer address as the rate-limit key - the same variable uvicorn honours. Unset means the header is never trusted, not even from `127.0.0.1` (uvicorn's own implicit default is deliberately not applied). Configure the proxy to overwrite or append `X-Forwarded-For` rather than pass the client's header through (`--forwarded-allow-ips`). `*` trusts every hop, so any client can set `X-Forwarded-For` itself and choose its own rate-limit key - name the proxy addresses instead; an entry that is not an IP literal or a strict CIDR is refused at startup |
 | `RATE_LIMIT_WINDOW_SECONDS` | float | `60`  | HTTP transport only. Fixed window size in seconds for `RATE_LIMIT_MAX_REQUESTS` (`--rate-limit-window-seconds`). Must be finite and greater than `0`; `0`, a negative value, `inf` or `nan` is refused at startup |
 | `READINESS_CACHE_SECONDS` | float | `30` | HTTP transport only. `GET /ready` memoizes its backend probe (`health_check` + `list_services`) for this many seconds - a failed probe for at most `5` s so recovery is noticed quickly - and concurrent probes share one in-flight check, so any number of unauthenticated readiness requests cost the backend at most one probe per window (on Honeycomb one slot of the shared 10/min query budget, on X-Ray up to a few hundred API calls). A probe that has not answered after `10` s returns `503`. `/ready` may therefore report a state up to this many seconds old; `0` disables the memo but keeps the timeout and the in-flight sharing (`--readiness-cache-seconds`). A failing probe's `503` body names only an error class (`backend unreachable`, `backend timeout`, `backend error <status>`, `backend unhealthy`); the redacted detail is logged once per fresh probe at WARNING and never returned to the unauthenticated caller |
-| `SESSION_IDLE_TIMEOUT_SECONDS` | float | `1800` | HTTP transport only. Close a streamable-HTTP session that has had no request for this many seconds (must be > 0); its id then answers `404` and spec-compliant clients re-initialize. Bounds how long one peer can hold entries in the shared 10,000-session table (`--session-idle-timeout-seconds`). Already-deployed containers can set fastmcp's own `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT` as a no-code stopgap |
+| `SESSION_IDLE_TIMEOUT_SECONDS` | float | `1800` | HTTP transport only. Close a streamable-HTTP session that has had no request for this many seconds (must be > 0); its id then answers `404` and spec-compliant clients re-initialize. Bounds how long one peer can hold entries in the shared 10,000-session table (`--session-idle-timeout-seconds`). fastmcp's own `FASTMCP_HTTP_SESSION_IDLE_TIMEOUT` has no effect on this server, which always passes this bound itself in stateful mode - set this variable instead |
 | `MCP_STATELESS_HTTP` | bool | `false` | HTTP transport only. Serve each `/mcp` request on a fresh transport with no session tracking, so no per-peer state outlives a request - at the cost of the GET SSE stream used for server-initiated notifications (`--stateless-http`) |
 | `SHUTDOWN_DRAIN_SECONDS` | float   | `0.0`  | HTTP transport only. On shutdown, wait this many seconds inside the ASGI shutdown handler - after uvicorn has already finished draining in-flight connections - before closing the shared backend HTTP client (`--shutdown-drain-seconds`) |
 | `BACKEND_CLOSE_TIMEOUT_SECONDS` | float | `5.0` | HTTP transport only. Abandon closing the shared backend HTTP client during shutdown if it does not finish within this many seconds - uvicorn places no timeout of its own around this wait (`--backend-close-timeout-seconds`) |
 | `GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` | integer | `2` | HTTP transport only. uvicorn's own bound (whole seconds only) on waiting for in-flight connections/tasks to finish on shutdown before cancelling them (`--graceful-shutdown-timeout-seconds`) |
 | `MCP_ACCESS_LOG` | boolean | `false` | HTTP transport only. Re-enables uvicorn's per-request access line (`--access-log`). Off by default because the line carries the full request target, including a token a misconfigured client puts in the query string; when enabled, the query string, fragments, matrix parameters (`;`, which uvicorn logs as `%3B`) and percent-encoded `?`/`#` are stripped from every access line and the logged path is cut at 2 KiB; a token placed in a path segment is indistinguishable from a path and is logged, so never put one there |
 
-Every backend-related CLI flag has a matching env var (`--backend`/`BACKEND_TYPE`, `--url`/`BACKEND_URL`, `--api-key`/`BACKEND_API_KEY`, `--app-key`/`BACKEND_APP_KEY`, `--tempo-instance-id`/`BACKEND_TEMPO_INSTANCE_ID`, `--sentry-org`/`BACKEND_SENTRY_ORG`, `--sentry-project`/`BACKEND_SENTRY_PROJECT`, `--aws-region`/`BACKEND_AWS_REGION`, `--environments`/`BACKEND_ENVIRONMENTS`). `--disable-tools <name1,name2,...>` / `--enabled-tools <name1,name2,...>` (CLI-only, no env var) remove/allowlist tools for reduced-trust deployments - `--enabled-tools` is applied first, `--disable-tools` on top of whatever it kept. `--allowed-hosts`, `--forwarded-allow-ips`, `--rate-limit-max-requests` and `--rate-limit-window-seconds` (and their env vars) are validated when the server starts: a value that cannot mean what was written exits `2` with a usage error that names both the flag and the env var - for `--allowed-hosts` and `--forwarded-allow-ips` the offending entry is echoed as a bounded repr; the two rate-limit options are checked by click's own integer/float ranges, which echo the value as written - and their `--help` text shows the env var (`[env var: ...`). Run `tracehub-mcp --help` for the full list.
+Every backend-related CLI flag has a matching env var (`--backend`/`BACKEND_TYPE`, `--url`/`BACKEND_URL`, `--api-key`/`BACKEND_API_KEY`, `--app-key`/`BACKEND_APP_KEY`, `--tempo-instance-id`/`BACKEND_TEMPO_INSTANCE_ID`, `--sentry-org`/`BACKEND_SENTRY_ORG`, `--sentry-project`/`BACKEND_SENTRY_PROJECT`, `--aws-region`/`BACKEND_AWS_REGION`, `--newrelic-account-id`/`BACKEND_NEWRELIC_ACCOUNT_ID`, `--honeycomb-dataset`/`BACKEND_HONEYCOMB_DATASET`, `--environments`/`BACKEND_ENVIRONMENTS`). `--disable-tools <name1,name2,...>` / `--enabled-tools <name1,name2,...>` (CLI-only, no env var) remove/allowlist tools for reduced-trust deployments - `--enabled-tools` is applied first, `--disable-tools` on top of whatever it kept. `--allowed-hosts`, `--forwarded-allow-ips`, `--rate-limit-max-requests` and `--rate-limit-window-seconds` (and their env vars) are validated when the server starts: a value that cannot mean what was written exits `2` with a usage error that names both the flag and the env var - for `--allowed-hosts` and `--forwarded-allow-ips` the offending entry is echoed as a bounded repr; the two rate-limit options are checked by click's own integer/float ranges, which echo the value as written - and their `--help` text shows the env var (`[env var: ...`). Run `tracehub-mcp --help` for the full list.
 
 **Known third-party egress dependency:** the underlying FastMCP framework checks PyPI (`https://pypi.org/pypi/fastmcp/json`) for a newer FastMCP release once every 12 hours when it prints its startup banner - this is FastMCP's own behavior, not tracehub-mcp's, and unrelated to the OTel self-instrumentation above. It fails silently if there's no network access. For network-restricted/air-gapped deployments, disable it with `FASTMCP_CHECK_FOR_UPDATES=off`, or suppress the banner entirely with `FASTMCP_SHOW_SERVER_BANNER=false`.
 
@@ -517,7 +517,7 @@ If you're running from a clone instead, the bundled wrapper script gives easy ba
 }
 ```
 
-(the script ships Jaeger/Traceloop/Tempo blocks only, with Jaeger active by default — to switch, comment out the active block and uncomment the one you want; Datadog/Sentry aren't in the script, so add their `export` lines manually).
+(the script ships Jaeger/Traceloop/Tempo blocks only, with Jaeger active by default — to switch, comment out the active block and uncomment the one you want; the other backends (Datadog, Sentry, AWS X-Ray, New Relic, Honeycomb) aren't in the script, so add their `export` lines manually).
 
 </details>
 
@@ -528,7 +528,7 @@ If you're running from a clone instead, the bundled wrapper script gives easy ba
 claude mcp add tracehub-mcp -e BACKEND_TYPE=jaeger -e BACKEND_URL=http://localhost:16686 -- uvx tracehub-mcp
 ```
 
-Datadog/Sentry work the same way — add more `-e KEY=value` flags for each backend's required env vars (see [Backend-Specific Setup](#backend-specific-setup)). Then:
+The other backends work the same way — add more `-e KEY=value` flags for each backend's required env vars (see [Backend-Specific Setup](#backend-specific-setup)). Then:
 
 ```bash
 claude mcp list
@@ -760,15 +760,18 @@ Returns error messages, error types, truncated stack traces, and LLM-specific er
 
 Multiple filters combine with **AND** logic. Legacy simple parameters (`service_name`, `gen_ai_request_model`, etc.) still work and are converted to filters internally — mix and match freely.
 
-The server uses a **hybrid filtering strategy**: filters are pushed to the backend's native query language when supported (TraceQL for Tempo, span-search syntax for Datadog, Discover syntax for Sentry), and applied client-side afterward for anything the backend can't express natively.
+The server uses a **hybrid filtering strategy**: filters are pushed to the backend's native query language when supported (TraceQL for Tempo, span-search syntax for Datadog, Sentry's search syntax, NRQL for New Relic, Query Data API filter ops for Honeycomb), and applied client-side afterward for anything the backend can't express natively.
 
 | Backend             | Native filter support                                                | Notes                          |
 | -------------------- | ---------------------------------------------------------------------- | ------------------------------- |
 | **Tempo** (TraceQL)  | `equals`, `not_equals`, `gt`, `lt`, `gte`, `lte`, `contains` (regex), `in` (OR), `exists`, `not_exists` | — |
 | **Traceloop**        | `equals`, `not_equals`, `gt`, `lt`, `gte`, `lte`                       | —                                |
-| **Datadog**          | Most operators via span-search syntax                                 | Field names validated against an allowlist before being spliced into the query |
-| **Sentry**           | Most operators via Discover search syntax                             | Same field-name allowlisting as Datadog |
+| **Datadog**          | `equals`, `not_equals`, `gt`, `lt`, `gte`, `lte`, `in`, `exists`, `not_exists` (span-search syntax) | Other operators (e.g. `contains`, `starts_with`, `between`) are applied client-side. Field names validated against an allowlist before being spliced into the query |
+| **Sentry**           | Same set as Datadog, via Sentry's search syntax                       | Same client-side fallback and field-name allowlisting as Datadog |
+| **New Relic**        | Same set as Datadog, via NRQL `WHERE`                                 | Same client-side fallback and field-name allowlisting as Datadog |
+| **Honeycomb**        | Same set as Datadog plus `contains`, via Query Data API filter ops    | Other operators are applied client-side. The Query Data API is documented as Enterprise-plan exclusive — see the Honeycomb setup section |
 | **Jaeger**           | `equals` (via tags only)                                               | **Requires `service_name`**    |
+| **AWS X-Ray**        | `equals`, `not_equals`, `gt`, `lt`, `gte`, `lte`, `in` — only on `service.name`, `duration` and `status` | Every other field, including all `gen_ai.*` attributes, is applied client-side (see the Backend Support Matrix) |
 
 Example — expensive OpenAI traces:
 
@@ -966,7 +969,7 @@ git clone https://github.com/mcpsmiths/tracehub-mcp.git
 cd tracehub-mcp
 uv sync --group dev   # pulls in pytest, mypy, ruff, etc. for local iteration
 
-# Tests (458 passed, 2 skipped at time of writing)
+# Tests (the full suite, as CI runs it)
 uv run pytest
 
 # With coverage
@@ -978,7 +981,7 @@ uv run ruff check .
 uv run mypy src/
 ```
 
-CI (`.github/workflows/ci.yml`) runs Ruff and mypy (strict) on every push, plus the full pytest suite.
+CI (`.github/workflows/ci.yml`) runs Ruff and mypy (strict) on every pull request and every push to `main`, plus the full pytest suite.
 
 `mcpb pack mcpb/` builds the Claude Desktop bundle. `mcpb/.mcpbignore` is a deny-list (mcpb never consults `.gitignore`): every file under `mcpb/` that it or mcpb's built-in patterns do not name is archived, tracked or not - pack from a clean tree (`git status --short mcpb/` prints nothing) and check the printed file count before publishing a bundle.
 
