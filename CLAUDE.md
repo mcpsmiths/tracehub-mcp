@@ -59,7 +59,7 @@ uv run mypy src/
 
 ### Backend Abstraction Pattern
 
-All trace storage backends implement the `BaseBackend` abstract interface in [opentelemetry_mcp/backends/base.py](opentelemetry_mcp/backends/base.py):
+All trace storage backends implement the `BaseBackend` abstract interface in [opentelemetry_mcp/backends/base.py](src/opentelemetry_mcp/backends/base.py):
 
 ```python
 class BaseBackend(ABC):
@@ -79,49 +79,49 @@ class BaseBackend(ABC):
 
 Concrete implementations:
 
-- [backends/jaeger.py](opentelemetry_mcp/backends/jaeger.py) - Jaeger backend
-- [backends/tempo.py](opentelemetry_mcp/backends/tempo.py) - Grafana Tempo backend
-- [backends/traceloop.py](opentelemetry_mcp/backends/traceloop.py) - Traceloop backend
-- [backends/datadog.py](opentelemetry_mcp/backends/datadog.py) - Datadog backend
-- [backends/sentry.py](opentelemetry_mcp/backends/sentry.py) - Sentry backend
-- [backends/xray.py](opentelemetry_mcp/backends/xray.py) - AWS X-Ray backend (boto3/SigV4, not httpx - see its module docstring; every boto3 call goes through `_call` on the instance's private `ThreadPoolExecutor(8)` behind a same-size `asyncio.Semaphore`, never the loop's default executor - `_MAX_CONCURRENT_XRAY_CALLS` is fixed, no env var; `close()` shuts the pool down)
-- [backends/newrelic.py](opentelemetry_mcp/backends/newrelic.py) - New Relic backend (NerdGraph GraphQL API - built without a live account to verify against, see its module docstring for exactly what's unverified)
-- [backends/honeycomb.py](opentelemetry_mcp/backends/honeycomb.py) - Honeycomb backend (Query Data API - built without a live account to verify against; the programmatic Query Data API is documented as Enterprise-plan exclusive, see its module docstring; Create Query Result runs pace through one `_RateLimiter` per `(url, api_key)` - `_shared_rate_limiter`, 10/min, shared by a same-key `SECONDARY_BACKEND_*` instance and the `/ready` probe - and `acquire(max_wait_seconds=self.timeout)` raises `HoneycombRateLimitedError` instead of parking a caller past `BACKEND_TIMEOUT`)
+- [backends/jaeger.py](src/opentelemetry_mcp/backends/jaeger.py) - Jaeger backend
+- [backends/tempo.py](src/opentelemetry_mcp/backends/tempo.py) - Grafana Tempo backend
+- [backends/traceloop.py](src/opentelemetry_mcp/backends/traceloop.py) - Traceloop backend
+- [backends/datadog.py](src/opentelemetry_mcp/backends/datadog.py) - Datadog backend
+- [backends/sentry.py](src/opentelemetry_mcp/backends/sentry.py) - Sentry backend
+- [backends/xray.py](src/opentelemetry_mcp/backends/xray.py) - AWS X-Ray backend (boto3/SigV4, not httpx - see its module docstring; every boto3 call goes through `_call` on the instance's private `ThreadPoolExecutor(8)` behind a same-size `asyncio.Semaphore`, never the loop's default executor - `_MAX_CONCURRENT_XRAY_CALLS` is fixed, no env var; `close()` shuts the pool down)
+- [backends/newrelic.py](src/opentelemetry_mcp/backends/newrelic.py) - New Relic backend (NerdGraph GraphQL API - built without a live account to verify against, see its module docstring for exactly what's unverified)
+- [backends/honeycomb.py](src/opentelemetry_mcp/backends/honeycomb.py) - Honeycomb backend (Query Data API - built without a live account to verify against; the programmatic Query Data API is documented as Enterprise-plan exclusive, see its module docstring; Create Query Result runs pace through one `_RateLimiter` per `(url, api_key)` - `_shared_rate_limiter`, 10/min, shared by a same-key `SECONDARY_BACKEND_*` instance and the `/ready` probe - and `acquire(max_wait_seconds=self.timeout)` raises `HoneycombRateLimitedError` instead of parking a caller past `BACKEND_TIMEOUT`)
 
 ### Tool-Based Architecture
 
-Each MCP capability is implemented as a separate tool module in [opentelemetry_mcp/tools/](opentelemetry_mcp/tools/):
+Each MCP capability is implemented as a separate tool module in [opentelemetry_mcp/tools/](src/opentelemetry_mcp/tools/):
 
 **Core Tools:**
 
-- [tools/search.py](opentelemetry_mcp/tools/search.py) - Search traces with filters
-- [tools/search_spans.py](opentelemetry_mcp/tools/search_spans.py) - Search individual spans with filters
-- [tools/trace.py](opentelemetry_mcp/tools/trace.py) - Get detailed trace by ID (`detail_level`: `"full"` default returns everything unbounded; `"summary"` elides large gen_ai.\* message/document fields and truncates long event attributes)
-- [tools/triage.py](opentelemetry_mcp/tools/triage.py) - `triage_trace`: synthesize a likely-root-cause diagnosis (critical path, latency-contribution ranking, error chain) instead of returning raw trace data - composes [tools/span_tree.py](opentelemetry_mcp/tools/span_tree.py)'s tree-walking utilities, which no backend or other tool builds elsewhere. `error_chain`/`critical_path` are bounded whatever the trace depth (summary: the first 5 and last 20 spans around one explicit elision entry; full: 1000) and a root-less parent cycle is reported with `confidence: "low"` instead of a depth
-- [tools/correlate.py](opentelemetry_mcp/tools/correlate.py) - `correlate_trace`: best-effort cross-backend correlation against a second, independently-configured backend (`SECONDARY_BACKEND_*`) - direct `trace_id` match first, else a time-window/service-overlap heuristic whose search window is capped at 24 h after the primary trace's start and which searches at most the 10 most-represented primary services (the result's `limitations` are the fixed list plus any per-call truncation notes); also reuses `tools/span_tree.py` to compare error-driven root causes across both traces
-- [tools/usage.py](opentelemetry_mcp/tools/usage.py) - Aggregate token usage metrics
-- [tools/services.py](opentelemetry_mcp/tools/services.py) - List available services
-- [tools/errors.py](opentelemetry_mcp/tools/errors.py) - Find traces with errors
+- [tools/search.py](src/opentelemetry_mcp/tools/search.py) - Search traces with filters
+- [tools/search_spans.py](src/opentelemetry_mcp/tools/search_spans.py) - Search individual spans with filters
+- [tools/trace.py](src/opentelemetry_mcp/tools/trace.py) - Get detailed trace by ID (`detail_level`: `"full"` default returns everything unbounded; `"summary"` elides large gen_ai.\* message/document fields and truncates long event attributes)
+- [tools/triage.py](src/opentelemetry_mcp/tools/triage.py) - `triage_trace`: synthesize a likely-root-cause diagnosis (critical path, latency-contribution ranking, error chain) instead of returning raw trace data - composes [tools/span_tree.py](src/opentelemetry_mcp/tools/span_tree.py)'s tree-walking utilities, which no backend or other tool builds elsewhere. `error_chain`/`critical_path` are bounded whatever the trace depth (summary: the first 5 and last 20 spans around one explicit elision entry; full: 1000) and a root-less parent cycle is reported with `confidence: "low"` instead of a depth
+- [tools/correlate.py](src/opentelemetry_mcp/tools/correlate.py) - `correlate_trace`: best-effort cross-backend correlation against a second, independently-configured backend (`SECONDARY_BACKEND_*`) - direct `trace_id` match first, else a time-window/service-overlap heuristic whose search window is capped at 24 h after the primary trace's start and which searches at most the 10 most-represented primary services (the result's `limitations` are the fixed list plus any per-call truncation notes); also reuses `tools/span_tree.py` to compare error-driven root causes across both traces
+- [tools/usage.py](src/opentelemetry_mcp/tools/usage.py) - Aggregate token usage metrics
+- [tools/services.py](src/opentelemetry_mcp/tools/services.py) - List available services
+- [tools/errors.py](src/opentelemetry_mcp/tools/errors.py) - Find traces with errors
 
 **LLM-Oriented Tools (Discovery & Analysis):**
 
-- [tools/list_models.py](opentelemetry_mcp/tools/list_models.py) - List all models in use with statistics
-- [tools/model_stats.py](opentelemetry_mcp/tools/model_stats.py) - Performance stats for a specific model
-- [tools/expensive_traces.py](opentelemetry_mcp/tools/expensive_traces.py) - Find highest token usage traces
-- [tools/slow_traces.py](opentelemetry_mcp/tools/slow_traces.py) - Find slowest LLM traces
-- [tools/list_llm_tools.py](opentelemetry_mcp/tools/list_llm_tools.py) - List LLM tools used (via traceloop.span.kind == tool)
-- [tools/sessions.py](opentelemetry_mcp/tools/sessions.py) - `list_sessions`/`get_session_stats`: group spans by `gen_ai.conversation.id`
-- [tools/compare.py](opentelemetry_mcp/tools/compare.py) - `compare_time_windows`: diff aggregated usage between two time ranges
-- [tools/investigate.py](opentelemetry_mcp/tools/investigate.py) - `investigate_cost_spike`/`investigate_error_spike`: compare a recent window against a baseline and rank which models/services/error types contributed most to the change
-- [tools/prompt_versions.py](opentelemetry_mcp/tools/prompt_versions.py) - `get_prompt_version_stats`: group spans by `gen_ai.prompt.name`/`gen_ai.prompt.version`
+- [tools/list_models.py](src/opentelemetry_mcp/tools/list_models.py) - List all models in use with statistics
+- [tools/model_stats.py](src/opentelemetry_mcp/tools/model_stats.py) - Performance stats for a specific model
+- [tools/expensive_traces.py](src/opentelemetry_mcp/tools/expensive_traces.py) - Find highest token usage traces
+- [tools/slow_traces.py](src/opentelemetry_mcp/tools/slow_traces.py) - Find slowest LLM traces
+- [tools/list_llm_tools.py](src/opentelemetry_mcp/tools/list_llm_tools.py) - List LLM tools used (via traceloop.span.kind == tool)
+- [tools/sessions.py](src/opentelemetry_mcp/tools/sessions.py) - `list_sessions`/`get_session_stats`: group spans by `gen_ai.conversation.id`
+- [tools/compare.py](src/opentelemetry_mcp/tools/compare.py) - `compare_time_windows`: diff aggregated usage between two time ranges
+- [tools/investigate.py](src/opentelemetry_mcp/tools/investigate.py) - `investigate_cost_spike`/`investigate_error_spike`: compare a recent window against a baseline and rank which models/services/error types contributed most to the change
+- [tools/prompt_versions.py](src/opentelemetry_mcp/tools/prompt_versions.py) - `get_prompt_version_stats`: group spans by `gen_ai.prompt.name`/`gen_ai.prompt.version`
 
 **Two valid return patterns exist.** Returning a JSON string was never actually an MCP protocol
 requirement - it was this codebase's original convention, from before FastMCP auto-derived
 `outputSchema`/`structuredContent` from a tool function's return-type annotation. Most tools
 still use the original pattern; `search_traces`, `search_spans_tool`, `list_sessions`, `get_trace`,
 and `triage_trace` were converted to (or, for the latter two, built directly on) the newer pattern
-(see [models.py](opentelemetry_mcp/models.py)'s `SearchTracesResult`/`SearchSpansResult`/
-`TraceDetail`/`TriageResult` and [tools/sessions.py](opentelemetry_mcp/tools/sessions.py)'s
+(see [models.py](src/opentelemetry_mcp/models.py)'s `SearchTracesResult`/`SearchSpansResult`/
+`TraceDetail`/`TriageResult` and [tools/sessions.py](src/opentelemetry_mcp/tools/sessions.py)'s
 `ListSessionsResult`) so MCP clients get real structured output instead of a JSON string wrapped
 in `{"result": "<json string>"}`.
 
@@ -139,10 +139,10 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 
 ### Key Components
 
-- [server.py](opentelemetry_mcp/server.py) - FastMCP application, CLI interface, tool handlers
-- [config.py](opentelemetry_mcp/config.py) - Pydantic configuration models
-- [models.py](opentelemetry_mcp/models.py) - Core data models (SpanData, TraceData, UsageMetrics)
-- [attributes.py](opentelemetry_mcp/attributes.py) - Strongly-typed OpenTelemetry attribute models
+- [server.py](src/opentelemetry_mcp/server.py) - FastMCP application, CLI interface, tool handlers
+- [config.py](src/opentelemetry_mcp/config.py) - Pydantic configuration models
+- [models.py](src/opentelemetry_mcp/models.py) - Core data models (SpanData, TraceData, UsageMetrics)
+- [attributes.py](src/opentelemetry_mcp/attributes.py) - Strongly-typed OpenTelemetry attribute models
 
 ## Configuration
 
@@ -274,10 +274,10 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
 
 ### 5. Adding New Backends
 
-1. Create new file in [opentelemetry_mcp/backends/](opentelemetry_mcp/backends/)
+1. Create new file in [opentelemetry_mcp/backends/](src/opentelemetry_mcp/backends/)
 2. Extend `BaseBackend` class
 3. Implement all abstract methods
-4. Add a branch to the `_create_backend` factory in [server.py](opentelemetry_mcp/server.py)
+4. Add a branch to the `_create_backend` factory in [server.py](src/opentelemetry_mcp/server.py)
    (not config.py - config.py only holds the config *schema*). Any field the backend needs
    beyond `url`/`api_key`/`timeout` (e.g. Sentry's `org_slug`, X-Ray's `aws_region`) is read
    unconditionally from `BackendConfig` regardless of `type` - there is no per-backend-type
@@ -298,10 +298,10 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
    `tests/test_base_backend.py`
    asserts every backend's client carries them
 5. Add the new backend name to every hardcoded backend-name literal site (must update in
-   lockstep): [config.py](opentelemetry_mcp/config.py)'s `BackendConfig.type` `Literal` (and its
+   lockstep): [config.py](src/opentelemetry_mcp/config.py)'s `BackendConfig.type` `Literal` (and its
    `from_env`/`apply_cli_overrides` inline validation lists),
-   [attributes.py](opentelemetry_mcp/attributes.py)'s `HealthCheckResponse.backend` `Literal`,
-   [server.py](opentelemetry_mcp/server.py)'s `click.Choice` for the `--backend` CLI flag,
+   [attributes.py](src/opentelemetry_mcp/attributes.py)'s `HealthCheckResponse.backend` `Literal`,
+   [server.py](src/opentelemetry_mcp/server.py)'s `click.Choice` for the `--backend` CLI flag,
    [server.json](server.json)'s `BACKEND_TYPE` env var `choices` (published to the live MCP
    Registry on every release - this drifted unnoticed across 3 backend additions in a row before
    `tests/test_discoverability_sync.py` was added specifically to catch it),
@@ -320,9 +320,9 @@ Parse attributes using: `LLMSpanAttributes.from_span(span_data)`
 
 ### 6. Adding New Tools
 
-1. Create new module in [opentelemetry_mcp/tools/](opentelemetry_mcp/tools/)
+1. Create new module in [opentelemetry_mcp/tools/](src/opentelemetry_mcp/tools/)
 2. Implement tool function that takes backend and returns JSON string
-3. Register in [server.py](opentelemetry_mcp/server.py) using `@mcp.tool()`
+3. Register in [server.py](src/opentelemetry_mcp/server.py) using `@mcp.tool()`
 
 ## LLM-Oriented Tools
 
