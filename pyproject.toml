@@ -69,9 +69,17 @@ dependencies = [
     #   authlib>=1.9.0      CVE-2026-96760 (critical) and 7 more advisories
     #   dnspython>=2.9.0    CVE-2026-114605 (high)
     #   certifi>=2026.10.19 GHSA-6q48-6c7w-9gw2 / PYSEC-2026-4320 (critical)
+    # joserfc is reached only through authlib and fastmcp-slim (nothing here
+    # imports it), which require just joserfc>=1.6.8 and >=1.5.0, so it is
+    # floored the same way:
+    #   joserfc>=1.7.6     GHSA-jpxq-7h8p-2q76 / CVE-2026-119283 (JWE General
+    #                      JSON unbounded recipients, fixed 1.7.5) and
+    #                      GHSA-9pg5-8c7x-5hfx / CVE-2026-119284 (compact JWS
+    #                      size guard, fixed 1.7.6)
     "authlib>=1.9.0",
     "dnspython>=2.9.0",
     "certifi>=2026.10.19",
+    "joserfc>=1.7.6",
     "pydantic>=2.12,<2.14",
     "httpx~=0.28.0",
     "python-dotenv~=1.2.2",
