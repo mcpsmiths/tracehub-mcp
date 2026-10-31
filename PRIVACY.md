@@ -15,9 +15,11 @@ or any third party. There is no tracking of any kind baked into the software.
 
 - **Backend credentials** (`BACKEND_API_KEY`, `BACKEND_APP_KEY`, etc.) are read from
   environment variables you provide and used only to authenticate to the observability
-  backend *you* configure (`BACKEND_URL`). They are never logged, never sent anywhere
-  else, and never leave the process — redaction is applied on the one code path that
-  could otherwise echo them back (see [Secret Flow](#secret-flow) below). `BACKEND_URL`
+  backend(s) *you* configure (`BACKEND_URL`, and `SECONDARY_BACKEND_URL` if set; for AWS
+  X-Ray, the AWS X-Ray API). Each backend receives only its own credential. They are
+  never logged, never sent anywhere else, and never leave the process — redaction is
+  applied on the one code path that could otherwise echo them back (see
+  [Secret Flow](#secret-flow) below). `BACKEND_URL`
   itself may not carry a credential: a `user:password@host` URL is rejected at startup,
   and as defence in depth every URL and backend error text that is logged, printed
   (`--print-config`, `doctor`) or returned (tool errors) is stripped of any userinfo
@@ -101,7 +103,9 @@ check). The HTTP transport builds its own application and does not print the ban
 Secret environment variables (API keys, tokens) are read once at startup, used to build
 auth headers for your configured backend, and are never written to logs, never included
 in tool output, and never transmitted to any host other than the backend URL you
-configured (or, for AWS X-Ray, to the AWS X-Ray API for your configured region).
+configured (or, for AWS X-Ray, to the AWS X-Ray API for your configured region) and, if
+you configure one, the `SECONDARY_BACKEND_URL` (each backend receives only its own
+credential).
 
 ## Third parties
 
