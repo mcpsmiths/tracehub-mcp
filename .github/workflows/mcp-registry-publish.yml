@@ -20,6 +20,11 @@ name: Publish to MCP Registry
 # binary rather than an unpinned build-from-source, which the registry's own
 # currently-open issues #1505/#1523 flag as an insecure pattern its own docs
 # still recommend.
+# The publish step retries every error the registry itself labels transient (its
+# PyPI lookup lags pypi.org and fails in several shapes), is idempotent when the
+# entry for the version is already live, and a read-back step then requires the
+# served listing to be active at the released version (issue #56; the same
+# hardening cost-guard-mcp's registry workflow ran through two real releases).
 
 on:
   workflow_call:
@@ -50,6 +55,10 @@ jobs:
   publish-mcp:
     name: Publish server.json to the MCP Registry
     runs-on: ubuntu-latest
+    # The designed worst case (PyPI poll 13.3 min + 8 publish attempts 3.5 min of
+    # waits + read-back 2.3 min) is about 20 minutes; anything longer is a stalled
+    # connection, not progress.
+    timeout-minutes: 30
     # Same boundary as release.yml's publishing jobs: the `release`
     # environment's deployment-branch policy admits only main. On the
     # workflow_call path the policy is evaluated against the caller's ref
@@ -129,7 +138,7 @@ jobs:
           identifier="$(jq -r '.packages[0].identifier' server.json)"
           echo "Waiting for PyPI ${identifier} ${NEW_VERSION} with marker 'mcp-name: ${name}'"
           for i in $(seq 1 40); do
-            desc="$(curl -sf "https://pypi.org/pypi/${identifier}/${NEW_VERSION}/json" \
+            desc="$(curl -sf --max-time 30 "https://pypi.org/pypi/${identifier}/${NEW_VERSION}/json" \
               | jq -r '.info.description' 2>/dev/null || true)"
             if printf '%s' "$desc" | grep -qF "mcp-name: ${name}"; then
               echo "Ownership marker present on PyPI ${NEW_VERSION}"
@@ -149,7 +158,7 @@ jobs:
           archive="mcp-publisher_linux_amd64.tar.gz"
           expected_sha256="a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
           url="https://github.com/modelcontextprotocol/registry/releases/download/v${version}/${archive}"
-          curl --fail --location --proto '=https' --tlsv1.2 "$url" --output "$archive"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 "$url" --output "$archive"
           printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum --check --strict
           tar --extract --gzip --file "$archive" mcp-publisher
           chmod 0755 mcp-publisher
@@ -159,30 +168,82 @@ jobs:
         run: ./mcp-publisher login github-oidc
 
       - name: Validate and publish server.json
+        # The registry does its own server-side PyPI lookup at publish time, on
+        # a different network path than the wait-loop above, and it lags it: in
+        # production that wait loop's own curl already saw the release while the
+        # registry's check still 404ed for ~30s longer ("PyPI package exists,
+        # but version was not found - a newly published release can take a
+        # moment to appear on PyPI. Wait and retry"). The budget is 8 attempts
+        # 30 s apart, no wait after the last. Retry only the errors the
+        # registry's PyPI validator labels transient (registry source
+        # internal/validators/registries/pypi.go at v1.8.1): "version ... was not
+        # found (status: 404)" (release not yet visible), "Likely transient,
+        # retry later" (PyPI 429, 5xx, or an inconclusive package probe) and
+        # "failed to fetch package metadata from PyPI" (PyPI unreachable).
+        # Anything else fails at once - in particular a duplicate version
+        # ("invalid version: cannot publish duplicate version"; registry
+        # versions are immutable) and a validation failure - except that when
+        # the entry for this exact version is already served (a lost success
+        # response, or a re-dispatch for an already-published tag) the step
+        # reports it and lets the read-back step decide whether the served entry
+        # is right.
+        env:
+          NEW_VERSION: ${{ inputs.version }}
         run: |
           ./mcp-publisher validate server.json
 
-          # The registry does its own server-side PyPI lookup at publish
-          # time, on a different network path than the wait-loop above -
-          # confirmed in production: that wait loop's own curl already saw
-          # the release, but the registry's own check still 404ed for
-          # ~30s longer ("PyPI package exists, but version was not found -
-          # a newly published release can take a moment to appear on
-          # PyPI. Wait and retry"). Retry only that specific, known-
-          # transient error; anything else (e.g. "cannot publish
-          # duplicate version") fails immediately rather than wasting time
-          # retrying a non-transient error identically.
-          for attempt in $(seq 1 5); do
+          name="$(jq -r '.name' server.json)"
+          encoded="$(jq -rn --arg s "$name" '$s | @uri')"
+          entry_url="https://registry.modelcontextprotocol.io/v0.1/servers/${encoded}/versions/${NEW_VERSION}"
+          for attempt in $(seq 1 8); do
             if output="$(./mcp-publisher publish 2>&1)"; then
               echo "$output"
               exit 0
             fi
             echo "$output"
-            if ! printf '%s' "$output" | grep -qF "was not found (status: 404)"; then
+            if ! printf '%s' "$output" | grep -qE 'was not found \(status: 404\)|Likely transient, retry later|failed to fetch package metadata from PyPI'; then
+              if curl -sf --max-time 30 "$entry_url" >/dev/null; then
+                echo "${name} ${NEW_VERSION} is already published on the registry - the read-back step checks the served entry"
+                exit 0
+              fi
               exit 1
             fi
-            echo "Attempt ${attempt}/5: registry has not yet seen this PyPI release, waiting 30s..."
-            sleep 30
+            if [ "$attempt" -lt 8 ]; then
+              echo "Attempt ${attempt}/8: registry has not yet confirmed this PyPI release, waiting 30s..."
+              sleep 30
+            fi
           done
-          echo "::error::mcp-publisher publish still failing after 5 attempts"
+          echo "::error::mcp-publisher publish still failing after 8 attempts"
           exit 1
+
+      - name: Confirm the published entry
+        # Reads back what the registry now serves for this version and requires
+        # it to name this PyPI project at the released version (the fields a
+        # registry consumer installs from) with status active - a deprecated or
+        # deleted entry at this version is a failure. The response shape is
+        # {server: {...}, _meta: {"io.modelcontextprotocol.registry/official":
+        # {status, ...}}} (registry docs/reference/api/openapi.yaml, v1.8.1).
+        env:
+          NEW_VERSION: ${{ inputs.version }}
+        run: |
+          name="$(jq -r '.name' server.json)"
+          identifier="$(jq -r '.packages[0].identifier' server.json)"
+          encoded="$(jq -rn --arg s "$name" '$s | @uri')"
+          body=""
+          for i in $(seq 1 10); do
+            if body="$(curl -sf --max-time 30 "https://registry.modelcontextprotocol.io/v0.1/servers/${encoded}/versions/${NEW_VERSION}")"; then
+              break
+            fi
+            if [ "$i" -lt 10 ]; then
+              echo "Attempt ${i}/10: entry not readable yet - sleeping 15s"
+              sleep 15
+            fi
+          done
+          if [ -z "$body" ]; then
+            echo "::error::Registry entry for ${name} ${NEW_VERSION} was not readable after 10 attempts"
+            exit 1
+          fi
+          printf '%s' "$body" | jq '{name: (.server // .).name, version: (.server // .).version, package: (.server // .).packages[0], meta: ._meta}'
+          printf '%s' "$body" | jq -e --arg v "$NEW_VERSION" --arg id "$identifier" \
+            '(.server // .) as $s | $s.version == $v and $s.packages[0].registryType == "pypi" and $s.packages[0].identifier == $id and $s.packages[0].version == $v and ._meta["io.modelcontextprotocol.registry/official"].status == "active"' >/dev/null
+          echo "Registry serves ${name} ${NEW_VERSION} (status active) with package record pypi/${identifier}/${NEW_VERSION}"
