@@ -1,3 +1,10 @@
+## v0.13.1 (2026-10-31)
+
+### Fix
+
+- **deps**: floor and relock joserfc past two 2026-10-30 GHSAs (#69)
+- **deps**: relock past certifi, authlib and fastmcp advisories (#63)
+
 ## v0.13.0 (2026-10-14)
 
 ### BREAKING CHANGE
