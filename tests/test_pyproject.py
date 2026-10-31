@@ -128,6 +128,9 @@ FIRST_PATCHED_TRANSITIVE_FLOORS = {
     "authlib": Version("1.9.0"),  # CVE-2026-96760 (critical) and 7 more
     "dnspython": Version("2.9.0"),  # CVE-2026-114605
     "certifi": Version("2026.10.19"),  # GHSA-6q48-6c7w-9gw2 / PYSEC-2026-4320
+    # GHSA-jpxq-7h8p-2q76 / CVE-2026-119283 (fixed 1.7.5) and
+    # GHSA-9pg5-8c7x-5hfx / CVE-2026-119284 (fixed 1.7.6)
+    "joserfc": Version("1.7.6"),
 }
 
 
