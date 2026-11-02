@@ -16,12 +16,12 @@ jobs:
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
             - name: Setup UV
-              uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+              uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
               with:
                   version: "0.12.23"  # same uv as Dockerfile; tests/test_build_toolchain.py
                   enable-cache: true
             - name: Setup Python
-              uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+              uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
               with:
                   python-version: "3.13"
             - name: Install dependencies
@@ -40,12 +40,12 @@ jobs:
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
             - name: Setup UV
-              uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+              uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
               with:
                   version: "0.12.23"  # same uv as Dockerfile; tests/test_build_toolchain.py
                   enable-cache: true
             - name: Setup Python
-              uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+              uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
               with:
                   python-version: "3.13"
             - name: Install dependencies
@@ -72,16 +72,16 @@ jobs:
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
             - name: Setup UV
-              uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+              uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
               with:
                   version: "0.12.23"  # same uv as Dockerfile; tests/test_build_toolchain.py
                   enable-cache: true
             - name: Setup Python
-              uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+              uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
               with:
                   python-version: "3.13"
             - name: Setup Node
-              uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v5
+              uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v5
               with:
                   # @modelcontextprotocol/conformance's dependency tree (a
                   # transitive content-type@3.1.0) now requires Node >=22 -
@@ -338,7 +338,7 @@ jobs:
               run: trivy convert --format sarif --output trivy-results-${{ matrix.platform }}.sarif trivy-results-${{ matrix.platform }}.json
             - name: Upload SARIF to GitHub Security
               if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-              uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2  # v4
+              uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370  # v4
               with:
                   sarif_file: trivy-results-${{ matrix.platform }}.sarif
                   category: container-security-tracehub-mcp-server-${{ matrix.platform }}
