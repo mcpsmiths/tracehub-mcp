@@ -126,7 +126,9 @@ def test_fastmcp_range_excludes_every_vulnerable_release() -> None:
 FIRST_PATCHED_TRANSITIVE_FLOORS = {
     "anyio": Version("4.14.2"),  # CVE-2026-63374, CVE-2026-64847
     "authlib": Version("1.9.0"),  # CVE-2026-96760 (critical) and 7 more
-    "dnspython": Version("2.9.0"),  # CVE-2026-114605
+    # CVE-2026-114605 (fixed 2.9.0) and GHSA-vvf4-9x63-8xvv / CVE-2026-128089
+    # (excessive memory and CPU use, fixed 2.9.2)
+    "dnspython": Version("2.9.2"),
     "certifi": Version("2026.10.19"),  # GHSA-6q48-6c7w-9gw2 / PYSEC-2026-4320
     # GHSA-jpxq-7h8p-2q76 / CVE-2026-119283 (fixed 1.7.5) and
     # GHSA-9pg5-8c7x-5hfx / CVE-2026-119284 (fixed 1.7.6)
