@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal, NoReturn
 
 import click
+import fastmcp
 import httpx
 import uvicorn
 from fastmcp import FastMCP
@@ -225,6 +226,22 @@ _backend: BaseBackend | None = None
 # ever constructed if config.secondary_backend is set (SECONDARY_BACKEND_*).
 _secondary_backend: BaseBackend | None = None
 _config: ServerConfig | None = None
+
+
+def _switch_fastmcp_update_check_off_by_default() -> None:
+    """Make FastMCP's PyPI update check opt-in. Its own default ("stable") makes
+    the stdio banner GET https://pypi.org/pypi/fastmcp/json - egress to a host
+    the operator never configured, from a server whose only intended peer is its
+    configured backend. The check reads fastmcp.settings when the banner prints,
+    so assigning here, at import, is early enough. It is assigned only when
+    pydantic-settings found no value in any source (the FASTMCP_CHECK_FOR_UPDATES
+    environment variable or a .env file), so an operator's own "stable",
+    "prerelease" or "off" wins. No other FastMCP setting is touched."""
+    if "check_for_updates" not in fastmcp.settings.model_fields_set:
+        fastmcp.settings.check_for_updates = "off"
+
+
+_switch_fastmcp_update_check_off_by_default()
 
 # Initialize FastMCP server
 mcp = FastMCP("tracehub-mcp", version=__version__)
