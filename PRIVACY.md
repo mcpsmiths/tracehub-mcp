@@ -9,7 +9,10 @@ where it goes.
 
 **tracehub-mcp collects no data on its own.** It has no built-in analytics, telemetry, or
 crash reporting that sends anything to its maintainers ([mcpsmiths](https://github.com/mcpsmiths))
-or any third party. There is no tracking of any kind baked into the software.
+or any third party. There is no tracking of any kind baked into the software. The one
+unsolicited request the software can make is FastMCP's version lookup on PyPI under the
+stdio transport, which carries no data of yours (see
+[Third-party egress](#third-party-egress-fastmcp-update-check)).
 
 ## What data the software handles, and where it goes
 
@@ -42,26 +45,43 @@ or any third party. There is no tracking of any kind baked into the software.
   enabled, query results are held in the server process's memory for up to the configured
   TTL (at most one day), capped at `QUERY_CACHE_MAX_ENTRIES` results (default 1024, least
   recently used evicted first), shared by every MCP session of that process and discarded
-  when it exits. tracehub-mcp's own code never writes trace data or credentials to disk;
-  the only file written on its behalf is FastMCP's version-check cache described under
-  [Third-party egress](#third-party-egress-fastmcp-update-check).
+  when it exits. tracehub-mcp's own code never writes trace data or credentials to disk.
+  The only file written on its behalf in a default run is FastMCP's small version-check
+  cache described under [Third-party egress](#third-party-egress-fastmcp-update-check),
+  which holds a FastMCP version number and a timestamp. (The `xray` backend uses boto3,
+  which can keep its own credential or SSO token cache on disk if your AWS profile uses
+  one.)
 - **Network calls** the running server makes are limited to: (1) the backend you
   configure (see [Where requests go, per backend](#where-requests-go-per-backend)),
   plus the optional second backend of `SECONDARY_BACKEND_*` if you set one, (2) if you
   enable `--transport http`, binding its own listening port for MCP clients to connect
   to, (3) if you set `OTEL_EXPORTER_OTLP_ENDPOINT`, the OTLP endpoint you chose (see
-  below), and (4) under the stdio transport, FastMCP's own update check (see
-  [Third-party egress](#third-party-egress-fastmcp-update-check)). No other outbound
-  network calls happen during normal operation. (Maintainer-only dev scripts under
+  below), and (4) under the stdio transport, unless disabled with
+  `FASTMCP_CHECK_FOR_UPDATES=off` (the Docker image does this), FastMCP's own update check
+  against PyPI (see [Third-party egress](#third-party-egress-fastmcp-update-check)). No
+  other outbound network calls happen during normal operation; for the `xray` backend the
+  AWS credential chain you configured may itself contact AWS credential endpoints.
+  (Maintainer-only dev scripts under
   `scripts/`, such as the pricing-table sync script, are never invoked by the running
   server and are not part of its runtime behavior.)
 - **Self-instrumentation is opt-in and points wherever *you* choose.** Setting
-  `OTEL_EXPORTER_OTLP_ENDPOINT` turns on OpenTelemetry tracing of the server's own tool
-  calls; those spans go to the OTLP endpoint you configure, not to tracehub-mcp's
-  maintainers. It is disabled by default. When enabled, tool call arguments/results
-  recorded on these spans pass through a redaction filter for known credential shapes
-  before export (`observability._redact_secrets`) — a pattern match, not a guarantee, so
-  treat any self-instrumentation collector as seeing the same data your MCP client sees.
+  `OTEL_EXPORTER_OTLP_ENDPOINT` turns on OpenTelemetry tracing and metrics of the server's
+  own tool calls; the spans and the two tool-call metrics (`mcp.server.tool.call.count`
+  and `mcp.server.tool.call.duration`) go to the OTLP endpoint you configure, not to
+  tracehub-mcp's maintainers. It is disabled by default and nothing connects to an OTLP
+  endpoint unless you set the variable. Each span carries the tool name, the MCP method
+  name, the MCP session id, its duration and, for a failed call, the error class; each
+  metric carries the tool name and an error flag; both carry the OTel resource attributes
+  (`service.name`, a random `service.instance.id` and the SDK's `telemetry.sdk.*`
+  attributes). Tool call arguments and results are added to the spans in full only if you
+  also set `MCP_INCLUDE_ARGS_IN_SPANS=true` (off by default). A failed tool call also
+  records a redacted error message of at most 256 characters as the span status, and that
+  message can quote the offending argument value (for example in a validation error) or,
+  for a backend failure, the backend's error text, including the request URL and its query
+  string, even without `MCP_INCLUDE_ARGS_IN_SPANS`. The argument and result attributes and the error
+  message pass through a redaction filter for known credential shapes before export
+  (`observability._redact_secrets`) — a pattern match, not a guarantee, so treat any
+  self-instrumentation collector as seeing the same data your MCP client sees.
 
 ## Where requests go, per backend
 
@@ -89,14 +109,28 @@ are returned to your MCP client, not stored.
 
 ## Third-party egress: FastMCP update check
 
-tracehub-mcp is built on [FastMCP](https://gofastmcp.com). Under the stdio transport the
-server calls FastMCP's `run`, which by default prints a startup banner; before printing
-it, FastMCP checks `https://pypi.org/pypi/fastmcp/json` for a newer FastMCP release (a
-2-second request, cached for 12 hours in a `version_cache.json` file in FastMCP's own
-user-data directory). That request is made by FastMCP, not by tracehub-mcp's code, and
-goes to PyPI, not to the maintainers. Set `FASTMCP_CHECK_FOR_UPDATES=off` to disable the
-check, or `FASTMCP_SHOW_SERVER_BANNER=false` to suppress the banner (and with it the
-check). The HTTP transport builds its own application and does not print the banner.
+tracehub-mcp is built on [FastMCP](https://gofastmcp.com). Under the stdio transport (the
+default, and what `uvx tracehub-mcp` and the MCPB bundle run) the server starts through
+FastMCP's `run`, which by default prints a startup banner on stderr. Before printing it,
+FastMCP looks up the newest FastMCP release: it sends one
+`GET https://pypi.org/pypi/fastmcp/json` to PyPI (with a 2-second timeout), with no query
+string and no custom headers, only the HTTP client's default headers, including its
+`python-httpx2/<version>` User-Agent. PyPI therefore sees your IP address, the time of the
+request and that User-Agent, and nothing about tracehub-mcp, your backend or your data.
+On success FastMCP writes the answer (`{"latest_version": ..., "timestamp": ...}`) to a
+small `version_cache.json` file in its own user-data directory (for example
+`~/Library/Application Support/fastmcp/` on macOS or `~/.local/share/fastmcp/` on Linux)
+and does not ask again for 12 hours. That cache is shared by every program built on
+FastMCP that the same user account runs. If the request fails (for example without
+network access) nothing is written and the request is retried on the next launch. At the
+default `INFO` log level a success is logged on stderr as an `HTTP Request: GET
+https://pypi.org/...` line. This request is made by FastMCP, not by tracehub-mcp's code,
+and goes to PyPI, not to the maintainers. Set `FASTMCP_CHECK_FOR_UPDATES=off` to disable
+the check and the file write, or `FASTMCP_SHOW_SERVER_BANNER=false` to suppress the
+banner (and with it the check). The published Docker image sets both variables, so by
+default a container does not make this request. The HTTP transport (`--transport http`,
+the image's default command) serves its own application, prints no banner and makes no
+such request.
 
 ## Secret Flow
 
@@ -117,8 +151,14 @@ tracehub-mcp mediates or is party to.
 
 ## Data retention
 
-tracehub-mcp itself retains nothing — it is a stateless request/response proxy between
-your MCP client and your observability backend. Retention of trace/span data is governed
+tracehub-mcp itself keeps no copy of your trace or span data once a request is answered —
+it is a request/response proxy between your MCP client and your observability backend.
+There are two small exceptions. The opt-in query cache (`QUERY_CACHE_TTL_SECONDS`, unset by default) keeps query
+results in the server process's memory for the TTL you set, at most one day, and discards
+them when the process exits. Under the stdio transport, unless disabled, FastMCP writes
+its small version-check file (a FastMCP version number and a timestamp, no trace data; see
+[Third-party egress](#third-party-egress-fastmcp-update-check)) to its own user-data
+directory, where it stays until you delete it. Retention of trace/span data is governed
 entirely by your backend's own retention settings.
 
 ## Contact
