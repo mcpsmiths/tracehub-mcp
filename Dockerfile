@@ -31,7 +31,7 @@
 # ghcr.io/astral-sh/uv:0.12.23-python3.13-trixie-slim` (reads the registry
 # API only, no image layers pulled); re-verify the same way after any tag
 # bump and update the digest below to match.
-FROM ghcr.io/astral-sh/uv:0.12.23-python3.13-trixie-slim@sha256:a6aeb5c166af9f765f9c68e585b5a5148c28f3b8a362f90151cecea88b21a3e2 AS builder
+FROM ghcr.io/astral-sh/uv:0.13.6-python3.13-trixie-slim@sha256:e586c1c65b7071aec78f02c5587c76c5011159cd76b3d6f1255f40e48e850abc AS builder
 
 # Enable bytecode compilation for faster startup and use copy mode
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
