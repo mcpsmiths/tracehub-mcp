@@ -1,3 +1,3 @@
 """OpenTelemetry MCP Server - Query OpenTelemetry traces from LLM applications."""
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"

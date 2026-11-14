@@ -203,6 +203,18 @@ def test_dependabot_tracks_uv_lock_at_the_root() -> None:
     assert [u["package-ecosystem"] for u in toolchain] == ["pip"], toolchain
 
 
+def test_dependabot_uv_entry_raises_pyproject_floors_with_the_lock() -> None:
+    """With the default `auto` strategy Dependabot treats this project as a library
+    (it has [project] metadata and a PyPI name) and *widens* pyproject.toml ranges:
+    it bumps uv.lock but leaves a floor such as `boto3>=1.43.97` where it was, which
+    trips tests/test_pyproject.py::test_dependency_floors_match_locked_versions on
+    every grouped PR. `increase` raises the minimum requirement to the new version,
+    so the floor and the lock move together."""
+    updates = _load_yaml(DEPENDABOT_YML)["updates"]
+    [root_uv] = [u for u in updates if u["package-ecosystem"] == "uv" and u["directory"] == "/"]
+    assert root_uv.get("versioning-strategy") == "increase", root_uv
+
+
 def test_security_md_describes_the_hash_pinned_release_toolchain() -> None:
     text = SECURITY_MD.read_text(encoding="utf-8")
     assert "requirements-release.txt" in text or "hash-pinned" in text
