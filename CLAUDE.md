@@ -214,7 +214,7 @@ data}` from a `-> str`-annotated tool breaks the protocol).
 
 **Configuration Precedence:** CLI args > environment variables > defaults
 
-**Known third-party egress:** FastMCP itself (not this project's code) checks PyPI for a newer FastMCP release every 12h when it prints the startup banner. Disable with `FASTMCP_CHECK_FOR_UPDATES=off`, or suppress the banner entirely with `FASTMCP_SHOW_SERVER_BANNER=false` (both are FastMCP's own env vars, not tracehub-mcp's). See `.venv/.../fastmcp/utilities/version_check.py` / `settings.py` for the implementation.
+**Known third-party egress:** FastMCP itself (not this project's code) checks PyPI for a newer FastMCP release when it prints the startup banner, but only under the stdio transport, and at most once every 12h per user account: the answer is cached in `version_cache.json` in FastMCP's user-data directory, and a failed lookup writes nothing and is retried on the next launch. No data of the user's is sent. The HTTP transport does not make the request, and by default neither does the Docker image (it sets `FASTMCP_CHECK_FOR_UPDATES=off`). Disable with `FASTMCP_CHECK_FOR_UPDATES=off`, or suppress the banner entirely with `FASTMCP_SHOW_SERVER_BANNER=false` (both are FastMCP's own env vars, not tracehub-mcp's). See `.venv/.../fastmcp/utilities/version_check.py` / `settings.py` for the implementation.
 
 ## Opentelemetry Semantic Conventions
 
