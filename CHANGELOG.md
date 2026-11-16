@@ -1,3 +1,10 @@
+## v0.13.2 (2026-11-16)
+
+### Fix
+
+- **server**: switch FastMCP's PyPI update check off by default (#80)
+- **deps**: floor and relock dnspython past GHSA-vvf4-9x63-8xvv (#76)
+
 ## v0.13.1 (2026-10-31)
 
 ### Fix
