@@ -117,13 +117,19 @@ EXPOSE 8000
 #   - .env files mounted at runtime
 #
 # FASTMCP_CHECK_FOR_UPDATES / FASTMCP_SHOW_SERVER_BANNER are FastMCP's own
-# settings, not this project's: with the defaults, the framework fetches
+# settings, not this project's. FastMCP's default is to fetch
 # https://pypi.org/pypi/fastmcp/json once per 12 h when it prints its startup
-# banner (stdio mode included - observed from the shipped image). README and
-# CLAUDE.md already tell operators to turn that off; the image ships with it
-# off so a container never makes egress nobody configured. Override at run
-# time (-e FASTMCP_CHECK_FOR_UPDATES=stable) to get the banner's update hint
-# back.
+# banner on the stdio transport. This Dockerfile has set both variables below
+# since 0.13.0, while tracehub-mcp's own code left FastMCP's default in place up
+# to and including 0.13.1 and now switches the check off itself (server.py), so
+# the two settings are explicit defence in depth: the image ships with the check
+# and the banner off so a container never makes egress nobody configured. The
+# image's default command is the HTTP transport, which never prints the banner
+# or makes the check. To get the banner's update hint back, override BOTH at
+# run time (-e FASTMCP_CHECK_FOR_UPDATES=stable
+# -e FASTMCP_SHOW_SERVER_BANNER=true) AND run the stdio transport
+# (--transport stdio): with only the first set the banner stays suppressed
+# and the check never runs.
 ENV BACKEND_TIMEOUT="30" \
     LOG_LEVEL="INFO" \
     MAX_TRACES_PER_QUERY="500" \
