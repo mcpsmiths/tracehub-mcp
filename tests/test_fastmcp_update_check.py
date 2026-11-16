@@ -246,8 +246,8 @@ async def test_opt_in_update_check_still_reaches_pypi(tmp_path: Path) -> None:
     )
 
     assert _BANNER_MARKER in stderr, stderr
-    hosts = {attempt["host"] for attempt in attempts}
-    assert "pypi.org" in hosts, (
+    pypi_lookups = [attempt for attempt in attempts if attempt["host"] == "pypi.org"]
+    assert pypi_lookups, (
         "an operator who sets FASTMCP_CHECK_FOR_UPDATES=stable must keep FastMCP's "
         f"update check (and this harness must be able to see it): {attempts}"
     )
