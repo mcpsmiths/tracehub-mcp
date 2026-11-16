@@ -10,9 +10,9 @@ where it goes.
 **tracehub-mcp collects no data on its own.** It has no built-in analytics, telemetry, or
 crash reporting that sends anything to its maintainers ([mcpsmiths](https://github.com/mcpsmiths))
 or any third party. There is no tracking of any kind baked into the software. The one
-unsolicited request the software can make is FastMCP's version lookup on PyPI under the
-stdio transport, which carries no data of yours (see
-[Third-party egress](#third-party-egress-fastmcp-update-check)).
+request the software can make to a destination you did not configure is FastMCP's version
+lookup on PyPI under the stdio transport; it is off unless you opt in, and it carries no
+data of yours (see [Third-party egress](#third-party-egress-fastmcp-update-check)).
 
 ## What data the software handles, and where it goes
 
@@ -45,23 +45,24 @@ stdio transport, which carries no data of yours (see
   enabled, query results are held in the server process's memory for up to the configured
   TTL (at most one day), capped at `QUERY_CACHE_MAX_ENTRIES` results (default 1024, least
   recently used evicted first), shared by every MCP session of that process and discarded
-  when it exits. tracehub-mcp's own code never writes trace data or credentials to disk.
-  The only file written on its behalf in a default run is FastMCP's small version-check
-  cache described under [Third-party egress](#third-party-egress-fastmcp-update-check),
-  which holds a FastMCP version number and a timestamp. (The `xray` backend uses boto3,
-  which can keep its own credential or SSO token cache on disk if your AWS profile uses
-  one.)
+  when it exits. tracehub-mcp's own code never writes trace data or credentials to disk,
+  and a default run writes no file on its behalf. The one file that can be written, only
+  if you opt in to FastMCP's update check, is FastMCP's small version-check cache
+  described under [Third-party egress](#third-party-egress-fastmcp-update-check), which
+  holds a FastMCP version number and a timestamp. (The `xray` backend uses boto3, which
+  can keep its own credential or SSO token cache on disk if your AWS profile uses one.)
 - **Network calls** the running server makes are limited to: (1) the backend you
   configure (see [Where requests go, per backend](#where-requests-go-per-backend)),
   plus the optional second backend of `SECONDARY_BACKEND_*` if you set one, (2) if you
   enable `--transport http`, binding its own listening port for MCP clients to connect
   to, (3) if you set `OTEL_EXPORTER_OTLP_ENDPOINT`, the OTLP endpoint you chose (see
-  below), and (4) under the stdio transport, unless disabled with
-  `FASTMCP_CHECK_FOR_UPDATES=off` (the Docker image does this), FastMCP's own update check
-  against PyPI (see [Third-party egress](#third-party-egress-fastmcp-update-check)). No
-  other outbound network calls happen during normal operation; for the `xray` backend the
-  AWS credential chain you configured may itself contact AWS credential endpoints.
-  (Maintainer-only dev scripts under
+  below), and (4) only if you opt in with `FASTMCP_CHECK_FOR_UPDATES=stable` (or
+  `prerelease`), and only while FastMCP prints its startup banner under the stdio
+  transport, FastMCP's own update check against PyPI (see
+  [Third-party egress](#third-party-egress-fastmcp-update-check)); a default run does not
+  make it. No other outbound network calls happen during normal operation; for the `xray`
+  backend the AWS credential chain you configured may itself contact AWS credential
+  endpoints. (Maintainer-only dev scripts under
   `scripts/`, such as the pricing-table sync script, are never invoked by the running
   server and are not part of its runtime behavior.)
 - **Self-instrumentation is opt-in and points wherever *you* choose.** Setting
@@ -109,28 +110,45 @@ are returned to your MCP client, not stored.
 
 ## Third-party egress: FastMCP update check
 
-tracehub-mcp is built on [FastMCP](https://gofastmcp.com). Under the stdio transport (the
-default, and what `uvx tracehub-mcp` and the MCPB bundle run) the server starts through
-FastMCP's `run`, which by default prints a startup banner on stderr. Before printing it,
-FastMCP looks up the newest FastMCP release: it sends one
-`GET https://pypi.org/pypi/fastmcp/json` to PyPI (with a 2-second timeout), with no query
-string and no custom headers, only the HTTP client's default headers, including its
-`python-httpx2/<version>` User-Agent. PyPI therefore sees your IP address, the time of the
-request and that User-Agent, and nothing about tracehub-mcp, your backend or your data.
-On success FastMCP writes the answer (`{"latest_version": ..., "timestamp": ...}`) to a
-small `version_cache.json` file in its own user-data directory (for example
-`~/Library/Application Support/fastmcp/` on macOS or `~/.local/share/fastmcp/` on Linux)
-and does not ask again for 12 hours. That cache is shared by every program built on
-FastMCP that the same user account runs. If the request fails (for example without
-network access) nothing is written and the request is retried on the next launch. At the
-default `INFO` log level a success is logged on stderr as an `HTTP Request: GET
-https://pypi.org/...` line. This request is made by FastMCP, not by tracehub-mcp's code,
-and goes to PyPI, not to the maintainers. Set `FASTMCP_CHECK_FOR_UPDATES=off` to disable
-the check and the file write, or `FASTMCP_SHOW_SERVER_BANNER=false` to suppress the
-banner (and with it the check). The published Docker image sets both variables, so by
-default a container does not make this request. The HTTP transport (`--transport http`,
-the image's default command) serves its own application, prints no banner and makes no
-such request.
+tracehub-mcp is built on [FastMCP](https://gofastmcp.com). FastMCP's own default is to look
+up the newest FastMCP release whenever it prints its startup banner, and tracehub-mcp
+switches that lookup **off by default**: a default run makes no request to PyPI and
+writes no FastMCP version cache file. tracehub-mcp 0.13.1 left FastMCP's default in
+place, so a default stdio run of that release made the request described below. The
+Docker image is the exception: its Dockerfile has set the check off since 0.13.0.
+
+You can opt in to the lookup, to get FastMCP's "update available" hint in the banner, by
+setting `FASTMCP_CHECK_FOR_UPDATES=stable` (or `prerelease`, to include pre-releases) in
+the process environment or in a `.env` file in the working directory. A value you set is
+never overridden.
+
+Once opted in, under the stdio transport (the default, and what `uvx tracehub-mcp` and
+the MCPB bundle run) the server starts through FastMCP's `run`, which by default prints a
+startup banner on stderr. Before printing it, FastMCP looks up the newest FastMCP
+release: it sends one `GET https://pypi.org/pypi/fastmcp/json` to PyPI (with a 2-second
+timeout), with no query string and no custom headers, only the HTTP client's default
+headers, including its `python-httpx2/<version>` User-Agent. PyPI therefore sees your IP
+address, the time of the request and that User-Agent, and nothing about tracehub-mcp,
+your backend or your data. On success FastMCP writes the answer
+(`{"latest_version": ..., "timestamp": ...}`) to a small `version_cache.json` file
+(`version_cache_prerelease.json` for `prerelease`) in its own user-data directory (for
+example `~/Library/Application Support/fastmcp/` on macOS or `~/.local/share/fastmcp/`
+on Linux) and does not ask again for 12 hours. That cache is shared by every program
+built on FastMCP that the same user account runs. If the request fails (for example
+without network access) nothing is written and the request is retried on the next
+launch. At the default `INFO` log level a success is logged on stderr as an `HTTP
+Request: GET https://pypi.org/...` line. This request is made by FastMCP, not by
+tracehub-mcp's code, and goes to PyPI, not to the maintainers.
+
+The lookup only runs while FastMCP prints its banner. `FASTMCP_SHOW_SERVER_BANNER=false`
+suppresses the banner, and with it the lookup, even when you have opted in. The HTTP
+transport (`--transport http`, the image's default command) serves its own application,
+prints no banner and makes no such request, whatever the setting. The published Docker
+image keeps `FASTMCP_CHECK_FOR_UPDATES=off` and `FASTMCP_SHOW_SERVER_BANNER=false` in its
+environment as an explicit second guard, independent of tracehub-mcp's own default. To
+get the update hint from the image, override both at run time
+(`-e FASTMCP_CHECK_FOR_UPDATES=stable -e FASTMCP_SHOW_SERVER_BANNER=true`) and run it
+with `--transport stdio`.
 
 ## Secret Flow
 
@@ -153,13 +171,14 @@ tracehub-mcp mediates or is party to.
 
 tracehub-mcp itself keeps no copy of your trace or span data once a request is answered —
 it is a request/response proxy between your MCP client and your observability backend.
-There are two small exceptions. The opt-in query cache (`QUERY_CACHE_TTL_SECONDS`, unset by default) keeps query
+There are two small exceptions, both off by default. The opt-in query cache (`QUERY_CACHE_TTL_SECONDS`, unset by default) keeps query
 results in the server process's memory for the TTL you set, at most one day, and discards
-them when the process exits. Under the stdio transport, unless disabled, FastMCP writes
-its small version-check file (a FastMCP version number and a timestamp, no trace data; see
-[Third-party egress](#third-party-egress-fastmcp-update-check)) to its own user-data
-directory, where it stays until you delete it. Retention of trace/span data is governed
-entirely by your backend's own retention settings.
+them when the process exits. If you opt in to FastMCP's update check
+(`FASTMCP_CHECK_FOR_UPDATES=stable` or `prerelease`), FastMCP writes, under the stdio
+transport, its small version-check file (a FastMCP version number and a timestamp, no
+trace data; see [Third-party egress](#third-party-egress-fastmcp-update-check)) to its
+own user-data directory, where it stays until you delete it. Retention of trace/span data
+is governed entirely by your backend's own retention settings.
 
 ## Contact
 
