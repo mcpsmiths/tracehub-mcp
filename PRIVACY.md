@@ -145,10 +145,18 @@ suppresses the banner, and with it the lookup, even when you have opted in. The 
 transport (`--transport http`, the image's default command) serves its own application,
 prints no banner and makes no such request, whatever the setting. The published Docker
 image keeps `FASTMCP_CHECK_FOR_UPDATES=off` and `FASTMCP_SHOW_SERVER_BANNER=false` in its
-environment as an explicit second guard, independent of tracehub-mcp's own default. To
-get the update hint from the image, override both at run time
-(`-e FASTMCP_CHECK_FOR_UPDATES=stable -e FASTMCP_SHOW_SERVER_BANNER=true`) and run it
-with `--transport stdio`.
+environment as an explicit second guard, independent of tracehub-mcp's own default. Its
+default command is the HTTP transport, and its `HEALTHCHECK` probes that transport's HTTP
+port. To get the update hint from the image, override both variables at run time and run
+it with `--transport stdio` (which replaces the image's default command); as a stdio
+container it also takes `-i` and `--no-healthcheck`:
+`docker run -i --no-healthcheck -e FASTMCP_CHECK_FOR_UPDATES=stable
+-e FASTMCP_SHOW_SERVER_BANNER=true ghcr.io/mcpsmiths/tracehub-mcp:latest --transport stdio`
+(plus your usual backend `-e` flags). `-i` and `--no-healthcheck` are not needed for the
+hint itself, which is printed at startup; they are for the stdio container: `-i` keeps
+stdin open, because the stdio transport reads its requests from stdin and exits when it
+ends, and `--no-healthcheck` switches off the image's `HEALTHCHECK`, which probes a port
+that a stdio server does not open.
 
 ## Secret Flow
 

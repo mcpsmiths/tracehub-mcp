@@ -125,11 +125,22 @@ EXPOSE 8000
 # the two settings are explicit defence in depth: the image ships with the check
 # and the banner off so a container never makes egress nobody configured. The
 # image's default command is the HTTP transport, which never prints the banner
-# or makes the check. To get the banner's update hint back, override BOTH at
-# run time (-e FASTMCP_CHECK_FOR_UPDATES=stable
-# -e FASTMCP_SHOW_SERVER_BANNER=true) AND run the stdio transport
-# (--transport stdio): with only the first set the banner stays suppressed
-# and the check never runs.
+# or makes the check, and the HEALTHCHECK below probes that transport's HTTP
+# port. To get the banner's update hint back, override BOTH variables at run
+# time and run the stdio transport; as a stdio container the image also takes
+# -i and --no-healthcheck:
+#   docker run -i --no-healthcheck -e FASTMCP_CHECK_FOR_UPDATES=stable
+#     -e FASTMCP_SHOW_SERVER_BANNER=true
+#     ghcr.io/mcpsmiths/tracehub-mcp:latest --transport stdio
+# plus the usual backend -e flags. The hint needs the two overrides (with only
+# the update-check override the banner stays suppressed and the check never
+# runs; with only the banner override the check stays off) and --transport stdio
+# (replaces the default CMD). -i and --no-healthcheck are not needed for the
+# hint itself, which is printed at startup; they are for the stdio container: -i
+# keeps stdin open (the stdio transport reads its requests from stdin and exits
+# when it ends) and --no-healthcheck switches off the HEALTHCHECK, which probes
+# the HTTP port that a stdio server never opens (docker_healthcheck.py says to
+# disable it for stdio deployments).
 ENV BACKEND_TIMEOUT="30" \
     LOG_LEVEL="INFO" \
     MAX_TRACES_PER_QUERY="500" \
