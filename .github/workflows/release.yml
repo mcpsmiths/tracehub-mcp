@@ -277,14 +277,40 @@ jobs:
           # real, successful release (PyPI CDN propagation lag exceeded 60s)
           # even though the publish itself had already succeeded - poll
           # instead of guessing a bigger fixed number.
+          #
+          # pip's stderr is kept and its last lines are printed after every
+          # failed attempt. It used to go to /dev/null, so when all ten attempts
+          # failed for 0.13.2 the log held only "not yet available on PyPI" and
+          # nothing said why (for a version the index does not list yet pip's own
+          # line is "Could not find a version ... (from versions: ...)").
+          #
+          # That text is untrusted (it can echo what the index sent), and the
+          # runner turns some log lines into workflow commands, so it is made
+          # inert before it is printed: carriage returns become newlines (the
+          # runner splits lines on them), "##[" is broken up (the legacy command
+          # form matches at any column), each line is cut to 500 bytes, and
+          # every line is printed behind a "pip: " prefix (a "::" command only
+          # counts at the start of a line). Only pip's stderr gets this
+          # treatment; pip's stdout and the output of the two commands after the
+          # loop are printed as they come. The "|| true" keeps a failing
+          # diagnostic (for example awk meeting a byte-truncated multibyte
+          # character) from aborting the retry loop under "bash -e".
+          : "${RUNNER_TEMP:?RUNNER_TEMP is not set}"
+          installed=false
           for attempt in $(seq 1 10); do
-            if pip install "tracehub-mcp==${NEW_VERSION}" 2>/dev/null; then
+            if pip install "tracehub-mcp==${NEW_VERSION}" 2>"${RUNNER_TEMP}/pip-install.err"; then
               echo "Installed on attempt ${attempt}"
+              installed=true
               break
             fi
             echo "Attempt ${attempt}/10: tracehub-mcp==${NEW_VERSION} not yet available on PyPI, waiting 30s..."
+            tr '\r' '\n' < "${RUNNER_TEMP}/pip-install.err" | tail -n 5 | cut -c1-500 | awk '{ gsub(/##\[/, "## ["); print "    pip: " $0 }' || true
             sleep 30
           done
+          if [ "${installed}" != "true" ]; then
+            echo "::error::tracehub-mcp==${NEW_VERSION} could not be installed from PyPI after 10 attempts; pip's last error is printed above"
+            exit 1
+          fi
           python -c "import opentelemetry_mcp; print(f'Installed version: {opentelemetry_mcp.__version__}')"
           tracehub-mcp --help
 
